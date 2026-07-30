@@ -1,0 +1,2 @@
+aiogram>=3.13,<4
+feedparser>=6.0.11
