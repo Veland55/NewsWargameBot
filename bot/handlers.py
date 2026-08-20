@@ -6,13 +6,15 @@ import logging
 import time
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import BaseFilter, Command, CommandObject
 from aiogram.types import (BufferedInputFile, InputMediaPhoto,
                            LinkPreviewOptions, Message)
 
 from .db import DEFAULTS, Storage
 from .llm import LLMError
-from .publisher import TG_CAPTION_LIMIT, Publisher, _ext_for, html_problem, tg_len
+from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, _ext_for,
+                        html_problem, tg_len)
 from .quota import until_reset
 from .rss import fetch
 from .vk import VKError, to_plain
@@ -30,6 +32,12 @@ HELP = """<b>RSS → DeepSeek → канал</b>
 /del &lt;id&gt; — удалить ленту
 /pause &lt;id&gt; · /resume &lt;id&gt; — выключить/включить ленту
 /test &lt;id&gt; — прогнать последнюю новость через шаблон без публикации
+
+<b>Опубликованные посты</b>
+/posts [n] — последние опубликованные посты (по умолчанию 10)
+/edit &lt;id&gt; — показать пост и что с ним можно сделать
+/setpost &lt;id&gt; &lt;текст&gt; — заменить текст поста вручную
+/regen &lt;id&gt; [пожелание] — перегенерировать текст через ИИ из исходной новости
 
 <b>Отладка</b>
 /debug on · /debug off — посты приходят в личку вместо канала
@@ -521,6 +529,143 @@ async def cmd_checknow(message: Message, st: Storage, publisher: Publisher) -> N
                 "<code>/test &lt;id&gt;</code>.")
     await _reply(message, f"Готово. Лент: {stats['feeds']}, {verb}: "
                           f"{stats['published']}{tail}{hint}")
+
+
+def _post_kind_label(kind: str) -> str:
+    return {"text": "текст", "photo": "фото", "album": "альбом"}.get(kind, kind)
+
+
+@router.message(Command("posts"))
+async def cmd_posts(message: Message, command: CommandObject, st: Storage) -> None:
+    n = _parse_id(command.args) or 10
+    n = max(1, min(30, n))
+    rows = st.posts(n)
+    if not rows:
+        await _reply(message, "Опубликованных постов пока нет.")
+        return
+    lines = [f"<b>Последние посты</b> (до {n})"]
+    for r in rows:
+        when = time.strftime("%d.%m %H:%M", time.localtime(r["posted_at"]))
+        edited = " ✏️" if r["edited_at"] else ""
+        lines.append(
+            f"\n<b>#{r['id']}</b> [{_post_kind_label(r['kind'])}]{edited} {when}\n"
+            f"   {_e(r['title'][:100])}"
+        )
+    lines.append("\nПодробнее и редактировать: <code>/edit &lt;id&gt;</code>")
+    await _reply(message, "\n".join(lines))
+
+
+@router.message(Command("edit"))
+async def cmd_edit(message: Message, command: CommandObject, st: Storage) -> None:
+    post_id = _parse_id(command.args)
+    row = st.post(post_id) if post_id is not None else None
+    if row is None:
+        await _reply(message, "Как использовать: <code>/edit 1</code> "
+                              "(id смотрите в /posts)")
+        return
+    edited = (f"\nОтредактирован: {time.strftime('%d.%m %H:%M', time.localtime(row['edited_at']))}"
+             if row["edited_at"] else "")
+    await _reply(
+        message,
+        f"<b>Пост #{row['id']}</b> [{_post_kind_label(row['kind'])}]\n"
+        f"Опубликован: {time.strftime('%d.%m %H:%M', time.localtime(row['posted_at']))}"
+        f"{edited}\n"
+        f"Источник: {_e(row['title'])}\n"
+        f"<a href=\"{_e(row['link'])}\">ссылка на новость</a>\n\n"
+        f"<b>Текущий текст в канале:</b>\n<pre>{_e(row['text'])}</pre>\n\n"
+        f"Изменить текст вручную: <code>/setpost {row['id']} новый текст</code>\n"
+        f"Перегенерировать через ИИ из исходной новости: <code>/regen {row['id']}</code> "
+        f"(можно добавить пожелание: <code>/regen {row['id']} короче и без хештегов</code>)",
+    )
+
+
+def _split_id_and_text(args: str | None) -> tuple[int | None, str]:
+    """"<id> <текст...>" → (id, текст). Разделитель — любой пробельный символ,
+    в т.ч. перенос строки (Shift+Enter сразу после id)."""
+    parts = (args or "").split(maxsplit=1)
+    post_id = _parse_id(parts[0]) if parts else None
+    text = parts[1].strip() if len(parts) > 1 else ""
+    return post_id, text
+
+
+@router.message(Command("setpost"))
+async def cmd_setpost(message: Message, command: CommandObject, st: Storage, bot: Bot) -> None:
+    post_id, text = _split_id_and_text(command.args)
+    row = st.post(post_id) if post_id is not None else None
+    if row is None or not text.strip():
+        await _reply(message, "Как использовать: <code>/setpost 1 новый текст поста</code> "
+                              "(id смотрите в /posts)")
+        return
+
+    limit = TG_CAPTION_LIMIT if row["kind"] in ("photo", "album") else TG_LIMIT
+    if tg_len(text) > limit:
+        await _reply(message, f"⚠️ Текст длиннее лимита Telegram для этого поста "
+                              f"({tg_len(text)} из {limit} — это "
+                              + ("подпись к фото" if row["kind"] in ("photo", "album")
+                                 else "сообщение") + "). Сократите и попробуйте снова.")
+        return
+    problem = html_problem(text)
+    if problem:
+        await _reply(message, f"⚠️ Разметка не годится: {problem}. Не сохранено.")
+        return
+
+    if not await _apply_post_edit(message, bot, st, row, text):
+        return
+    await _reply(message, f"✅ Пост #{row['id']} обновлён.")
+
+
+@router.message(Command("regen"))
+async def cmd_regen(message: Message, command: CommandObject, st: Storage, bot: Bot,
+                    publisher: Publisher) -> None:
+    post_id, extra = _split_id_and_text(command.args)
+    row = st.post(post_id) if post_id is not None else None
+    if row is None:
+        await _reply(message, "Как использовать: <code>/regen 1</code> или "
+                              "<code>/regen 1 сделай короче</code> (id из /posts)")
+        return
+
+    backend = "Claude" if publisher.claude_mode else "DeepSeek/LLM"
+    await _reply(message, f"Перегенерирую через {backend} из исходной новости…")
+    try:
+        text = await publisher.rebuild_post_text(row, extra)
+    except LLMError as exc:
+        await _reply(message, f"❌ Модель вернула ошибку: <code>{_e(exc)}</code>\n"
+                              f"Текст поста не менялся.")
+        return
+
+    if not await _apply_post_edit(message, bot, st, row, text):
+        return
+    await _reply(message, f"✅ Пост #{row['id']} обновлён через {backend}.\n\n"
+                          f"<b>Новый текст:</b>\n<pre>{_e(text)}</pre>")
+
+
+async def _apply_post_edit(message: Message, bot: Bot, st: Storage,
+                           row, text: str) -> bool:
+    """Редактирует само сообщение в канале и обновляет запись в базе.
+    True — получилось, False — Telegram отказал (текст не сохранён)."""
+    try:
+        if row["kind"] in ("photo", "album"):
+            await bot.edit_message_caption(chat_id=row["chat_id"], message_id=row["message_id"],
+                                           caption=text, parse_mode="HTML")
+        else:
+            await bot.edit_message_text(chat_id=row["chat_id"], message_id=row["message_id"],
+                                        text=text, parse_mode="HTML",
+                                        link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            await _reply(message, "Текст не изменился — Telegram отклонил правку "
+                                  "как пустую. В базе тоже не трогал.")
+            return False
+        await _reply(message, f"❌ Telegram отказал в правке: <code>{_e(exc)}</code>\n"
+                              f"Частые причины: пост старше ~48 часов, бот больше не "
+                              f"админ канала, или сообщение было удалено вручную.")
+        return False
+    except TelegramAPIError as exc:
+        await _reply(message, f"❌ Ошибка Telegram: <code>{_e(exc)}</code>")
+        return False
+
+    st.update_post_text(row["id"], text)
+    return True
 
 
 @router.message(Command("debug"))

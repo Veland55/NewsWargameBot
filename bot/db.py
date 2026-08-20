@@ -56,6 +56,26 @@ CREATE TABLE IF NOT EXISTS usage (
     tokens_out INTEGER NOT NULL DEFAULT 0,
     cost       REAL    NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
+
+-- Уже опубликованные посты — чтобы их можно было найти и отредактировать
+-- (/posts, /edit, /setpost, /regen). Пишется только для настоящих публикаций
+-- в канал, не для превью /test и не для отладочных постов в личку.
+CREATE TABLE IF NOT EXISTS posts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    feed_id    INTEGER,
+    chat_id    TEXT NOT NULL,
+    message_id INTEGER NOT NULL,   -- сообщение, у которого редактируется текст/подпись
+    kind       TEXT NOT NULL,      -- 'text' | 'photo' | 'album' — какой метод edit_message_* нужен
+    title      TEXT NOT NULL DEFAULT '',
+    summary    TEXT NOT NULL DEFAULT '',
+    link       TEXT NOT NULL DEFAULT '',
+    source     TEXT NOT NULL DEFAULT '',
+    published  TEXT NOT NULL DEFAULT '',
+    text       TEXT NOT NULL DEFAULT '',   -- текущий текст поста, каким он сейчас в канале
+    posted_at  INTEGER NOT NULL,
+    edited_at  INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_posts_posted ON posts (posted_at DESC);
 """
 
 DEFAULT_TEMPLATE = """\
@@ -339,6 +359,50 @@ class Storage:
             )
             self._conn.commit()
 
+    # --- опубликованные посты (/posts, /edit, /setpost, /regen) -----------
+    def add_post(self, *, feed_id: int | None, chat_id: str, message_id: int,
+                kind: str, title: str, summary: str, link: str, source: str,
+                published: str, text: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO posts (feed_id, chat_id, message_id, kind, title, "
+                "summary, link, source, published, text, posted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (feed_id, chat_id, message_id, kind, title, summary, link,
+                 source, published, text, int(time.time())),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def posts(self, limit: int = 10) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM posts ORDER BY posted_at DESC, id DESC LIMIT ?", (limit,)
+            ).fetchall()
+
+    def post(self, post_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM posts WHERE id = ?", (post_id,)
+            ).fetchone()
+
+    def update_post_text(self, post_id: int, text: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE posts SET text = ?, edited_at = ? WHERE id = ?",
+                (text, int(time.time()), post_id),
+            )
+            self._conn.commit()
+
+    def prune_posts(self, keep: int = 500) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM posts WHERE id NOT IN "
+                "(SELECT id FROM posts ORDER BY posted_at DESC, id DESC LIMIT ?)",
+                (keep,),
+            )
+            self._conn.commit()
+
     def drop_alerts_except(self, day: str) -> None:
         """Чистим отметки об отправленных предупреждениях за прошлые дни."""
         with self._lock:
@@ -360,6 +424,7 @@ class Storage:
             self.prune_seen(row["id"], keep_seen)
         self.prune_usage(keep_usage_days)
         self.prune_page_images()
+        self.prune_posts()
         with self._lock:
             # TRUNCATE возвращает файл WAL к нулю, а не просто помечает
             # содержимое переиспользуемым.

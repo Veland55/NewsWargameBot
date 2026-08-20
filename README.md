@@ -34,12 +34,16 @@
 * **Режим Claude** — включается командой `/claude on`: обработка через платный
   Claude вместо LLM_* из `.env`, плюс несколько картинок со страницы новости
   альбомом вместо одной.
+* **Редактирование опубликованного** — `/posts` показывает последние посты,
+  `/setpost` меняет текст вручную, `/regen` перегенерирует его через ИИ заново
+  из исходной новости, без republish.
 
 ## Команды
 
 | | |
 |---|---|
 | **Ленты** | `/add <url> [название]` · `/list` · `/del <id>` · `/pause <id>` · `/resume <id>` · `/test <id>` |
+| **Опубликованное** | `/posts [n]` · `/edit <id>` · `/setpost <id> <текст>` · `/regen <id> [пожелание]` |
 | **Отладка** | `/debug on` · `/debug off` · `/usage` |
 | **Шаблоны** | `/template` · `/settemplate` · `/format` · `/setformat` · `/reset template\|format` |
 | **VK** | `/vk` · `/vk on` · `/vk off` · `/vk group <id>` · `/vk check` · `/vk test <id ленты>` |

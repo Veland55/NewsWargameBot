@@ -14,7 +14,7 @@ from aiogram import Bot
 from aiogram.exceptions import (TelegramAPIError, TelegramBadRequest,
                                 TelegramRetryAfter)
 from aiogram.types import (BufferedInputFile, InputMediaPhoto,
-                            LinkPreviewOptions)
+                            LinkPreviewOptions, Message)
 
 from .claude import ClaudeClient
 from .db import Storage, entry_key
@@ -490,12 +490,15 @@ class Publisher:
                 # Прочитанным не помечаем: после /debug off новость уйдёт в канал.
                 if await self._send_debug(post, feed):
                     published += 1
-            elif await self._send(post.text, image=post.image, images=post.images):
-                self.st.mark_seen(feed_id, key)
-                published += 1
-                # После отметки о прочтении: новость уже не повторится, значит
-                # и в VK не задвоится, даже если он сейчас недоступен.
-                await self.send_vk(post)
+            else:
+                sent = await self._send(post.text, image=post.image, images=post.images)
+                if sent:
+                    self.st.mark_seen(feed_id, key)
+                    published += 1
+                    self._record_post(feed_id, entry, feed, post, sent)
+                    # После отметки о прочтении: новость уже не повторится, значит
+                    # и в VK не задвоится, даже если он сейчас недоступен.
+                    await self.send_vk(post)
 
             if self._blocked:
                 break
@@ -537,6 +540,57 @@ class Publisher:
             return Post(text=text, images=await self._images_of_claude(entry),
                        link=entry.link)
         return Post(text=text, image=await self._image_of(entry), link=entry.link)
+
+    async def rebuild_post_text(self, row: sqlite3.Row, extra: str = "") -> str:
+        """Заново прогоняет уже опубликованную новость через модель — /regen.
+
+        Источник тот же, что был при первой публикации (строка из таблицы
+        posts, а не свежий запрос к ленте: заголовок мог с тех пор
+        измениться на сайте, а редактируем мы историю, а не текущую версию).
+        Картинки не трогаем — /regen меняет только текст.
+        """
+        raw_values = {
+            "title": row["title"],
+            "summary": row["summary"] or row["title"],
+            "link": row["link"],
+            "source": row["source"] or "RSS",
+            "published": row["published"],
+        }
+        feed = self.st.feed(row["feed_id"]) if row["feed_id"] else None
+        template = (feed["template"] if feed and feed["template"] else "") or self.st.get("template")
+        prompt = render(template, raw_values, escape=False)
+        if extra.strip():
+            prompt += f"\n\nДополнительно учти: {extra.strip()}"
+        ai_text = await self._ask_model(prompt)
+
+        post_format = self.st.get("post_format")
+        limit = TG_CAPTION_LIMIT if row["kind"] in ("photo", "album") else TG_LIMIT
+        return _shorten(render(post_format, {**raw_values, "ai": ai_text}, escape=True), limit)
+
+    def _record_post(self, feed_id: int, entry: Entry, feed: sqlite3.Row | None,
+                     post: Post, sent: "Message | list[Message]") -> None:
+        """Запоминает опубликованный пост — чтобы его можно было найти и
+        отредактировать (/posts, /edit, /setpost, /regen)."""
+        messages = sent if isinstance(sent, list) else [sent]
+        first = messages[0]
+        if len(messages) > 1:
+            kind = "album"
+        elif first.photo:
+            kind = "photo"
+        else:
+            kind = "text"
+        self.st.add_post(
+            feed_id=feed_id,
+            chat_id=str(first.chat.id),
+            message_id=first.message_id,
+            kind=kind,
+            title=entry.title,
+            summary=entry.summary,
+            link=entry.link,
+            source=(feed["title"] if feed and feed["title"] else "") or "RSS",
+            published=entry.published,
+            text=post.text,
+        )
 
     def _drop_stale(self, feed_id: int, fresh: list[tuple[str, Entry]]
                     ) -> list[tuple[str, Entry]]:
@@ -729,25 +783,38 @@ class Publisher:
         return LinkPreviewOptions(is_disabled=self.st.get("disable_preview") == "1")
 
     async def _send(self, text: str, chat_id: int | str | None = None,
-                    image: str = "", images: list[tuple[bytes, str]] | None = None) -> bool:
+                    image: str = "", images: list[tuple[bytes, str]] | None = None
+                    ) -> "Message | list[Message] | None":
+        """Возвращает отправленное сообщение (список — для альбома) или None.
+
+        Тип возврата не bool, чтобы вызывающий код мог записать post_id для
+        дальнейшего редактирования (/edit, /setpost, /regen) — но истинность
+        (truthy/falsy) та же, что и раньше, так что весь код вида
+        `if await self._send(...)` продолжает работать без изменений.
+        """
         target = chat_id if chat_id is not None else self.channel
         if not target:
             log.error("канал не задан: укажите CHANNEL_ID или /setchannel")
             self._blocked = True
-            return False
+            return None
 
         images = images or []
         fits_caption = tg_len(text) <= TG_CAPTION_LIMIT
 
         if len(images) >= 2:
-            if await self._send_media_group(text if fits_caption else "", target, images[:10]):
+            sent = await self._send_media_group(text if fits_caption else "", target, images[:10])
+            if sent:
                 if fits_caption:
-                    return True
+                    return sent
                 # Подпись длиннее лимита медиагруппы — картинки уже ушли,
-                # текст отдельным сообщением следом.
-                return await self._send(text, chat_id)
+                # текст отдельным сообщением следом. Если это отдельное
+                # сообщение не отправится — альбом всё равно живой, публикацию
+                # считаем состоявшейся (иначе следующий проход прислал бы
+                # тот же альбом повторно).
+                tail = await self._send(text, chat_id)
+                return tail or sent
             if self._blocked:
-                return False
+                return None
             # Альбом не отправился (например Telegram отверг один из файлов) —
             # пробуем хотя бы первую картинку одиночным фото.
             images = images[:1]
@@ -757,20 +824,20 @@ class Publisher:
         # вчетверо короче сообщения, поэтому длинные посты отправляем текстом,
         # а картинку прикладываем превью-ссылкой, чтобы не резать содержимое.
         if single and fits_caption:
-            if await self._send_photo(text, target, single):
-                return True
+            sent = await self._send_photo(text, target, single)
+            if sent:
+                return sent
             if self._blocked:
-                return False
+                return None
         preview = self._preview(image)
         for _ in range(3):
             try:
-                await self.bot.send_message(
+                return await self.bot.send_message(
                     chat_id=target,
                     text=text,
                     parse_mode="HTML",
                     link_preview_options=preview,
                 )
-                return True
             except TelegramRetryAfter as exc:
                 log.warning("лимит Telegram, ждём %ss", exc.retry_after)
                 await asyncio.sleep(exc.retry_after + 1)
@@ -778,7 +845,7 @@ class Publisher:
                 if not self._is_markup_error(exc):
                     log.error("не удалось отправить в %s: %s", target, exc)
                     self._blocked = True
-                    return False
+                    return None
                 # Разметку Telegram не принял (обычно из-за /setformat).
                 # Публикуем текстом, иначе новость зависнет и будет
                 # переобрабатываться моделью каждый проход.
@@ -788,25 +855,24 @@ class Publisher:
             except TelegramAPIError as exc:
                 log.error("не удалось отправить в %s: %s", target, exc)
                 self._blocked = True
-                return False
-        return False
+                return None
+        return None
 
     async def _send_photo(self, text: str, target: int | str,
-                          image: str | tuple[bytes, str]) -> bool:
-        """Фото по URL или уже скачанным байтам. False — картинка не подошла,
+                          image: str | tuple[bytes, str]) -> "Message | None":
+        """Фото по URL или уже скачанным байтам. None — картинка не подошла,
         пост уйдёт отдельно."""
         photo = image if isinstance(image, str) else BufferedInputFile(
             image[0], filename=f"image.{_ext_for(image[1])}")
         label = image if isinstance(image, str) else f"{len(image[0])} байт, {image[1]}"
         for _ in range(3):
             try:
-                await self.bot.send_photo(
+                return await self.bot.send_photo(
                     chat_id=target,
                     photo=photo,
                     caption=text,
                     parse_mode="HTML",
                 )
-                return True
             except TelegramRetryAfter as exc:
                 log.warning("лимит Telegram, ждём %ss", exc.retry_after)
                 await asyncio.sleep(exc.retry_after + 1)
@@ -814,24 +880,24 @@ class Publisher:
                 if self._is_markup_error(exc):
                     # Разметка сломана — картинка ни при чём, пусть общий путь
                     # разбирается и публикует текстом.
-                    return False
+                    return None
                 if self._is_delivery_error(exc):
                     log.error("не удалось отправить в %s: %s", target, exc)
                     self._blocked = True
-                    return False
+                    return None
                 log.warning("Telegram не принял картинку %s (%s) — публикую "
                             "пост без фото", label, exc)
-                return False
+                return None
             except TelegramAPIError as exc:
                 log.warning("ошибка отправки фото в %s (%s) — публикую пост "
                             "без фото", target, exc)
-                return False
-        return False
+                return None
+        return None
 
     async def _send_media_group(self, caption: str, target: int | str,
-                                images: list[tuple[bytes, str]]) -> bool:
+                                images: list[tuple[bytes, str]]) -> "list[Message] | None":
         """Альбом из 2-10 картинок (режим Claude). Подпись — только на первой,
-        так её показывает сам Telegram. False — не отправился целиком, пост
+        так её показывает сам Telegram. None — не отправился целиком, пост
         попробует уйти другим путём (см. _send)."""
         media = []
         for i, (data, ctype) in enumerate(images):
@@ -843,8 +909,8 @@ class Publisher:
 
         for _ in range(3):
             try:
-                await self.bot.send_media_group(chat_id=target, media=media)
-                return True
+                sent = await self.bot.send_media_group(chat_id=target, media=media)
+                return list(sent)
             except TelegramRetryAfter as exc:
                 log.warning("лимит Telegram, ждём %ss", exc.retry_after)
                 await asyncio.sleep(exc.retry_after + 1)
@@ -852,14 +918,14 @@ class Publisher:
                 if self._is_delivery_error(exc):
                     log.error("не удалось отправить в %s: %s", target, exc)
                     self._blocked = True
-                    return False
+                    return None
                 log.warning("Telegram не принял альбом (%s) — пробую иначе", exc)
-                return False
+                return None
             except TelegramAPIError as exc:
                 log.warning("ошибка отправки альбома в %s (%s) — пробую иначе",
                             target, exc)
-                return False
-        return False
+                return None
+        return None
 
     @staticmethod
     def _is_delivery_error(exc: TelegramBadRequest) -> bool:
@@ -875,11 +941,10 @@ class Publisher:
         text = str(exc).lower()
         return "entit" in text or "tag" in text or "parse" in text
 
-    async def _send_plain(self, text: str, target: int | str) -> bool:
+    async def _send_plain(self, text: str, target: int | str) -> "Message | None":
         try:
-            await self.bot.send_message(chat_id=target, text=_shorten(text),
-                                        parse_mode=None)
-            return True
+            return await self.bot.send_message(chat_id=target, text=_shorten(text),
+                                                parse_mode=None)
         except TelegramAPIError as exc:
             log.error("не удалось отправить даже без разметки в %s: %s", target, exc)
-            return False
+            return None
