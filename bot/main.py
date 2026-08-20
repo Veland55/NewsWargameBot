@@ -21,6 +21,7 @@ from .publisher import Publisher
 from .quota import Quota
 from .rss import FETCH_TIMEOUT, close_http
 from .vk import VKClient
+from .web import run_web_panel
 
 log = logging.getLogger("bot")
 
@@ -97,6 +98,14 @@ async def run() -> None:
         log.warning("VK_TOKEN задан, но id сообщества нет — "
                     "укажите VK_GROUP_ID в .env или /vk group <id>")
 
+    web_runner = None
+    if cfg.web_panel_password:
+        web_runner, _ = await run_web_panel(storage, publisher, bot,
+                                            cfg.web_panel_password, cfg.web_panel_port)
+        log.info("веб-панель на http://0.0.0.0:%s (пароль задан)", cfg.web_panel_port)
+    else:
+        log.info("веб-панель выключена — WEB_PANEL_PASSWORD не задан в .env")
+
     poller = asyncio.create_task(publisher.run_forever(), name="rss-poller")
     try:
         await dp.start_polling(bot, handle_signals=True)
@@ -104,6 +113,8 @@ async def run() -> None:
         publisher.stop()
         poller.cancel()
         await asyncio.gather(poller, return_exceptions=True)
+        if web_runner is not None:
+            await web_runner.cleanup()
         await llm.close()
         await vk.close()
         await claude.close()
