@@ -323,8 +323,25 @@ NAV_ITEMS = [
     ("/format", "🎨", "Формат"),
     ("/settings", "⚙️", "Настройки"),
     ("/posts", "📮", "Посты"),
-    ("/usage", "💰", "Расход"),
 ]
+
+
+async def _usage_body(pub: "Publisher") -> str:
+    if pub.quota is None:
+        return ""
+    info = await pub.quota.snapshot(force=True)
+    rows = [
+        ("Запросов сегодня", f"{info.requests}" + (f" из {info.request_limit} ({info.request_pct:.0f}%)" if info.request_limit else "")),
+        ("Токены", f"{info.tokens_in} вход / {info.tokens_out} выход"),
+        ("Модель", info.model + (" (бесплатная)" if info.is_free_model else "")),
+    ]
+    if info.request_limit:
+        rows.append(("Обнуление лимита", f"через {until_reset()} (00:00 UTC), источник: {info.limit_source}"))
+    if info.credit_limit is not None:
+        rows.append(("Кредиты на ключе", f"{info.credit_limit:.4f}, осталось {info.credit_remaining:.4f}"))
+    return "<h2>Расход за сутки (LLM/DeepSeek, не Claude)</h2><div class='card'><table>" + "".join(
+        f"<tr><td class='muted'>{_e(k)}</td><td>{_e(v)}</td></tr>" for k, v in rows
+    ) + "</table></div>"
 
 
 def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok", active: str = "") -> str:
@@ -506,6 +523,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             <button type="submit">🔄 Проверить ленты сейчас</button></form>
         </div>
         """
+        body += await _usage_body(pub)
         return web.Response(text=_layout("Статус", body, active="/"), content_type="text/html")
 
     async def pause_post(request: web.Request) -> web.Response:
@@ -998,27 +1016,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             return await post_detail(request, flash=f"Модель вернула ошибку: {exc}", flash_kind="err")
         return await post_detail(request, draft=text, flash="Черновик готов — не забудьте сохранить.")
 
-    # --- расход ------------------------------------------------------------
-    async def usage_get(request: web.Request) -> web.Response:
-        pub: Publisher = app["publisher"]
-        if pub.quota is None:
-            body = "<p class='muted'>Учёт расхода недоступен.</p>"
-            return web.Response(text=_layout("Расход", body, active="/usage"), content_type="text/html")
-        info = await pub.quota.snapshot(force=True)
-        rows = [
-            ("Запросов сегодня", f"{info.requests}" + (f" из {info.request_limit} ({info.request_pct:.0f}%)" if info.request_limit else "")),
-            ("Токены", f"{info.tokens_in} вход / {info.tokens_out} выход"),
-            ("Модель", info.model + (" (бесплатная)" if info.is_free_model else "")),
-        ]
-        if info.request_limit:
-            rows.append(("Обнуление лимита", f"через {until_reset()} (00:00 UTC), источник: {info.limit_source}"))
-        if info.credit_limit is not None:
-            rows.append(("Кредиты на ключе", f"{info.credit_limit:.4f}, осталось {info.credit_remaining:.4f}"))
-        body = "<h2>Расход за сутки (LLM/DeepSeek, не Claude)</h2><div class='card'><table>" + "".join(
-            f"<tr><td class='muted'>{_e(k)}</td><td>{_e(v)}</td></tr>" for k, v in rows
-        ) + "</table></div>"
-        return web.Response(text=_layout("Расход", body, active="/usage"), content_type="text/html")
-
     async def _apply_edit(bot_: Bot, row, text: str) -> str | None:
         try:
             if row["kind"] in ("photo", "album"):
@@ -1068,7 +1065,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_get("/posts/{id}", post_detail)
     app.router.add_post("/posts/{id}/save", post_save)
     app.router.add_post("/posts/{id}/regen", post_regen)
-    app.router.add_get("/usage", usage_get)
 
     return app
 
