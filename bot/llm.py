@@ -43,6 +43,7 @@ class LLMClient:
         temperature: float = 0.3,
         retries: int = 2,
         on_usage: Callable[[dict], None] | None = None,
+        reasoning_effort: str | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -50,6 +51,11 @@ class LLMClient:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.retries = retries
+        # Только для «думающих» моделей (сейчас — Gemini): без этого они тратят
+        # весь max_tokens на невидимые рассуждения и возвращают пустой ответ.
+        # У DeepSeek/OpenRouter не выставляется — там параметр незнаком и может
+        # вызвать ошибку запроса.
+        self.reasoning_effort = reasoning_effort
         # Вызывается после каждого удачного запроса — так учёт расхода
         # не знает про HTTP, а клиент не знает про базу.
         self.on_usage = on_usage
@@ -131,6 +137,8 @@ class LLMClient:
             "temperature": self.temperature,
             "stream": False,
         }
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         headers = self._auth_headers
 
         last_error = "неизвестная ошибка"

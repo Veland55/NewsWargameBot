@@ -60,7 +60,12 @@ async def run() -> None:
     # Gemini даёт OpenAI-совместимый /chat/completions — тот же LLMClient, что
     # и для DeepSeek/OpenRouter, просто второй экземпляр со своим ключом/URL.
     # Отдельного протокол-клиента, как для Claude, тут не нужно.
-    gemini = LLMClient(cfg.gemini_base_url, cfg.gemini_api_key, cfg.gemini_model)
+    # reasoning_effort="low": свежие модели Gemini «думают» перед ответом и без
+    # этого тратят весь max_tokens на невидимые рассуждения, возвращая пустой
+    # текст (finish_reason=length) — приходится повторять запрос с удвоенным
+    # лимитом. С low модель почти не думает и укладывается в лимит с первого раза.
+    gemini = LLMClient(cfg.gemini_base_url, cfg.gemini_api_key, cfg.gemini_model,
+                       reasoning_effort="low")
     publisher = Publisher(bot, storage, llm, cfg.channel_id,
                           admin_ids=cfg.admin_ids, quota=quota, vk=vk, claude=claude, gemini=gemini)
 
