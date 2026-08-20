@@ -201,11 +201,13 @@ class Post:
 class Publisher:
     def __init__(self, bot: Bot, storage: Storage, llm: LLMClient, default_channel: str,
                  admin_ids: set[int] | None = None, quota: "Quota | None" = None,
-                 vk: "VKClient | None" = None, claude: "ClaudeClient | None" = None):
+                 vk: "VKClient | None" = None, claude: "ClaudeClient | None" = None,
+                 gemini: "LLMClient | None" = None):
         self.bot = bot
         self.st = storage
         self.llm = llm
         self.claude = claude
+        self.gemini = gemini
         self.default_channel = default_channel
         self.admin_ids = set(admin_ids or ())
         self.quota = quota
@@ -241,8 +243,22 @@ class Publisher:
                 and self.claude is not None and bool(self.claude.api_key))
 
     @property
+    def gemini_mode(self) -> bool:
+        return (self.st.get("gemini_mode") == "1"
+                and self.gemini is not None and bool(self.gemini.api_key))
+
+    @property
     def _active_llm(self) -> "LLMClient | ClaudeClient":
-        return self.claude if self.claude_mode and self.claude else self.llm
+        # Claude и Gemini включаются командами /claude on и /gemini on, которые
+        # сами гасят друг друга — но на случай, если оба флага всё же оказались
+        # взведены разом (например, ручная правка базы), Claude в приоритете:
+        # он единственный, кто меняет ещё и картинки (альбом), так что молча
+        # переключиться на Gemini было бы более заметным сюрпризом.
+        if self.claude_mode and self.claude:
+            return self.claude
+        if self.gemini_mode and self.gemini:
+            return self.gemini
+        return self.llm
 
     @property
     def vk_group(self) -> str:

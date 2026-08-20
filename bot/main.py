@@ -57,8 +57,12 @@ async def run() -> None:
     llm.on_usage = quota.record
     vk = VKClient(cfg.vk_token, cfg.vk_group_id, cfg.vk_user_token)
     claude = ClaudeClient(cfg.claude_api_key, cfg.claude_model)
+    # Gemini даёт OpenAI-совместимый /chat/completions — тот же LLMClient, что
+    # и для DeepSeek/OpenRouter, просто второй экземпляр со своим ключом/URL.
+    # Отдельного протокол-клиента, как для Claude, тут не нужно.
+    gemini = LLMClient(cfg.gemini_base_url, cfg.gemini_api_key, cfg.gemini_model)
     publisher = Publisher(bot, storage, llm, cfg.channel_id,
-                          admin_ids=cfg.admin_ids, quota=quota, vk=vk, claude=claude)
+                          admin_ids=cfg.admin_ids, quota=quota, vk=vk, claude=claude, gemini=gemini)
 
     dp = Dispatcher()
     handlers.setup(handlers.router, cfg.admin_ids)
@@ -81,15 +85,19 @@ async def run() -> None:
         storage.close()
         raise SystemExit(f"Не удалось связаться с Telegram: {exc}")
 
-    log.info("бот @%s запущен; канал: %s; модель: %s; VK: %s; Claude: %s",
+    log.info("бот @%s запущен; канал: %s; модель: %s; VK: %s; Claude: %s; Gemini: %s",
              me.username, publisher.channel or "не задан", llm.model,
              (f"сообщество {publisher.vk_group}, картинка — {vk.photo_mode}"
               ) if publisher.vk_on else "выключен",
-             f"включён, {claude.model}" if publisher.claude_mode else "выключен")
+             f"включён, {claude.model}" if publisher.claude_mode else "выключен",
+             f"включён, {gemini.model}" if publisher.gemini_mode else "выключен")
     if not llm.api_key:
         log.warning("LLM_API_KEY не задан — новости будут публиковаться без обработки")
     if storage.get("claude_mode") == "1" and not claude.api_key:
         log.warning("режим Claude включён командой, но CLAUDE_API_KEY не задан — "
+                    "работает обычный LLM")
+    if storage.get("gemini_mode") == "1" and not gemini.api_key:
+        log.warning("режим Gemini включён командой, но GEMINI_API_KEY не задан — "
                     "работает обычный LLM")
     if not publisher.channel:
         log.warning("канал не задан — укажите CHANNEL_ID в .env или /setchannel")
@@ -138,6 +146,7 @@ async def run() -> None:
         await llm.close()
         await vk.close()
         await claude.close()
+        await gemini.close()
         await close_http()
         await bot.session.close()
         storage.close()

@@ -36,6 +36,9 @@
 * **Режим Claude** — включается командой `/claude on`: обработка через платный
   Claude вместо LLM_* из `.env`, плюс несколько картинок со страницы новости
   альбомом вместо одной.
+* **Режим Gemini** — включается командой `/gemini on`: обработка через Gemini
+  вместо LLM_* из `.env`, обычно бесплатно. Взаимоисключимо с Claude —
+  включён может быть только один из двух.
 * **Редактирование опубликованного** — `/posts` показывает последние посты,
   `/setpost` меняет текст вручную, `/regen` перегенерирует его через ИИ заново
   из исходной новости, без republish.
@@ -59,6 +62,7 @@
 | **VK** | `/vk` · `/vk on` · `/vk off` · `/vk group <id>` · `/vk check` · `/vk test <id ленты>` |
 | **Настройки** | `/status` · `/model` · `/setmodel` · `/interval <мин>` · `/set <ключ> <знач>` · `/setchannel` · `/checknow` · `/stop` · `/start` |
 | **Claude** | `/claude on` · `/claude off` · `/claude check` · `/claude test <id>` |
+| **Gemini** | `/gemini on` · `/gemini off` · `/gemini check` · `/gemini test <id>` |
 
 Подробно с примерами — в [SETUP.md](SETUP.md).
 

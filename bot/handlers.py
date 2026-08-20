@@ -71,6 +71,7 @@ HELP = """<b>RSS → DeepSeek → канал</b>
 /setchannel &lt;@канал|id&gt; — куда публиковать
 /vk — дублирование постов в сообщество VK
 /claude — обработка через платный Claude + несколько картинок из новости
+/gemini — обработка через Gemini (обычно бесплатно), взаимоисключимо с Claude
 /checknow — проверить ленты немедленно
 /stop · /start — глобальная пауза и снятие паузы"""
 
@@ -294,13 +295,15 @@ async def cmd_test(message: Message, command: CommandObject, st: Storage,
     try:
         post = await publisher.build_post(entry, feed)
     except LLMError as exc:
-        model_hint = ("Проверьте CLAUDE_API_KEY / CLAUDE_MODEL в .env"
-                      if publisher.claude_mode else
-                      "Проверьте LLM_API_KEY / LLM_MODEL / LLM_BASE_URL в .env")
+        if publisher.claude_mode:
+            backend_name, model_hint = "Claude", "Проверьте CLAUDE_API_KEY / CLAUDE_MODEL в .env"
+        elif publisher.gemini_mode:
+            backend_name, model_hint = "Gemini", "Проверьте GEMINI_API_KEY / GEMINI_MODEL в .env"
+        else:
+            backend_name, model_hint = "DeepSeek", "Проверьте LLM_API_KEY / LLM_MODEL / LLM_BASE_URL в .env"
         await _reply(
             message,
-            f"❌ {'Claude' if publisher.claude_mode else 'DeepSeek'} вернул "
-            f"ошибку: <code>{_e(exc)}</code>\n\n{model_hint}",
+            f"❌ {backend_name} вернул ошибку: <code>{_e(exc)}</code>\n\n{model_hint}",
         )
         return
 
@@ -707,7 +710,7 @@ async def cmd_regen(message: Message, command: CommandObject, st: Storage, bot: 
                               "<code>/regen 1 сделай короче</code> (id из /posts)")
         return
 
-    backend = "Claude" if publisher.claude_mode else "DeepSeek/LLM"
+    backend = "Claude" if publisher.claude_mode else "Gemini" if publisher.gemini_mode else "DeepSeek/LLM"
     await _reply(message, f"Перегенерирую через {backend} из исходной новости…")
     try:
         text = await publisher.rebuild_post_text(row, extra)
@@ -966,6 +969,7 @@ async def cmd_claude(message: Message, command: CommandObject, st: Storage,
 
     if action in ("on", "вкл", "1"):
         st.set("claude_mode", "1")
+        st.set("gemini_mode", "0")  # одновременно работать может только один альтернативный бэкенд
         if not publisher.claude_mode:
             await _reply(message, "Включил, но работать пока не выйдет: "
                                   "не хватает CLAUDE_API_KEY в .env.\n\n" + CLAUDE_HELP)
@@ -1044,6 +1048,118 @@ async def cmd_claude(message: Message, command: CommandObject, st: Storage,
     )
 
 
+GEMINI_HELP = """<b>Режим Gemini</b>
+
+Обработка через Gemini вместо DeepSeek/LLM_* из .env — обычно бесплатно
+(у Gemini свой бесплатный тариф, не через OpenRouter). Картинки — как в
+обычном режиме, одна из ленты/страницы новости; альбом из нескольких
+картинок, как у Claude, тут не делается.
+
+<b>Что нужно</b>
+В <code>.env</code>: <code>GEMINI_API_KEY=...</code> (ключ — в Google AI
+Studio), при необходимости <code>GEMINI_MODEL=</code> (по умолчанию
+<code>gemini-2.5-flash</code> — если модель переименовали, впишите
+актуальное имя), затем перезапуск бота.
+
+Шаблон промпта и формат поста — те же, что и для обычного режима
+(/template, /format). Учёт расхода лимита ИИ (/usage) на Gemini не
+распространяется — это отдельный API со своими лимитами, смотрите их в
+Google AI Studio.
+
+Включён одновременно с Claude быть не может — включение одного гасит
+другой.
+
+<b>Команды</b>
+/gemini — это сообщение и состояние
+/gemini on · /gemini off — включить и выключить режим
+/gemini check — проверить ключ живым запросом (ничего не публикует)
+/gemini test &lt;id ленты&gt; — прогнать последнюю новость ленты через Gemini, показать в личке"""
+
+
+@router.message(Command("gemini"))
+async def cmd_gemini(message: Message, command: CommandObject, st: Storage,
+                     publisher: Publisher) -> None:
+    args = (command.args or "").split()
+    action = args[0].lower() if args else ""
+    gemini = publisher.gemini
+
+    if action in ("on", "вкл", "1"):
+        st.set("gemini_mode", "1")
+        st.set("claude_mode", "0")
+        if not publisher.gemini_mode:
+            await _reply(message, "Включил, но работать пока не выйдет: "
+                                  "не хватает GEMINI_API_KEY в .env.\n\n" + GEMINI_HELP)
+            return
+        await _reply(message, f"✅ Обрабатываю через Gemini (<code>{_e(gemini.model)}</code>).")
+        return
+
+    if action in ("off", "выкл", "0"):
+        st.set("gemini_mode", "0")
+        await _reply(message, "⏸ Вернул обычный режим "
+                              f"(<code>{_e(publisher.llm.model)}</code>). "
+                              "Включить снова — <code>/gemini on</code>")
+        return
+
+    if action == "check":
+        if gemini is None or not gemini.api_key:
+            await _reply(message, "GEMINI_API_KEY не задан.\n\n" + GEMINI_HELP)
+            return
+        await _reply(message, "Спрашиваю Gemini…")
+        try:
+            reply = await gemini.complete("Ответь одним словом: работает")
+        except LLMError as exc:
+            await _reply(message, f"❌ Gemini ответил ошибкой: <code>{_e(exc)}</code>\n\n"
+                                  f"Чаще всего дело в неверном ключе или названии модели "
+                                  f"(<code>GEMINI_MODEL</code>).")
+            return
+        await _reply(message, f"✅ Ключ рабочий, модель <code>{_e(gemini.model)}</code> "
+                              f"ответила: «{_e(reply[:200])}»")
+        return
+
+    if action == "test":
+        feed_id = _parse_id(" ".join(args[1:]))
+        feed = st.feed(feed_id) if feed_id is not None else None
+        if feed is None:
+            await _reply(message, "Как использовать: <code>/gemini test 1</code> "
+                                  "(id ленты из /list)")
+            return
+        if gemini is None or not gemini.api_key:
+            await _reply(message, "GEMINI_API_KEY не задан.\n\n" + GEMINI_HELP)
+            return
+        await _reply(message, "Забираю ленту и прогоняю через Gemini…")
+        result = await fetch(feed["url"])
+        if result.error or not result.entries:
+            await _reply(message, f"❌ {_e(result.error or 'в ленте нет записей')}")
+            return
+
+        entry = result.entries[-1]
+        was_on = st.get("gemini_mode")
+        st.set("gemini_mode", "1")   # build_post смотрит на это состояние
+        try:
+            post = await publisher.build_post(entry, feed)
+        except LLMError as exc:
+            await _reply(message, f"❌ Gemini вернул ошибку: <code>{_e(exc)}</code>")
+            return
+        finally:
+            st.set("gemini_mode", was_on)
+
+        picture = f"картинок: {len(post.images)}" if post.images else "без картинок"
+        await _reply(message, f"⬇️ Предпросмотр через Gemini ({picture}, "
+                              f"<b>не</b> опубликовано)")
+        if not await _preview_post(message, post):
+            await message.answer(post.text, parse_mode="HTML",
+                                 link_preview_options=NO_PREVIEW)
+        return
+
+    state = "включён ✅" if publisher.gemini_mode else "выключен"
+    key = "задан" if gemini and gemini.api_key else "❌ не задан"
+    model = gemini.model if gemini else "—"
+    await _reply(
+        message,
+        f"Режим Gemini: {state}\nКлюч: {key}\nМодель: <code>{_e(model)}</code>\n\n" + GEMINI_HELP,
+    )
+
+
 @router.message(Command("usage"))
 async def cmd_usage(message: Message, st: Storage, publisher: Publisher) -> None:
     if publisher.quota is None:
@@ -1108,6 +1224,7 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
     if publisher.debug:
         mode = "🔧 отладка — посты в личку, /debug off чтобы публиковать"
     claude = publisher.claude
+    gemini = publisher.gemini
     await _reply(
         message,
         f"<b>Состояние</b>\n"
@@ -1117,6 +1234,8 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
                    if publisher.vk_on else "выключен") + "\n"
         f"Claude: " + (f"включён, <code>{_e(claude.model)}</code>"
                        if publisher.claude_mode else "выключен") + "\n"
+        f"Gemini: " + (f"включён, <code>{_e(gemini.model)}</code>"
+                       if publisher.gemini_mode else "выключен") + "\n"
         f"Ленты: {active} активных из {len(feeds)}"
         + (f", с ошибками: {len(errors)}" if errors else "") + "\n"
         f"Модель: <code>{_e(llm.model)}</code>\n"

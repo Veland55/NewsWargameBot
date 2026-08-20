@@ -492,6 +492,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             <span class="pill {'on' if pub.llm.api_key else 'off'}">{'ключ задан' if pub.llm.api_key else 'нет ключа'}</span></div>
           <div class="line">Claude: <span class="pill {'on' if pub.claude_mode else 'off'}">
             {'включён, ' + _e(pub.claude.model) if pub.claude_mode else 'выключен'}</span></div>
+          <div class="line">Gemini: <span class="pill {'on' if pub.gemini_mode else 'off'}">
+            {'включён, ' + _e(pub.gemini.model) if pub.gemini_mode else 'выключен'}</span></div>
           <div class="line">VK: <span class="pill {'on' if pub.vk_on else 'off'}">
             {'сообщество ' + _e(pub.vk_group) if pub.vk_on else 'выключен'}</span></div>
         </div>
@@ -788,10 +790,25 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           <div class="line">Сейчас: <span class="pill {'on' if pub.claude_mode else 'off'}">
             {'включён, ' + _e(pub.claude.model) if pub.claude_mode else 'выключен'}</span>
             {'· CLAUDE_API_KEY не задан в .env' if not (pub.claude and pub.claude.api_key) else ''}</div>
+          <p class="muted">Взаимоисключимо с Gemini ниже — включение одного гасит другой.</p>
           <form method="post" action="/settings/claude">{csrf_field(request)}
             <div class="row" style="align-items:flex-end;">
               <div style="flex:1;"><label>Картинок в альбом (1-10)</label>
                 <input type="text" name="claude_max_images" value="{_e(st.get('claude_max_images'))}"></div>
+              <button type="submit" name="action" value="on" class="primary">Включить</button>
+              <button type="submit" name="action" value="off">Выключить</button>
+            </div>
+          </form>
+        </div>
+
+        <h2>Gemini</h2>
+        <div class="card">
+          <div class="line">Сейчас: <span class="pill {'on' if pub.gemini_mode else 'off'}">
+            {'включён, ' + _e(pub.gemini.model) if pub.gemini_mode else 'выключен'}</span>
+            {'· GEMINI_API_KEY не задан в .env' if not (pub.gemini and pub.gemini.api_key) else ''}</div>
+          <p class="muted">Обычно бесплатно. Взаимоисключимо с Claude выше.</p>
+          <form method="post" action="/settings/gemini">{csrf_field(request)}
+            <div class="row" style="align-items:flex-end;">
               <button type="submit" name="action" value="on" class="primary">Включить</button>
               <button type="submit" name="action" value="off">Выключить</button>
             </div>
@@ -855,10 +872,25 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             if not n.isdigit() or not (1 <= int(n) <= 10):
                 return await settings_get(request, "Картинок в альбом — число от 1 до 10.", "err")
             st.set("claude_max_images", n)
-        st.set("claude_mode", "1" if form.get("action") == "on" else "0")
+        turning_on = form.get("action") == "on"
+        st.set("claude_mode", "1" if turning_on else "0")
+        if turning_on:
+            st.set("gemini_mode", "0")
         pub: Publisher = app["publisher"]
         if st.get("claude_mode") == "1" and not pub.claude_mode:
             return await settings_get(request, "Включил, но не хватает CLAUDE_API_KEY в .env — режим не заработает.", "err")
+        return await settings_get(request, "Сохранено.")
+
+    async def settings_gemini(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        form = request["form"]
+        turning_on = form.get("action") == "on"
+        st.set("gemini_mode", "1" if turning_on else "0")
+        if turning_on:
+            st.set("claude_mode", "0")
+        pub: Publisher = app["publisher"]
+        if st.get("gemini_mode") == "1" and not pub.gemini_mode:
+            return await settings_get(request, "Включил, но не хватает GEMINI_API_KEY в .env — режим не заработает.", "err")
         return await settings_get(request, "Сохранено.")
 
     # --- посты -----------------------------------------------------------
@@ -1031,6 +1063,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/settings/debug", settings_debug)
     app.router.add_post("/settings/vk", settings_vk)
     app.router.add_post("/settings/claude", settings_claude)
+    app.router.add_post("/settings/gemini", settings_gemini)
     app.router.add_get("/posts", posts_get)
     app.router.add_get("/posts/{id}", post_detail)
     app.router.add_post("/posts/{id}/save", post_save)

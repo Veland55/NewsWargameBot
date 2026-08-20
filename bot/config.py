@@ -36,6 +36,9 @@ class Config:
     vk_user_token: str = ""
     claude_api_key: str = ""
     claude_model: str = "claude-sonnet-5"
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
     web_panel_password: str = ""
     web_panel_port: int = 8090
     web_panel_public_url: str = ""
@@ -96,6 +99,11 @@ class Config:
             vk_user_token=os.getenv("VK_USER_TOKEN", "").strip(),
             claude_api_key=os.getenv("CLAUDE_API_KEY", "").strip(),
             claude_model=os.getenv("CLAUDE_MODEL", "claude-sonnet-5").strip(),
+            gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
+            gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip(),
+            gemini_base_url=os.getenv(
+                "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"
+            ).rstrip("/"),
             web_panel_password=os.getenv("WEB_PANEL_PASSWORD", "").strip(),
             web_panel_port=int(os.getenv("WEB_PANEL_PORT", "8090") or 8090),
             web_panel_public_url=os.getenv("WEB_PANEL_PUBLIC_URL", "").strip().rstrip("/"),
