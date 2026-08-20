@@ -53,6 +53,11 @@ HELP = """<b>RSS → DeepSeek → канал</b>
 /setformat &lt;текст&gt; — задать формат поста
 /reset template|format — вернуть значение по умолчанию
 
+<b>Свой промпт для отдельной ленты</b>
+/feedtemplate &lt;id&gt; — показать промпт ленты (свой или общий)
+/setfeedtemplate &lt;id&gt; &lt;текст&gt; — задать свой промпт только для этой ленты
+/resetfeedtemplate &lt;id&gt; — вернуть общий промпт
+
 Плейсхолдеры: <code>{title}</code> <code>{summary}</code> <code>{link}</code> <code>{source}</code> <code>{published}</code>
 В формате поста дополнительно <code>{ai}</code> — ответ модели. Формат поста поддерживает HTML-теги Telegram.
 
@@ -235,7 +240,7 @@ async def cmd_list(message: Message, st: Storage) -> None:
         if f["last_error"]:
             lines.append(f"   ⚠️ {_e(f['last_error'][:150])}")
         if f["template"]:
-            lines.append("   📝 свой шаблон")
+            lines.append(f"   📝 свой промпт — <code>/feedtemplate {f['id']}</code>")
     await _reply(message, "\n".join(lines))
 
 
@@ -350,6 +355,65 @@ async def cmd_settemplate(message: Message, st: Storage) -> None:
         return
     st.set("template", text)
     await _reply(message, "✅ Промпт сохранён. Проверить: <code>/test &lt;id&gt;</code>")
+
+
+@router.message(Command("feedtemplate"))
+async def cmd_feedtemplate(message: Message, command: CommandObject, st: Storage) -> None:
+    feed_id = _parse_id(command.args)
+    feed = st.feed(feed_id) if feed_id is not None else None
+    if feed is None:
+        await _reply(message, "Как использовать: <code>/feedtemplate 1</code> (id смотрите в /list)")
+        return
+    name = _e(feed["title"] or feed["url"])
+    if feed["template"]:
+        await _reply(
+            message,
+            f"<b>Свой промпт ленты #{feed_id}</b> ({name})\n<pre>{_e(feed['template'])}</pre>\n\n"
+            f"Изменить: <code>/setfeedtemplate {feed_id} текст</code>\n"
+            f"Вернуть общий промпт: <code>/resetfeedtemplate {feed_id}</code>",
+        )
+        return
+    await _reply(
+        message,
+        f"Лента #{feed_id} ({name}) использует общий промпт — /template.\n\n"
+        f"Задать свой только для неё: <code>/setfeedtemplate {feed_id} текст</code>",
+    )
+
+
+@router.message(Command("setfeedtemplate"))
+async def cmd_setfeedtemplate(message: Message, command: CommandObject, st: Storage) -> None:
+    feed_id, text = _split_id_and_text(command.args)
+    feed = st.feed(feed_id) if feed_id is not None else None
+    if feed is None or not text:
+        await _reply(
+            message,
+            "Как использовать: <code>/setfeedtemplate 1 текст промпта</code> (id смотрите в /list)\n\n"
+            "Пришлите текст одним сообщением после id (перенос строки — Shift+Enter):\n\n"
+            "<code>/setfeedtemplate 1 Перепиши в 2 предложения.\n\n"
+            "Заголовок: {title}\nТекст: {summary}</code>",
+        )
+        return
+    if "{summary}" not in text and "{title}" not in text:
+        await _reply(message, "⚠️ В промпте нет ни <code>{title}</code>, ни <code>{summary}</code> — "
+                              "модель не получит саму новость. Не сохранено.")
+        return
+    st.update_feed(feed_id, template=text)
+    await _reply(message, f"✅ Свой промпт для ленты #{feed_id} сохранён. "
+                          f"Проверить: <code>/test {feed_id}</code>")
+
+
+@router.message(Command("resetfeedtemplate"))
+async def cmd_resetfeedtemplate(message: Message, command: CommandObject, st: Storage) -> None:
+    feed_id = _parse_id(command.args)
+    feed = st.feed(feed_id) if feed_id is not None else None
+    if feed is None:
+        await _reply(message, "Как использовать: <code>/resetfeedtemplate 1</code> (id смотрите в /list)")
+        return
+    if not feed["template"]:
+        await _reply(message, f"У ленты #{feed_id} и так общий промпт — менять нечего.")
+        return
+    st.update_feed(feed_id, template=None)
+    await _reply(message, f"↩️ Лента #{feed_id} снова использует общий промпт — /template.")
 
 
 @router.message(Command("format"))

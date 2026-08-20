@@ -473,11 +473,13 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         for f in rows:
             checked = time.strftime("%d.%m %H:%M", time.localtime(f["last_check"])) if f["last_check"] else "—"
             err = f'<div class="muted" style="color:#ff9d9d">{_e(f["last_error"][:150])}</div>' if f["last_error"] else ""
+            own_prompt = f' <span class="pill on">свой промпт</span>' if f["template"] else ""
             items += f"""<tr>
               <td>#{f['id']}<br><span class="pill {'on' if f['enabled'] else 'off'}">{'вкл' if f['enabled'] else 'пауза'}</span></td>
-              <td>{_e(f['title'] or '(без названия)')}<br><span class="mono muted">{_e(f['url'])}</span>{err}</td>
+              <td>{_e(f['title'] or '(без названия)')}{own_prompt}<br><span class="mono muted">{_e(f['url'])}</span>{err}</td>
               <td class="muted">{checked}<br>в архиве: {st.seen_count(f['id'])}</td>
               <td>
+                <a class="btn" href="/feeds/{f['id']}/template">🤖 Промпт</a>
                 <form class="inline" method="post" action="/feeds/{f['id']}/toggle">{csrf_field(request)}
                   <button type="submit">{'⏸' if f['enabled'] else '▶️'}</button></form>
                 <form class="inline" method="post" action="/feeds/{f['id']}/delete"
@@ -533,6 +535,75 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if row is not None:
             st.set_enabled(feed_id, not row["enabled"])
         return _redirect("/feeds")
+
+    # --- свой промпт для отдельной ленты ----------------------------------
+    async def feed_template_get(request: web.Request, draft: str | None = None,
+                                flash: str = "", flash_kind: str = "ok") -> web.Response:
+        st: Storage = app["st"]
+        feed_id = int(request.match_info["id"])
+        feed = st.feed(feed_id)
+        if feed is None:
+            raise web.HTTPNotFound(text="Лента не найдена")
+        text = draft if draft is not None else (feed["template"] or "")
+        is_custom = bool(feed["template"])
+        reset_form = (
+            f'<form id="reset-feed-template-{feed_id}" method="post" '
+            f'action="/feeds/{feed_id}/template/reset">{csrf_field(request)}</form>'
+            if is_custom else ""
+        )
+        reset_btn = (f'<button type="submit" form="reset-feed-template-{feed_id}">Вернуть общий промпт</button>'
+                    if is_custom else "")
+        body = f"""
+        <h2>Промпт ленты #{feed_id}</h2>
+        <div class="card">
+          <div class="line">{_e(feed['title'] or feed['url'])}</div>
+          <div class="line muted">Сейчас: {'свой промпт' if is_custom else 'общий промпт (см. /template)'}</div>
+        </div>
+        <div class="card">
+          <form method="post" action="/feeds/{feed_id}/template">{csrf_field(request)}
+            <label>Свой промпт для этой ленты (пусто — использовать общий)</label>
+            <textarea name="text" rows="14">{_e(text)}</textarea>
+            <div class="row" style="margin-top:10px;">
+              <button class="primary" type="submit">Сохранить</button>
+              {reset_btn}
+            </div>
+          </form>
+          {reset_form}
+        </div>
+        <div class="card">
+          <details>
+            <summary style="cursor:pointer; color:#ffd76a;">Общий промпт — для сравнения</summary>
+            <pre class="post" style="margin-top:10px;">{_e(st.get('template'))}</pre>
+          </details>
+        </div>
+        <p class="muted">Плейсхолдеры: <code>{{title}}</code> <code>{{summary}}</code>
+          <code>{{link}}</code> <code>{{source}}</code> <code>{{published}}</code></p>
+        """
+        return web.Response(text=_layout(f"Промпт ленты #{feed_id}", body, flash, flash_kind),
+                            content_type="text/html")
+
+    async def feed_template_post(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        feed_id = int(request.match_info["id"])
+        feed = st.feed(feed_id)
+        if feed is None:
+            raise web.HTTPNotFound(text="Лента не найдена")
+        text = str(request["form"].get("text", "")).strip()
+        if not text:
+            st.update_feed(feed_id, template=None)
+            return await feed_template_get(request, flash="Убрано — используется общий промпт.")
+        if "{summary}" not in text and "{title}" not in text:
+            return await feed_template_get(
+                request, draft=text,
+                flash="В промпте нет ни {title}, ни {summary} — модель не получит новость. Не сохранено.",
+                flash_kind="err")
+        st.update_feed(feed_id, template=text)
+        return await feed_template_get(request, flash="Сохранено.")
+
+    async def feed_template_reset(request: web.Request) -> web.Response:
+        feed_id = int(request.match_info["id"])
+        app["st"].update_feed(feed_id, template=None)
+        return _redirect(f"/feeds/{feed_id}/template")
 
     # --- шаблон / формат -----------------------------------------------------
     async def template_get(request: web.Request, flash: str = "", flash_kind: str = "ok") -> web.Response:
@@ -886,6 +957,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/feeds/add", feeds_add)
     app.router.add_post("/feeds/{id}/delete", feeds_delete)
     app.router.add_post("/feeds/{id}/toggle", feeds_toggle)
+    app.router.add_get("/feeds/{id}/template", feed_template_get)
+    app.router.add_post("/feeds/{id}/template", feed_template_post)
+    app.router.add_post("/feeds/{id}/template/reset", feed_template_reset)
     app.router.add_get("/template", template_get)
     app.router.add_post("/template", template_post)
     app.router.add_post("/template/reset", template_reset)

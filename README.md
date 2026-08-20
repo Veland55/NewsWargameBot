@@ -52,6 +52,7 @@
 | | |
 |---|---|
 | **Ленты** | `/add <url> [название]` · `/list` · `/del <id>` · `/pause <id>` · `/resume <id>` · `/test <id>` |
+| **Свой промпт ленты** | `/feedtemplate <id>` · `/setfeedtemplate <id> <текст>` · `/resetfeedtemplate <id>` |
 | **Опубликованное** | `/posts [n]` · `/edit <id>` · `/setpost <id> <текст>` · `/regen <id> [пожелание]` |
 | **Отладка** | `/debug on` · `/debug off` · `/usage` |
 | **Шаблоны** | `/template` · `/settemplate` · `/format` · `/setformat` · `/reset template\|format` |
