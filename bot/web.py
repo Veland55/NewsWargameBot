@@ -15,11 +15,15 @@ Storage/Publisher, эти хендлеры только рендерят HTML и
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import html as html_mod
+import json
 import logging
 import secrets
 import time
 from typing import Awaitable, Callable
+from urllib.parse import parse_qsl
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -46,6 +50,43 @@ SETTINGS_EDITABLE = (
     "alert_thresholds", "free_daily_limit", "claude_max_images",
 )
 SETTINGS_TOGGLES = ("require_russian", "disable_preview", "images", "og_image")
+
+TG_AUTH_DATE_TTL = 24 * 3600     # старше суток initData не принимаем (см. verify_telegram_init_data)
+
+
+def verify_telegram_init_data(init_data: str, bot_token: str) -> dict | None:
+    """Проверка initData из Telegram Web App (авто-вход /tg-login).
+
+    Тот же алгоритм, что описан в официальной доке Telegram — HMAC от
+    bot_token, secret_key = HMAC_SHA256(key="WebAppData", data=bot_token).
+    Возвращает распарсенный объект user или None, если подпись неверна,
+    истёк auth_date, или initData вообще пустой (бот открыт не из Telegram).
+    """
+    if not init_data or not bot_token:
+        return None
+    try:
+        data = dict(parse_qsl(init_data, keep_blank_values=True))
+    except ValueError:
+        return None
+    received_hash = data.pop("hash", None)
+    if not received_hash:
+        return None
+    check_string = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+    secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+    computed_hash = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(computed_hash, received_hash):
+        return None
+    try:
+        auth_date = int(data.get("auth_date", "0"))
+    except ValueError:
+        return None
+    if not auth_date or time.time() - auth_date > TG_AUTH_DATE_TTL:
+        return None
+    try:
+        user = json.loads(data.get("user", "null"))
+    except ValueError:
+        return None
+    return user if isinstance(user, dict) and "id" in user else None
 
 
 def _e(text: object) -> str:
@@ -220,6 +261,7 @@ def _login_page(error: str = "") -> str:
 <main style="max-width:360px; margin-top:80px;">
   <h2>Вход в панель</h2>
   {err_html}
+  <div id="tgLoginNote" class="flash ok" style="display:none;">Вхожу через Telegram…</div>
   <div class="card">
     <form method="post" action="/login">
       <label>Пароль</label>
@@ -227,7 +269,22 @@ def _login_page(error: str = "") -> str:
       <div style="margin-top:12px;"><button class="primary" type="submit">Войти</button></div>
     </form>
   </div>
-</main></body></html>"""
+</main>
+<script>
+(function () {{
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (!tg || !tg.initData) return;
+  document.getElementById('tgLoginNote').style.display = 'block';
+  fetch('/tg-login', {{
+    method: 'POST', headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{initData: tg.initData}})
+  }}).then(function (r) {{
+    if (r.ok) {{ location.href = '/'; }}
+    else {{ document.getElementById('tgLoginNote').style.display = 'none'; }}
+  }}).catch(function () {{ document.getElementById('tgLoginNote').style.display = 'none'; }});
+}})();
+</script>
+</body></html>"""
 
 
 def _redirect(path: str) -> web.HTTPFound:
@@ -235,15 +292,17 @@ def _redirect(path: str) -> web.HTTPFound:
 
 
 # ======================== приложение ========================
-def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str) -> web.Application:
+def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
+               admin_ids: set[int] | None = None) -> web.Application:
     auth = WebAuth(password)
+    admin_ids = admin_ids or set()
     app = web.Application()
     app["auth"] = auth
     app["st"] = storage
     app["publisher"] = publisher
     app["bot"] = bot
 
-    PUBLIC_PATHS = {"/login"}
+    PUBLIC_PATHS = {"/login", "/tg-login"}
 
     @web.middleware
     async def auth_middleware(request: web.Request, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]):
@@ -291,6 +350,26 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str) 
         auth.revoke(request.cookies.get(SESSION_COOKIE))
         resp = _redirect("/login")
         resp.del_cookie(SESSION_COOKIE)
+        return resp
+
+    async def tg_login_post(request: web.Request) -> web.Response:
+        """Авто-вход без пароля, когда панель открыта Web App-кнопкой в
+        Telegram: initData подписан ботом, доверяем ей вместо пароля — но
+        только для тех, кто и так может управлять ботом командами (ADMIN_IDS).
+        Не троганное CSRF-мидлварой — сессии тут ещё нет, а подделать
+        initData без BOT_TOKEN невозможно, ровно как и подобрать пароль."""
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad_request"}, status=400)
+        user = verify_telegram_init_data(str(payload.get("initData", "")), bot.token)
+        if user is None:
+            return web.json_response({"ok": False, "error": "invalid_signature"}, status=401)
+        if int(user["id"]) not in admin_ids:
+            return web.json_response({"ok": False, "error": "not_admin"}, status=403)
+        token = auth.new_session()
+        resp = web.json_response({"ok": True})
+        resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="Lax")
         return resp
 
     # --- статус -------------------------------------------------------------
@@ -748,6 +827,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str) 
 
     app.router.add_get("/login", login_get)
     app.router.add_post("/login", login_post)
+    app.router.add_post("/tg-login", tg_login_post)
     app.router.add_post("/logout", logout_post)
     app.router.add_get("/", dashboard)
     app.router.add_post("/pause", pause_post)
@@ -778,9 +858,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str) 
 
 
 async def run_web_panel(storage: Storage, publisher: Publisher, bot: Bot,
-                        password: str, port: int, host: str = "0.0.0.0"
+                        password: str, port: int, host: str = "0.0.0.0",
+                        admin_ids: set[int] | None = None
                         ) -> tuple[web.AppRunner, web.TCPSite]:
-    app = create_app(storage, publisher, bot, password)
+    app = create_app(storage, publisher, bot, password, admin_ids=admin_ids)
     runner = web.AppRunner(app, access_log=log)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
