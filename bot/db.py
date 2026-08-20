@@ -1,0 +1,390 @@
+"""SQLite-хранилище: ленты, настройки, отметки о прочитанном.
+
+Все запросы короткие, поэтому используем синхронный sqlite3 под локом —
+это дешевле и проще, чем тащить async-драйвер.
+"""
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS feeds (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    url           TEXT NOT NULL UNIQUE,
+    title         TEXT NOT NULL DEFAULT '',
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    template      TEXT,              -- переопределение шаблона для этой ленты
+    etag          TEXT,              -- условный GET, чтобы не качать лишнее
+    modified      TEXT,
+    pending       INTEGER NOT NULL DEFAULT 0,  -- остался непубликованный хвост
+    last_check    INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT,
+    added_at      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS seen (
+    feed_id   INTEGER NOT NULL,
+    key       TEXT NOT NULL,
+    seen_at   INTEGER NOT NULL,
+    PRIMARY KEY (feed_id, key)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Картинки, вытащенные со страниц новостей (og:image). Пустая строка —
+-- «смотрели, там нет»: это тоже кэшируем, чтобы не ходить повторно.
+CREATE TABLE IF NOT EXISTS page_image (
+    url        TEXT PRIMARY KEY,
+    image      TEXT NOT NULL,
+    checked_at INTEGER NOT NULL
+) WITHOUT ROWID;
+
+-- Расход по дням UTC: лимиты бесплатных моделей OpenRouter суточные,
+-- сбрасываются в 00:00 UTC.
+CREATE TABLE IF NOT EXISTS usage (
+    day        TEXT PRIMARY KEY,
+    requests   INTEGER NOT NULL DEFAULT 0,
+    tokens_in  INTEGER NOT NULL DEFAULT 0,
+    tokens_out INTEGER NOT NULL DEFAULT 0,
+    cost       REAL    NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+"""
+
+DEFAULT_TEMPLATE = """\
+Ты — редактор Telegram-канала с новостями. Перепиши новость на русском языке.
+
+Требования:
+- 2-4 коротких предложения, только факты из источника;
+- ничего не выдумывай, не добавляй оценок и воды;
+- без markdown и без ссылок в тексте;
+- в конце — 2-3 тематических хештега.
+
+Новость:
+Заголовок: {title}
+Источник: {source}
+Дата: {published}
+Текст: {summary}"""
+
+DEFAULT_FORMAT = """\
+{ai}
+
+<a href="{link}">Источник</a>"""
+
+DEFAULTS: dict[str, str] = {
+    "template": DEFAULT_TEMPLATE,
+    "post_format": DEFAULT_FORMAT,
+    "interval": "15",          # минуты между проверками
+    "max_per_cycle": "3",      # сколько новостей максимум брать из одной ленты за проход
+    "post_delay": "5",         # пауза между публикациями, сек
+    "backfill": "1",           # сколько новостей опубликовать при первом опросе новой ленты
+    "max_age_days": "7",       # новости старше — не публиковать (0 = публиковать любые)
+    "flood_guard": "15",       # столько новых записей разом — считать выдачу ленты сбитой
+    "channel_id": "",          # переопределяет CHANNEL_ID из .env
+    "model": "",               # переопределяет LLM_MODEL из .env (пусто = из .env)
+    "paused": "0",             # глобальная пауза публикаций
+    # skip = отложить до следующего прохода (новость не помечается прочитанной
+    # и будет обработана снова), raw = опубликовать исходник без обработки.
+    # По умолчанию skip: необработанная новость в канале хуже её отсутствия.
+    "on_llm_error": "skip",
+    "require_russian": "1",    # ответ не на русском считать отказом модели
+    "disable_preview": "0",
+    "images": "1",             # прикладывать картинку из новости к посту
+    "og_image": "1",           # если в ленте картинки нет — взять со страницы новости
+    "vk_enabled": "1",         # дублировать посты в VK, если задан VK_TOKEN
+    "vk_group_id": "",         # переопределяет VK_GROUP_ID из .env
+    "claude_mode": "0",        # обработка через платный Claude вместо LLM_* из .env,
+                               # плюс несколько картинок со страницы новости вместо одной
+    "claude_max_images": "6",  # сколько картинок со страницы прикладывать (1-10)
+    "keep_seen": "500",        # сколько отметок хранить на ленту
+    "debug": "0",              # отладка: посты уходят в личку админам, а не в канал
+    "alert_thresholds": "70,90",  # при каком % расхода лимита предупреждать
+    "free_daily_limit": "0",   # суточный лимит запросов; 0 = определить автоматически
+}
+
+# Лимиты бесплатных моделей OpenRouter (значения из их документации).
+FREE_RPD_NO_CREDITS = 50     # если кредитов куплено меньше порога
+FREE_RPD_WITH_CREDITS = 1000  # если куплено 10+ кредитов
+FREE_RPM = 20
+
+
+def entry_key(*parts: str) -> str:
+    """Стабильный идентификатор записи ленты."""
+    raw = "\x00".join(p for p in parts if p)
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:32]
+
+
+class Storage:
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._path = path
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            # Потолок для WAL: после крупной транзакции файл ужимается обратно,
+            # а не остаётся раздутым до перезапуска.
+            self._conn.execute("PRAGMA journal_size_limit=4194304")
+            self._conn.executescript(SCHEMA)
+            self._migrate()
+            self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Добавляет колонки, появившиеся после создания базы.
+
+        CREATE TABLE IF NOT EXISTS не меняет существующую таблицу, поэтому
+        новые поля доносим руками — иначе обновление ломает старую базу.
+        """
+        added: dict[str, list[tuple[str, str]]] = {
+            "feeds": [("pending", "INTEGER NOT NULL DEFAULT 0")],
+        }
+        for table, columns in added.items():
+            have = {
+                row["name"]
+                for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, decl in columns:
+                if name not in have:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    # --- настройки -------------------------------------------------------
+    def get(self, key: str) -> str:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else DEFAULTS.get(key, "")
+
+    def get_int(self, key: str) -> int:
+        try:
+            return int(self.get(key))
+        except ValueError:
+            return int(DEFAULTS.get(key, "0") or 0)
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
+            self._conn.commit()
+
+    # --- ленты -----------------------------------------------------------
+    def add_feed(self, url: str, title: str = "") -> int | None:
+        """Возвращает id новой ленты или None, если такая уже есть."""
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "INSERT INTO feeds (url, title, added_at) VALUES (?, ?, ?)",
+                    (url, title, int(time.time())),
+                )
+                self._conn.commit()
+                return int(cur.lastrowid)
+            except sqlite3.IntegrityError:
+                return None
+
+    def feeds(self, only_enabled: bool = False) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM feeds"
+        if only_enabled:
+            sql += " WHERE enabled = 1"
+        sql += " ORDER BY id"
+        with self._lock:
+            return self._conn.execute(sql).fetchall()
+
+    def feed(self, feed_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM feeds WHERE id = ?", (feed_id,)
+            ).fetchone()
+
+    def delete_feed(self, feed_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM feeds WHERE id = ?", (feed_id,))
+            self._conn.execute("DELETE FROM seen WHERE feed_id = ?", (feed_id,))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def set_enabled(self, feed_id: int, enabled: bool) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE feeds SET enabled = ? WHERE id = ?", (int(enabled), feed_id)
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def update_feed(self, feed_id: int, **fields: Any) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE feeds SET {cols} WHERE id = ?", (*fields.values(), feed_id)
+            )
+            self._conn.commit()
+
+    # --- дедупликация ----------------------------------------------------
+    def is_seen(self, feed_id: int, key: str) -> bool:
+        with self._lock:
+            return (
+                self._conn.execute(
+                    "SELECT 1 FROM seen WHERE feed_id = ? AND key = ?", (feed_id, key)
+                ).fetchone()
+                is not None
+            )
+
+    def mark_seen(self, feed_id: int, keys: list[str] | str) -> None:
+        if isinstance(keys, str):
+            keys = [keys]
+        if not keys:
+            return
+        now = int(time.time())
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO seen (feed_id, key, seen_at) VALUES (?, ?, ?)",
+                [(feed_id, k, now) for k in keys],
+            )
+            self._conn.commit()
+
+    def seen_count(self, feed_id: int) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM seen WHERE feed_id = ?", (feed_id,)
+            ).fetchone()
+        return int(row["n"])
+
+    # --- кэш картинок со страниц ------------------------------------------
+    def page_image(self, url: str) -> str | None:
+        """None — страницу ещё не смотрели; "" — смотрели, картинки нет."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT image FROM page_image WHERE url = ?", (url,)
+            ).fetchone()
+        return row["image"] if row else None
+
+    def set_page_image(self, url: str, image: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO page_image (url, image, checked_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(url) DO UPDATE SET image = excluded.image, "
+                "checked_at = excluded.checked_at",
+                (url, image, int(time.time())),
+            )
+            self._conn.commit()
+
+    def prune_page_images(self, keep: int = 500) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM page_image WHERE url NOT IN "
+                "(SELECT url FROM page_image ORDER BY checked_at DESC LIMIT ?)",
+                (keep,),
+            )
+            self._conn.commit()
+
+    # --- учёт расхода LLM ------------------------------------------------
+    def bump_usage(self, day: str, tokens_in: int = 0, tokens_out: int = 0,
+                   cost: float = 0.0) -> int:
+        """Плюс один запрос за день `day`. Возвращает новое число запросов."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO usage (day, requests, tokens_in, tokens_out, cost) "
+                "VALUES (?, 1, ?, ?, ?) "
+                "ON CONFLICT(day) DO UPDATE SET "
+                "  requests   = requests + 1,"
+                "  tokens_in  = tokens_in + excluded.tokens_in,"
+                "  tokens_out = tokens_out + excluded.tokens_out,"
+                "  cost       = cost + excluded.cost",
+                (day, tokens_in, tokens_out, cost),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT requests FROM usage WHERE day = ?", (day,)
+            ).fetchone()
+        return int(row["requests"]) if row else 0
+
+    def usage(self, day: str) -> dict[str, float]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT requests, tokens_in, tokens_out, cost FROM usage WHERE day = ?",
+                (day,),
+            ).fetchone()
+        if not row:
+            return {"requests": 0, "tokens_in": 0, "tokens_out": 0, "cost": 0.0}
+        return {
+            "requests": int(row["requests"]),
+            "tokens_in": int(row["tokens_in"]),
+            "tokens_out": int(row["tokens_out"]),
+            "cost": float(row["cost"]),
+        }
+
+    def prune_usage(self, keep_days: int = 60) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM usage WHERE day NOT IN "
+                "(SELECT day FROM usage ORDER BY day DESC LIMIT ?)",
+                (keep_days,),
+            )
+            self._conn.commit()
+
+    def drop_alerts_except(self, day: str) -> None:
+        """Чистим отметки об отправленных предупреждениях за прошлые дни."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM settings WHERE key LIKE 'alerted:%' AND key NOT LIKE ?",
+                (f"alerted:{day}:%",),
+            )
+            self._conn.commit()
+
+    def maintain(self, keep_seen: int, keep_usage_days: int = 60) -> dict[str, int]:
+        """Периодическая уборка: обрезает таблицы и ужимает WAL.
+
+        Без неё отметки о прочитанном подчищались только у тех лент, которые
+        только что опубликовались, а WAL после крупных транзакций так и
+        оставался раздутым до перезапуска.
+        """
+        before = self.db_bytes()
+        for row in self.feeds():
+            self.prune_seen(row["id"], keep_seen)
+        self.prune_usage(keep_usage_days)
+        self.prune_page_images()
+        with self._lock:
+            # TRUNCATE возвращает файл WAL к нулю, а не просто помечает
+            # содержимое переиспользуемым.
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._conn.execute("PRAGMA optimize")
+            self._conn.commit()
+        return {"before": before, "after": self.db_bytes()}
+
+    def db_bytes(self) -> int:
+        """Размер базы вместе с WAL — то, что реально занято на диске."""
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                total += (self._path.parent / (self._path.name + suffix)).stat().st_size
+            except OSError:
+                pass
+        return total
+
+    def prune_seen(self, feed_id: int, keep: int) -> None:
+        """Оставляем только последние `keep` отметок, чтобы база не пухла."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM seen WHERE feed_id = ? AND key NOT IN ("
+                "  SELECT key FROM seen WHERE feed_id = ? ORDER BY seen_at DESC LIMIT ?"
+                ")",
+                (feed_id, feed_id, keep),
+            )
+            self._conn.commit()

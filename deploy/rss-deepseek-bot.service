@@ -1,0 +1,38 @@
+[Unit]
+Description=RSS -> DeepSeek -> Telegram channel bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+ExecStart=__DIR__/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rss-bot
+
+# Немного изоляции: боту нужен только свой каталог с базой
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=__DIR__/data
+
+# Потолок ресурсов. В работе боту хватает ~170 МБ (почти всё — импорт
+# библиотек), рост со временем не наблюдается. Лимит нужен на случай сбоя:
+# при MemoryMax процесс будет убит и перезапущен, а не утащит за собой
+# весь сервер. MemoryHigh — мягкий порог: сначала система поджимает кэш.
+MemoryHigh=256M
+MemoryMax=384M
+TasksMax=64
+LimitNOFILE=1024
+
+# Журнал: бот пишет мало, но при аварийном цикле мог бы залить диск логами.
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+[Install]
+WantedBy=multi-user.target

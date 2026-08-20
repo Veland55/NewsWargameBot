@@ -1,0 +1,921 @@
+"""Команды управления ботом (только для админов из ADMIN_IDS)."""
+from __future__ import annotations
+
+import html
+import logging
+import time
+
+from aiogram import Bot, F, Router
+from aiogram.filters import BaseFilter, Command, CommandObject
+from aiogram.types import (BufferedInputFile, InputMediaPhoto,
+                           LinkPreviewOptions, Message)
+
+from .db import DEFAULTS, Storage
+from .llm import LLMError
+from .publisher import TG_CAPTION_LIMIT, Publisher, _ext_for, html_problem, tg_len
+from .quota import until_reset
+from .rss import fetch
+from .vk import VKError, to_plain
+
+log = logging.getLogger(__name__)
+router = Router(name="admin")
+
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+HELP = """<b>RSS → DeepSeek → канал</b>
+
+<b>Ленты</b>
+/add &lt;url&gt; [название] — добавить ленту
+/list — список лент
+/del &lt;id&gt; — удалить ленту
+/pause &lt;id&gt; · /resume &lt;id&gt; — выключить/включить ленту
+/test &lt;id&gt; — прогнать последнюю новость через шаблон без публикации
+
+<b>Отладка</b>
+/debug on · /debug off — посты приходят в личку вместо канала
+/usage — расход лимита ИИ за сутки
+
+<b>Шаблоны</b>
+/template — показать промпт для DeepSeek
+/settemplate &lt;текст&gt; — задать промпт
+/format — показать формат поста
+/setformat &lt;текст&gt; — задать формат поста
+/reset template|format — вернуть значение по умолчанию
+
+Плейсхолдеры: <code>{title}</code> <code>{summary}</code> <code>{link}</code> <code>{source}</code> <code>{published}</code>
+В формате поста дополнительно <code>{ai}</code> — ответ модели. Формат поста поддерживает HTML-теги Telegram.
+
+Картинка из новости прикладывается сама, отдельного плейсхолдера не нужно: до 1024 символов — фото с подписью, длиннее — превью над текстом. Если картинки нет в самой ленте, бот берёт её со страницы новости (og:image). Выключить: <code>/set images 0</code>, только дочитывание со страницы — <code>/set og_image 0</code>
+
+<b>Настройки</b>
+/status — состояние бота
+/model · /setmodel &lt;название&gt; — модель LLM
+/interval &lt;мин&gt; — периодичность проверки
+/set &lt;ключ&gt; &lt;значение&gt; — прочие параметры (см. /status)
+/setchannel &lt;@канал|id&gt; — куда публиковать
+/vk — дублирование постов в сообщество VK
+/claude — обработка через платный Claude + несколько картинок из новости
+/checknow — проверить ленты немедленно
+/stop · /start — глобальная пауза и снятие паузы"""
+
+
+class IsAdmin(BaseFilter):
+    def __init__(self, admin_ids: set[int]):
+        self.admin_ids = admin_ids
+
+    async def __call__(self, message: Message) -> bool:
+        return bool(message.from_user and message.from_user.id in self.admin_ids)
+
+
+def setup(router_: Router, admin_ids: set[int]) -> None:
+    """Вешаем проверку прав на все хендлеры роутера сразу."""
+    guard = IsAdmin(admin_ids)
+    router_.message.filter(guard)
+
+
+def _e(text: str) -> str:
+    return html.escape(str(text or ""))
+
+
+async def _reply(message: Message, text: str) -> None:
+    await message.answer(text, parse_mode="HTML", link_preview_options=NO_PREVIEW)
+
+
+async def _preview_post(message: Message, post) -> bool:
+    """Показывает пост в личке так же, как он ушёл бы в канал. True — картинка
+    (одна или альбом) показана, False — нечем, вызывающий шлёт текстом сам."""
+    if post.images:
+        media = [InputMediaPhoto(
+            media=BufferedInputFile(data, filename=f"image{i}.{_ext_for(ctype)}"),
+            caption=post.text if i == 0 and tg_len(post.text) <= TG_CAPTION_LIMIT else None,
+            parse_mode="HTML" if i == 0 else None,
+        ) for i, (data, ctype) in enumerate(post.images)]
+        try:
+            if len(media) == 1:
+                await message.answer_photo(
+                    media[0].media, caption=media[0].caption, parse_mode="HTML")
+            else:
+                await message.answer_media_group(media)
+            if not (tg_len(post.text) <= TG_CAPTION_LIMIT):
+                await message.answer(post.text, parse_mode="HTML",
+                                     link_preview_options=NO_PREVIEW)
+            return True
+        except Exception as exc:
+            await _reply(message, f"⚠️ Telegram не принял картинки: "
+                                  f"<code>{_e(exc)}</code>\nПост уйдёт без них.")
+            return False
+
+    if post.image and tg_len(post.text) <= TG_CAPTION_LIMIT:
+        try:
+            await message.answer_photo(post.image, caption=post.text,
+                                       parse_mode="HTML")
+            return True
+        except Exception as exc:
+            await _reply(message, f"⚠️ Telegram не принял картинку "
+                                  f"<code>{_e(post.image)}</code>: <code>{_e(exc)}</code>\n"
+                                  f"Пост уйдёт без неё.")
+            return False
+    if post.image:
+        # Длинный пост в подпись не влезает — как и в канале, показываем
+        # картинку превью-ссылкой над текстом.
+        await message.answer(
+            post.text, parse_mode="HTML",
+            link_preview_options=LinkPreviewOptions(
+                url=post.image, is_disabled=False, prefer_large_media=True,
+                show_above_text=True),
+        )
+        return True
+    return False
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await _reply(message, HELP)
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, st: Storage) -> None:
+    if st.get("paused") == "1":
+        st.set("paused", "0")
+        await _reply(message, "▶️ Публикация возобновлена.\n\n" + HELP)
+    else:
+        await _reply(message, HELP)
+
+
+@router.message(Command("stop"))
+async def cmd_stop(message: Message, st: Storage) -> None:
+    st.set("paused", "1")
+    await _reply(message, "⏸ Публикация приостановлена. Вернуть — /start")
+
+
+@router.message(Command("add"))
+async def cmd_add(message: Message, st: Storage, publisher: Publisher) -> None:
+    args = (message.text or "").split(maxsplit=2)[1:]
+    if not args:
+        await _reply(message, "Как использовать: <code>/add https://example.com/rss Название</code>")
+        return
+
+    url = args[0].strip()
+    title = args[1].strip() if len(args) > 1 else ""
+    if not url.startswith(("http://", "https://")):
+        await _reply(message, "Нужна ссылка, начинающаяся на http:// или https://")
+        return
+
+    await _reply(message, "Проверяю ленту…")
+    result = await fetch(url)
+    if result.error:
+        await _reply(message, f"❌ Лента недоступна: <code>{_e(result.error)}</code>")
+        return
+    if not result.entries:
+        await _reply(message, "❌ В ленте нет записей — проверьте адрес.")
+        return
+
+    feed_id = st.add_feed(url, title or result.feed_title[:120])
+    if feed_id is None:
+        await _reply(message, "Такая лента уже добавлена — /list")
+        return
+
+    last = result.entries[-1]
+    await _reply(
+        message,
+        f"✅ Лента <b>#{feed_id}</b> добавлена: {_e(title or result.feed_title or url)}\n"
+        f"Записей в выдаче: {len(result.entries)}\n"
+        f"Последняя: {_e(last.title[:150])}\n\n"
+        f"Проверить обработку: /test {feed_id}",
+    )
+    publisher.wake()
+
+
+@router.message(Command("list"))
+async def cmd_list(message: Message, st: Storage) -> None:
+    feeds = st.feeds()
+    if not feeds:
+        await _reply(message, "Лент пока нет. Добавить: <code>/add &lt;url&gt;</code>")
+        return
+
+    lines = ["<b>Ленты</b>"]
+    for f in feeds:
+        mark = "✅" if f["enabled"] else "⏸"
+        checked = (
+            time.strftime("%d.%m %H:%M", time.localtime(f["last_check"]))
+            if f["last_check"] else "ещё не проверялась"
+        )
+        lines.append(
+            f"\n{mark} <b>#{f['id']}</b> {_e(f['title'] or '(без названия)')}\n"
+            f"   <code>{_e(f['url'])}</code>\n"
+            f"   проверена: {checked}, в архиве: {st.seen_count(f['id'])}"
+        )
+        if f["last_error"]:
+            lines.append(f"   ⚠️ {_e(f['last_error'][:150])}")
+        if f["template"]:
+            lines.append("   📝 свой шаблон")
+    await _reply(message, "\n".join(lines))
+
+
+@router.message(Command("del"))
+async def cmd_del(message: Message, command: CommandObject, st: Storage) -> None:
+    feed_id = _parse_id(command.args)
+    if feed_id is None:
+        await _reply(message, "Как использовать: <code>/del 1</code> (id смотрите в /list)")
+        return
+    if st.delete_feed(feed_id):
+        await _reply(message, f"🗑 Лента #{feed_id} удалена.")
+    else:
+        await _reply(message, f"Ленты #{feed_id} нет.")
+
+
+@router.message(Command("pause"))
+async def cmd_pause(message: Message, command: CommandObject, st: Storage) -> None:
+    feed_id = _parse_id(command.args)
+    if feed_id is None or not st.set_enabled(feed_id, False):
+        await _reply(message, "Как использовать: <code>/pause 1</code>")
+        return
+    await _reply(message, f"⏸ Лента #{feed_id} выключена.")
+
+
+@router.message(Command("resume"))
+async def cmd_resume(message: Message, command: CommandObject, st: Storage) -> None:
+    feed_id = _parse_id(command.args)
+    if feed_id is None or not st.set_enabled(feed_id, True):
+        await _reply(message, "Как использовать: <code>/resume 1</code>")
+        return
+    await _reply(message, f"▶️ Лента #{feed_id} включена.")
+
+
+@router.message(Command("test"))
+async def cmd_test(message: Message, command: CommandObject, st: Storage,
+                   publisher: Publisher) -> None:
+    feed_id = _parse_id(command.args)
+    feed = st.feed(feed_id) if feed_id is not None else None
+    if feed is None:
+        await _reply(message, "Как использовать: <code>/test 1</code> (id смотрите в /list)")
+        return
+
+    await _reply(message, "Забираю ленту и прогоняю через DeepSeek…")
+    result = await fetch(feed["url"])
+    if result.error or not result.entries:
+        await _reply(message, f"❌ {_e(result.error or 'в ленте нет записей')}")
+        return
+
+    entry = result.entries[-1]
+    started = time.monotonic()
+    try:
+        post = await publisher.build_post(entry, feed)
+    except LLMError as exc:
+        model_hint = ("Проверьте CLAUDE_API_KEY / CLAUDE_MODEL в .env"
+                      if publisher.claude_mode else
+                      "Проверьте LLM_API_KEY / LLM_MODEL / LLM_BASE_URL в .env")
+        await _reply(
+            message,
+            f"❌ {'Claude' if publisher.claude_mode else 'DeepSeek'} вернул "
+            f"ошибку: <code>{_e(exc)}</code>\n\n{model_hint}",
+        )
+        return
+
+    elapsed = time.monotonic() - started
+    if post.images:
+        picture = f"картинок: {len(post.images)}"
+    elif post.image:
+        picture = "с картинкой"
+    else:
+        picture = ("без картинки — в новости её нет" if st.get("images") == "1"
+                   else "без картинки — /set images 1")
+    await _reply(message, f"⬇️ Предпросмотр (за {elapsed:.1f}s, {picture}, "
+                          f"<b>не</b> опубликовано)")
+    shown = await _preview_post(message, post)
+    if not shown:
+        await message.answer(post.text, parse_mode="HTML",
+                             link_preview_options=NO_PREVIEW)
+
+    if publisher.vk_on:
+        # В VK уходит тот же пост без разметки — показываем и его, чтобы
+        # не выяснять постфактум, во что превратились теги и ссылки.
+        await _reply(message, "⬇️ Так же новость уйдёт в VK (тоже не опубликовано):")
+        # parse_mode=None обязателен: у бота по умолчанию HTML, а текст для VK
+        # уже без разметки — случайный «<» иначе сорвал бы отправку.
+        await message.answer(to_plain(post.text) or "(пусто)", parse_mode=None,
+                             link_preview_options=NO_PREVIEW)
+
+
+@router.message(Command("template"))
+async def cmd_template(message: Message, st: Storage) -> None:
+    await _reply(
+        message,
+        f"<b>Промпт для DeepSeek</b>\n<pre>{_e(st.get('template'))}</pre>\n"
+        f"Изменить: <code>/settemplate текст</code>",
+    )
+
+
+@router.message(Command("settemplate"))
+async def cmd_settemplate(message: Message, st: Storage) -> None:
+    text = _tail(message.text)
+    if not text:
+        await _reply(
+            message,
+            "Пришлите промпт одним сообщением после команды (перенос строки — Shift+Enter):\n\n"
+            "<code>/settemplate Перепиши новость в 2 предложения.\n\n"
+            "Заголовок: {title}\nТекст: {summary}</code>",
+        )
+        return
+    if "{summary}" not in text and "{title}" not in text:
+        await _reply(message, "⚠️ В промпте нет ни <code>{title}</code>, ни <code>{summary}</code> — "
+                              "модель не получит саму новость. Шаблон не сохранён.")
+        return
+    st.set("template", text)
+    await _reply(message, "✅ Промпт сохранён. Проверить: <code>/test &lt;id&gt;</code>")
+
+
+@router.message(Command("format"))
+async def cmd_format(message: Message, st: Storage) -> None:
+    await _reply(
+        message,
+        f"<b>Формат поста</b>\n<pre>{_e(st.get('post_format'))}</pre>\n"
+        f"Изменить: <code>/setformat текст</code>",
+    )
+
+
+@router.message(Command("setformat"))
+async def cmd_setformat(message: Message, st: Storage) -> None:
+    text = _tail(message.text)
+    if not text:
+        await _reply(
+            message,
+            "Пример:\n<code>/setformat &lt;b&gt;{title}&lt;/b&gt;\n\n{ai}\n\n"
+            "&lt;a href=\"{link}\"&gt;Источник&lt;/a&gt;</code>",
+        )
+        return
+    if "{ai}" not in text:
+        await _reply(message, "⚠️ Без <code>{ai}</code> в посте не будет текста от модели. Не сохранено.")
+        return
+    problem = html_problem(text)
+    if problem:
+        await _reply(
+            message,
+            f"⚠️ Разметка не годится: {problem}.\n\n"
+            f"Telegram отверг бы такой пост целиком. Формат не сохранён.\n"
+            f"Допустимые теги: <code>b i u s code pre a blockquote</code>",
+        )
+        return
+    st.set("post_format", text)
+    await _reply(message, "✅ Формат поста сохранён. Проверить: <code>/test &lt;id&gt;</code>")
+
+
+@router.message(Command("reset"))
+async def cmd_reset(message: Message, command: CommandObject, st: Storage) -> None:
+    what = (command.args or "").strip()
+    keys = {"template": "template", "format": "post_format"}
+    if what not in keys:
+        await _reply(message, "Как использовать: <code>/reset template</code> или <code>/reset format</code>")
+        return
+    key = keys[what]
+    st.set(key, DEFAULTS[key])
+    await _reply(message, f"↩️ Значение «{what}» сброшено к умолчанию.")
+
+
+@router.message(Command("interval"))
+async def cmd_interval(message: Message, command: CommandObject, st: Storage,
+                       publisher: Publisher) -> None:
+    value = _parse_id(command.args)
+    if value is None or not 1 <= value <= 1440:
+        await _reply(message, f"Как использовать: <code>/interval 15</code> (1–1440 мин)\n"
+                              f"Сейчас: {st.get_int('interval')} мин")
+        return
+    st.set("interval", value)
+    publisher.wake()
+    await _reply(message, f"✅ Проверяю ленты каждые {value} мин.")
+
+
+@router.message(Command("set"))
+async def cmd_set(message: Message, command: CommandObject, st: Storage) -> None:
+    editable = {
+        "interval", "max_per_cycle", "post_delay", "backfill",
+        "max_age_days", "flood_guard",
+        "on_llm_error", "require_russian", "disable_preview", "images",
+        "og_image", "keep_seen",
+        "alert_thresholds", "free_daily_limit", "claude_max_images",
+    }
+    parts = (command.args or "").split(maxsplit=1)
+    if len(parts) < 2 or parts[0] not in editable:
+        await _reply(
+            message,
+            "Как использовать: <code>/set max_per_cycle 5</code>\n\nДоступные ключи:\n"
+            + "\n".join(f"· <code>{k}</code> = {_e(st.get(k))}" for k in sorted(editable)),
+        )
+        return
+    key, value = parts[0], parts[1].strip()
+
+    if key == "on_llm_error":
+        if value not in ("raw", "skip"):
+            await _reply(message, "on_llm_error принимает <code>raw</code> или <code>skip</code>")
+            return
+    elif key == "alert_thresholds":
+        parsed = [p for p in value.replace(" ", "").split(",") if p]
+        if not all(p.isdigit() and 1 <= int(p) <= 100 for p in parsed) or not parsed:
+            await _reply(message, "Пороги — числа 1–100 через запятую, например "
+                                  "<code>/set alert_thresholds 70,90</code>")
+            return
+        value = ",".join(str(int(p)) for p in sorted({int(p) for p in parsed}))
+    elif not value.isdigit():
+        await _reply(message, f"{_e(key)} ожидает число.")
+        return
+
+    st.set(key, value)
+    await _reply(message, f"✅ <code>{_e(key)}</code> = <code>{_e(value)}</code>")
+
+
+@router.message(Command("setchannel"))
+async def cmd_setchannel(message: Message, command: CommandObject, st: Storage,
+                         bot: Bot, publisher: Publisher) -> None:
+    target = (command.args or "").strip()
+    if not target:
+        await _reply(message, f"Как использовать: <code>/setchannel @my_channel</code>\n"
+                              f"Сейчас: <code>{_e(publisher.channel or 'не задан')}</code>")
+        return
+    try:
+        chat = await bot.get_chat(target)
+    except Exception as exc:
+        await _reply(message, f"❌ Не вижу такой чат: <code>{_e(exc)}</code>\n"
+                              f"Бот должен быть админом канала.")
+        return
+    st.set("channel_id", str(chat.id))
+    await _reply(message, f"✅ Публикую в «{_e(chat.title or chat.id)}» (<code>{chat.id}</code>)")
+    publisher.wake()
+
+
+MODEL_HINTS = """Примеры моделей OpenRouter:
+
+<b>DeepSeek</b> (платный, но дешёвый — цена за 1000 новостей):
+· <code>deepseek/deepseek-v4-flash</code> — ~22 ₽
+· <code>deepseek/deepseek-v3.2</code> — ~40 ₽
+· <code>deepseek/deepseek-chat</code> — ~52 ₽
+
+<b>Бесплатные</b> (не DeepSeek, есть суточный лимит):
+· <code>nvidia/nemotron-3-super-120b-a12b:free</code>
+· <code>google/gemma-4-31b-it:free</code>
+· <code>openai/gpt-oss-20b:free</code>
+
+Список: openrouter.ai/models"""
+
+
+@router.message(Command("model"))
+async def cmd_model(message: Message, st: Storage, publisher: Publisher) -> None:
+    source = "задана командой" if st.get("model") else "из .env"
+    await _reply(
+        message,
+        f"Текущая модель: <code>{_e(publisher.llm.model)}</code> ({source})\n"
+        f"Сменить: <code>/setmodel &lt;название&gt;</code>\n\n{MODEL_HINTS}",
+    )
+
+
+@router.message(Command("setmodel"))
+async def cmd_setmodel(message: Message, command: CommandObject, st: Storage,
+                       publisher: Publisher) -> None:
+    name = (command.args or "").strip()
+    if not name:
+        await _reply(message, f"Как использовать: <code>/setmodel deepseek/deepseek-v4-flash</code>\n"
+                              f"Сейчас: <code>{_e(publisher.llm.model)}</code>\n\n{MODEL_HINTS}")
+        return
+    if " " in name:
+        await _reply(message, "Название модели без пробелов, например "
+                              "<code>deepseek/deepseek-v4-flash</code>")
+        return
+
+    previous = publisher.llm.model
+    publisher.llm.model = name
+    try:
+        await publisher.llm.complete("Ответь одним словом: работает")
+    except LLMError as exc:
+        publisher.llm.model = previous
+        await _reply(message, f"❌ Модель не ответила: <code>{_e(exc)}</code>\n"
+                              f"Оставил прежнюю: <code>{_e(previous)}</code>")
+        return
+
+    st.set("model", name)
+    await _reply(message, f"✅ Модель: <code>{_e(name)}</code> (проверена живым запросом)")
+
+
+@router.message(Command("checknow"))
+async def cmd_checknow(message: Message, st: Storage, publisher: Publisher) -> None:
+    if not st.feeds(only_enabled=True):
+        await _reply(message, "Нет активных лент.")
+        return
+    debug = publisher.debug
+    await _reply(message, "🔧 Отладка: собираю посты в личку…" if debug
+                 else "🔄 Проверяю ленты…")
+    stats = await publisher.run_once(manual=True)
+    verb = "показано в личке" if debug else "опубликовано"
+    tail = f", ошибок: {stats['errors']}" if stats["errors"] else ""
+    if publisher.vk_on and not debug:
+        tail += f", в VK: {stats['vk']}"
+    if stats.get("postponed"):
+        tail += f", отложено: {stats['postponed']}"
+    hint = ""
+    if stats.get("postponed"):
+        hint = ("\n\n⏳ Отложенные новости модель не смогла обработать. Они не "
+                "потеряны и уйдут в канал со следующей попыткой — подробности "
+                "в журнале. Публиковать такие без обработки: "
+                "<code>/set on_llm_error raw</code>.")
+    if debug and not stats["published"]:
+        hint = ("\n\nНовых новостей нет. Отладка показывает только непрочитанные — "
+                "чтобы посмотреть на конкретной новости, используйте "
+                "<code>/test &lt;id&gt;</code>.")
+    await _reply(message, f"Готово. Лент: {stats['feeds']}, {verb}: "
+                          f"{stats['published']}{tail}{hint}")
+
+
+@router.message(Command("debug"))
+async def cmd_debug(message: Message, command: CommandObject, st: Storage,
+                    publisher: Publisher) -> None:
+    arg = (command.args or "").strip().lower()
+    if arg in ("on", "вкл", "1"):
+        st.set("debug", "1")
+        await _reply(
+            message,
+            "🔧 <b>Режим отладки включён.</b>\n\n"
+            "· посты приходят сюда, в личку, а не в канал\n"
+            "· новости <b>не</b> помечаются прочитанными — после выключения "
+            "они уйдут в канал как обычно\n"
+            "· автоматический цикл в отладке молчит, проверка — по "
+            "<code>/checknow</code> (можно гонять одну и ту же новость, "
+            "меняя <code>/settemplate</code>)\n\n"
+            "Выключить: <code>/debug off</code>",
+        )
+        return
+    if arg in ("off", "выкл", "0"):
+        st.set("debug", "0")
+        await _reply(message, "✅ Режим отладки выключен, публикую в канал: "
+                             f"<code>{_e(publisher.channel or 'не задан')}</code>")
+        return
+    state = "включён 🔧" if publisher.debug else "выключен"
+    await _reply(message, f"Режим отладки {state}.\n"
+                          f"Как использовать: <code>/debug on</code> · "
+                          f"<code>/debug off</code>")
+
+
+VK_HELP = """<b>Публикация в VK</b>
+
+Посты дублируются на стену сообщества после публикации в Telegram.
+Разметка убирается (VK её не понимает), ссылки разворачиваются в текст.
+
+<b>Что нужно</b>
+1. В сообществе: Управление → Работа с API → Создать ключ.
+   Права: <b>Стена</b> и <b>Фотографии</b>.
+2. Числовой id сообщества (не короткое имя): «Ещё» → «Статистика» в адресе,
+   либо regvk.com/id
+3. В <code>.env</code>: <code>VK_TOKEN=vk1.a...</code> и <code>VK_GROUP_ID=123456789</code>, затем перезапуск.
+
+<b>Про картинку</b>
+Загружать фото на стену VK разрешает <b>только пользовательскому ключу</b>.
+Без него бот прикрепляет к записи ссылку на новость, и картинку подбирает сам
+VK со страницы источника — иногда её нет вовсе.
+
+Чтобы картинка была всегда, нужен <code>VK_USER_TOKEN</code>. Своё приложение создавать
+не обязательно (для этого нужно юрлицо) — подойдёт id уже существующего:
+
+1. Откройте в браузере под аккаунтом администратора сообщества:
+<code>https://oauth.vk.com/authorize?client_id=6121396&amp;scope=photos,wall,groups,offline&amp;response_type=token&amp;redirect_uri=https://oauth.vk.com/blank.html&amp;display=page</code>
+2. Разрешите доступ — откроется пустая страница.
+3. Из адресной строки скопируйте всё между <code>access_token=</code> и <code>&amp;expires_in</code>.
+4. Добавьте в <code>.env</code> строкой <code>VK_USER_TOKEN=...</code> и перезапустите бота.
+
+Ключ бессрочный, хранить его надо как пароль. Публикует по-прежнему
+сообщество — пользовательский ключ идёт только на загрузку фото.
+
+<b>Команды</b>
+/vk — это сообщение и состояние
+/vk on · /vk off — включить и выключить дублирование
+/vk group &lt;id&gt; — сменить сообщество без правки .env
+/vk check — проверить ключи (запрос к VK, ничего не публикует)
+/vk test &lt;id ленты&gt; — опубликовать последнюю новость ленты в VK"""
+
+
+@router.message(Command("vk"))
+async def cmd_vk(message: Message, command: CommandObject, st: Storage,
+                 publisher: Publisher) -> None:
+    args = (command.args or "").split()
+    action = args[0].lower() if args else ""
+    vk = publisher.vk
+
+    if action in ("on", "вкл", "1"):
+        st.set("vk_enabled", "1")
+        if not publisher.vk_on:
+            await _reply(message, "Включил, но публиковать пока не выйдет: "
+                                  "не хватает VK_TOKEN или id сообщества.\n\n" + VK_HELP)
+            return
+        await _reply(message, f"✅ Дублирую в VK, сообщество "
+                              f"<code>{_e(publisher.vk_group)}</code>")
+        return
+
+    if action in ("off", "выкл", "0"):
+        st.set("vk_enabled", "0")
+        await _reply(message, "⏸ В VK больше не публикую. Вернуть — <code>/vk on</code>")
+        return
+
+    if action == "group":
+        value = args[1].lstrip("-") if len(args) > 1 else ""
+        if not value.isdigit():
+            await _reply(message, "Как использовать: <code>/vk group 123456789</code> — "
+                                  "числовой id сообщества, не короткое имя.")
+            return
+        st.set("vk_group_id", value)
+        await _reply(message, f"✅ Сообщество VK: <code>{value}</code>. "
+                              f"Проверить: <code>/vk check</code>")
+        return
+
+    if action == "check":
+        if vk is None or not vk.token:
+            await _reply(message, "VK_TOKEN не задан.\n\n" + VK_HELP)
+            return
+        if not publisher.vk_group.isdigit():
+            await _reply(message, "Не задан id сообщества: "
+                                  "<code>/vk group 123456789</code>")
+            return
+        vk.group_id = publisher.vk_group
+        await _reply(message, "Спрашиваю VK…")
+        try:
+            name = await vk.group_name()
+        except VKError as exc:
+            await _reply(message, f"❌ VK ответил ошибкой: <code>{_e(exc)}</code>\n\n"
+                                  f"Чаще всего это чужой или отозванный ключ, "
+                                  f"либо у ключа нет прав «Стена» и «Фотографии».")
+            return
+        lines = [f"✅ Ключ сообщества рабочий: <b>{_e(name)}</b> "
+                 f"(<code>{_e(publisher.vk_group)}</code>)",
+                 f"Дублирование сейчас "
+                 f"{'включено' if publisher.vk_on else 'выключено'}."]
+        if vk.user_token:
+            # Тот же запрос, что и при публикации фото, но без самой загрузки.
+            try:
+                await vk._call("photos.getWallUploadServer",
+                               _token=vk.user_token, group_id=publisher.vk_group)
+                lines.append("🖼 Пользовательский ключ рабочий — картинки "
+                             "уходят настоящим фото.")
+            except VKError as exc:
+                lines.append(f"⚠️ Пользовательский ключ не работает: "
+                             f"<code>{_e(exc)}</code>\nКартинки пойдут "
+                             f"карточкой-ссылкой.")
+        else:
+            lines.append("🖼 <code>VK_USER_TOKEN</code> не задан — вместо фото "
+                         "карточка-ссылка, картинку выбирает сам VK. "
+                         "Как это исправить — /vk")
+        await _reply(message, "\n".join(lines))
+        return
+
+    if action == "test":
+        feed_id = _parse_id(" ".join(args[1:]))
+        feed = st.feed(feed_id) if feed_id is not None else None
+        if feed is None:
+            await _reply(message, "Как использовать: <code>/vk test 1</code> "
+                                  "(id ленты из /list)")
+            return
+        if vk is None or not publisher.vk_group.isdigit() or not vk.token:
+            await _reply(message, "Сначала настройте доступ.\n\n" + VK_HELP)
+            return
+        await _reply(message, "Беру последнюю новость и публикую её в VK…")
+        result = await fetch(feed["url"])
+        if result.error or not result.entries:
+            await _reply(message, f"❌ {_e(result.error or 'в ленте нет записей')}")
+            return
+        try:
+            post = await publisher.build_post(result.entries[-1], feed)
+        except LLMError as exc:
+            await _reply(message, f"❌ Модель вернула ошибку: <code>{_e(exc)}</code>")
+            return
+        vk.group_id = publisher.vk_group
+        try:
+            post_id = await vk.post(to_plain(post.text), post.image, post.link)
+        except VKError as exc:
+            await _reply(message, f"❌ VK не принял пост: <code>{_e(exc)}</code>")
+            return
+        link = f"https://vk.com/wall-{publisher.vk_group}_{post_id}" if post_id else ""
+        await _reply(message, "✅ Опубликовано в VK"
+                     + (f": {link}" if link else "")
+                     + "\n\nЭто настоящая запись на стене — если она не нужна, удалите её.")
+        return
+
+    state = "включено ✅" if publisher.vk_on else "выключено"
+    token = "задан" if vk and vk.token else "❌ не задан"
+    group = publisher.vk_group or "не задан"
+    picture = (vk.photo_mode if vk and vk.can_upload_photo
+               else "карточка-ссылка — VK возьмёт картинку со страницы источника")
+    await _reply(
+        message,
+        f"Дублирование в VK: {state}\n"
+        f"Ключ сообщества: {token}\nСообщество: <code>{_e(group)}</code>\n"
+        f"Картинка: {picture}\n\n" + VK_HELP,
+    )
+
+
+CLAUDE_HELP = """<b>Режим Claude</b>
+
+Платная обработка через Claude вместо DeepSeek/LLM_* из .env. В этом режиме
+бот сам открывает страницу новости и качает несколько картинок из статьи
+(а не одну, как обычно) — они уходят в канал альбомом.
+
+<b>Что нужно</b>
+В <code>.env</code>: <code>CLAUDE_API_KEY=sk-ant-...</code>, при необходимости
+<code>CLAUDE_MODEL=</code> (по умолчанию <code>claude-sonnet-5</code>), затем
+перезапуск бота.
+
+Шаблон промпта и формат поста — те же, что и для обычного режима
+(/template, /format). Сколько картинок прикладывать (1-10, по умолчанию 6):
+<code>/set claude_max_images 6</code>. Учёт расхода лимита ИИ (/usage) на
+Claude не распространяется — это отдельный платный API.
+
+<b>Команды</b>
+/claude — это сообщение и состояние
+/claude on · /claude off — включить и выключить режим
+/claude check — проверить ключ живым запросом (ничего не публикует)
+/claude test &lt;id ленты&gt; — прогнать последнюю новость ленты через Claude, показать в личке"""
+
+
+@router.message(Command("claude"))
+async def cmd_claude(message: Message, command: CommandObject, st: Storage,
+                     publisher: Publisher) -> None:
+    args = (command.args or "").split()
+    action = args[0].lower() if args else ""
+    claude = publisher.claude
+
+    if action in ("on", "вкл", "1"):
+        st.set("claude_mode", "1")
+        if not publisher.claude_mode:
+            await _reply(message, "Включил, но работать пока не выйдет: "
+                                  "не хватает CLAUDE_API_KEY в .env.\n\n" + CLAUDE_HELP)
+            return
+        await _reply(message, f"✅ Обрабатываю через Claude "
+                              f"(<code>{_e(claude.model)}</code>), картинки — "
+                              f"альбомом со страницы новости.")
+        return
+
+    if action in ("off", "выкл", "0"):
+        st.set("claude_mode", "0")
+        await _reply(message, "⏸ Вернул обычный режим "
+                              f"(<code>{_e(publisher.llm.model)}</code>). "
+                              "Включить снова — <code>/claude on</code>")
+        return
+
+    if action == "check":
+        if claude is None or not claude.api_key:
+            await _reply(message, "CLAUDE_API_KEY не задан.\n\n" + CLAUDE_HELP)
+            return
+        await _reply(message, "Спрашиваю Claude…")
+        try:
+            reply = await claude.complete("Ответь одним словом: работает")
+        except LLMError as exc:
+            await _reply(message, f"❌ Claude ответил ошибкой: <code>{_e(exc)}</code>\n\n"
+                                  f"Чаще всего дело в неверном ключе или названии модели "
+                                  f"(<code>CLAUDE_MODEL</code>).")
+            return
+        await _reply(message, f"✅ Ключ рабочий, модель <code>{_e(claude.model)}</code> "
+                              f"ответила: «{_e(reply[:200])}»")
+        return
+
+    if action == "test":
+        feed_id = _parse_id(" ".join(args[1:]))
+        feed = st.feed(feed_id) if feed_id is not None else None
+        if feed is None:
+            await _reply(message, "Как использовать: <code>/claude test 1</code> "
+                                  "(id ленты из /list)")
+            return
+        if claude is None or not claude.api_key:
+            await _reply(message, "CLAUDE_API_KEY не задан.\n\n" + CLAUDE_HELP)
+            return
+        await _reply(message, "Забираю ленту и прогоняю через Claude "
+                              "(качаю картинки со страницы — это дольше обычного)…")
+        result = await fetch(feed["url"])
+        if result.error or not result.entries:
+            await _reply(message, f"❌ {_e(result.error or 'в ленте нет записей')}")
+            return
+
+        entry = result.entries[-1]
+        was_on = st.get("claude_mode")
+        st.set("claude_mode", "1")   # build_post смотрит на это состояние
+        try:
+            post = await publisher.build_post(entry, feed)
+        except LLMError as exc:
+            await _reply(message, f"❌ Claude вернул ошибку: <code>{_e(exc)}</code>")
+            return
+        finally:
+            st.set("claude_mode", was_on)
+
+        picture = f"картинок: {len(post.images)}" if post.images else "без картинок"
+        await _reply(message, f"⬇️ Предпросмотр через Claude ({picture}, "
+                              f"<b>не</b> опубликовано)")
+        if not await _preview_post(message, post):
+            await message.answer(post.text, parse_mode="HTML",
+                                 link_preview_options=NO_PREVIEW)
+        return
+
+    state = "включён ✅" if publisher.claude_mode else "выключен"
+    key = "задан" if claude and claude.api_key else "❌ не задан"
+    model = claude.model if claude else "—"
+    await _reply(
+        message,
+        f"Режим Claude: {state}\nКлюч: {key}\nМодель: <code>{_e(model)}</code>\n"
+        f"Картинок в альбом: {st.get('claude_max_images')}\n\n" + CLAUDE_HELP,
+    )
+
+
+@router.message(Command("usage"))
+async def cmd_usage(message: Message, st: Storage, publisher: Publisher) -> None:
+    if publisher.quota is None:
+        await _reply(message, "Учёт расхода недоступен.")
+        return
+    await _reply(message, "Запрашиваю сведения о лимите…")
+    info = await publisher.quota.snapshot(force=True)
+
+    lines = [
+        f"<b>Расход за {info.day}</b> (сутки UTC)",
+        f"Запросов: {info.requests}"
+        + (f" из {info.request_limit} — <b>{info.request_pct:.0f}%</b>"
+           if info.request_limit else ""),
+        f"Токенов: {info.tokens_in} вход / {info.tokens_out} выход",
+    ]
+    if info.request_limit:
+        lines.append(f"Источник лимита: {info.limit_source}")
+        lines.append(f"Обнуление через {until_reset()} (00:00 UTC)")
+    if info.cost:
+        lines.append(f"Стоимость запросов: {info.cost:.4f} кредита")
+
+    lines.append("")
+    lines.append(f"Модель: <code>{_e(info.model)}</code>"
+                 + (" (бесплатная)" if info.is_free_model else ""))
+    if info.credit_limit is not None:
+        lines.append(f"Лимит кредитов на ключе: {info.credit_limit:.4f}, "
+                     f"осталось {info.credit_remaining:.4f}"
+                     + (f" — <b>{info.credit_pct:.0f}%</b> израсходовано"
+                        if info.credit_pct is not None else ""))
+    elif info.credits_used_total is not None:
+        lines.append(f"Лимит трат на ключе не задан; всего израсходовано "
+                     f"{info.credits_used_total:.4f} кредита")
+    if info.credits_used_today is not None:
+        lines.append(f"Кредитов за сутки: {info.credits_used_today:.4f}")
+    if info.is_free_tier is not None:
+        lines.append("Кредиты покупались: " + ("нет" if info.is_free_tier else "да"))
+
+    thresholds = publisher.quota.thresholds()
+    lines.append("")
+    lines.append("Предупреждения при: "
+                 + (", ".join(f"{t}%" for t in thresholds) if thresholds else "отключены")
+                 + " — <code>/set alert_thresholds 70,90</code>")
+    if not info.request_limit:
+        lines.append("Суточный лимит запросов можно задать вручную: "
+                     "<code>/set free_daily_limit 50</code>")
+    await _reply(message, "\n".join(lines))
+
+
+@router.message(Command("status"))
+async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> None:
+    feeds = st.feeds()
+    active = sum(1 for f in feeds if f["enabled"])
+    errors = [f for f in feeds if f["last_error"]]
+    paused = st.get("paused") == "1"
+    llm = publisher.llm
+    keys = ("interval", "max_per_cycle", "post_delay", "backfill",
+            "max_age_days", "flood_guard", "on_llm_error",
+            "require_russian", "disable_preview", "images", "og_image",
+            "keep_seen", "alert_thresholds", "free_daily_limit",
+            "claude_max_images")
+    mode = "⏸ на паузе" if paused else "▶️ работает"
+    if publisher.debug:
+        mode = "🔧 отладка — посты в личку, /debug off чтобы публиковать"
+    claude = publisher.claude
+    await _reply(
+        message,
+        f"<b>Состояние</b>\n"
+        f"Публикация: {mode}\n"
+        f"Канал: <code>{_e(publisher.channel or 'не задан')}</code>\n"
+        f"VK: " + (f"сообщество <code>{_e(publisher.vk_group)}</code>"
+                   if publisher.vk_on else "выключен") + "\n"
+        f"Claude: " + (f"включён, <code>{_e(claude.model)}</code>"
+                       if publisher.claude_mode else "выключен") + "\n"
+        f"Ленты: {active} активных из {len(feeds)}"
+        + (f", с ошибками: {len(errors)}" if errors else "") + "\n"
+        f"Модель: <code>{_e(llm.model)}</code>\n"
+        f"Endpoint: <code>{_e(llm.endpoint)}</code>\n"
+        f"Ключ LLM: {'задан' if llm.api_key else '❌ не задан'}\n\n"
+        + "\n".join(f"· <code>{k}</code> = {_e(st.get(k))}" for k in keys),
+    )
+
+
+@router.message(F.text.startswith("/"))
+async def cmd_unknown(message: Message) -> None:
+    await _reply(message, "Не знаю такой команды. Список — /help")
+
+
+def _parse_id(args: str | None) -> int | None:
+    try:
+        return int((args or "").split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _tail(text: str | None) -> str:
+    """Всё после первой команды, включая переносы строк."""
+    if not text:
+        return ""
+    _, _, rest = text.partition(" ")
+    if not rest:
+        _, nl, after = text.partition("\n")
+        rest = after if nl else ""
+    return rest.strip()
