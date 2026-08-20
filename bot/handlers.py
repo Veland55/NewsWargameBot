@@ -1058,7 +1058,7 @@ GEMINI_HELP = """<b>Режим Gemini</b>
 <b>Что нужно</b>
 В <code>.env</code>: <code>GEMINI_API_KEY=...</code> (ключ — в Google AI
 Studio), при необходимости <code>GEMINI_MODEL=</code> (по умолчанию
-<code>gemini-2.5-flash</code> — если модель переименовали, впишите
+<code>gemini-3.6-flash</code> — если модель переименовали, впишите
 актуальное имя), затем перезапуск бота.
 
 Шаблон промпта и формат поста — те же, что и для обычного режима

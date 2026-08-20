@@ -585,7 +585,7 @@ Claude и Gemini не могут быть включены одновремен�
 
 1. Ключ на [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
 2. В `.env`: `GEMINI_API_KEY=...`, при желании `GEMINI_MODEL=` (по
-   умолчанию `gemini-2.5-flash` — если Google переименует модели, впишите
+   умолчанию `gemini-3.6-flash` — если Google переименует модели, впишите
    актуальное имя), затем перезапуск бота.
 3. `/gemini on`
 
