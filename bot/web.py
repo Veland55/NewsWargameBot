@@ -164,23 +164,33 @@ class WebAuth:
 # базовые стили уже под палец и узкий экран, @media (min-width) добавляет
 # десктопные удобства (таблицы вместо карточек и т.п.) сверху.
 STYLE = """
-:root { color-scheme: dark; --tg-top: 0px; --tg-bottom: 0px; }
+:root { color-scheme: dark; --tg-top: 0px; --tg-bottom: 0px; --nav-h: 58px; }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html { overflow-x: hidden; }
 body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: #14151a;
-       color: #e6e6e6; margin: 0; padding: 0 0 calc(32px + var(--tg-bottom));
-       overflow-x: hidden; font-size: 15px; }
-header { background: #1c1e26; padding: calc(12px + var(--tg-top)) 14px 0; border-bottom: 1px solid #2c2f3a;
-         position: sticky; top: 0; z-index: 10; }
-header .top-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-bottom: 10px; }
+       color: #e6e6e6; margin: 0; overflow-x: hidden; font-size: 15px;
+       /* место под фиксированное нижнее меню, см. .bottom-nav */
+       padding-bottom: calc(var(--nav-h) + 14px + var(--tg-bottom)); }
+header { background: #1c1e26; padding: calc(12px + var(--tg-top)) 14px 12px; border-bottom: 1px solid #2c2f3a;
+         position: sticky; top: 0; z-index: 10;
+         display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 header h1 { font-size: 16px; margin: 0; }
 header .logout button { padding: 7px 12px; font-size: 12.5px; }
-nav { display: flex; gap: 6px; overflow-x: auto; -webkit-overflow-scrolling: touch;
-      padding-bottom: 10px; scrollbar-width: none; }
-nav::-webkit-scrollbar { display: none; }
-nav a { color: #c7cbd6; text-decoration: none; font-size: 13px; flex-shrink: 0;
-        padding: 8px 13px; border-radius: 999px; background: #262838; white-space: nowrap; }
-nav a:hover, nav a:active { background: #33374a; }
+/* Нижнее меню — дотягивается большим пальцем при работе одной рукой,
+   в отличие от верхнего, где на телефоне надо было либо листать горизонтально,
+   либо тянуться через весь экран. */
+.bottom-nav {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+  display: flex; background: #1c1e26; border-top: 1px solid #2c2f3a;
+  padding-bottom: var(--tg-bottom); height: calc(var(--nav-h) + var(--tg-bottom));
+}
+.bottom-nav a {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 2px; color: #9098a8; text-decoration: none; font-size: 10.5px; min-width: 0; padding: 0 2px;
+}
+.bottom-nav a .ic { font-size: 19px; line-height: 1; }
+.bottom-nav a .lbl { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.bottom-nav a.active { color: #ffd76a; }
 main { max-width: 880px; margin: 16px auto; padding: 0 12px; }
 h2 { font-size: 15px; color: #ffd76a; border-bottom: 1px solid #2c2f3a; padding-bottom: 8px; }
 .card { background: #1c1e26; border: 1px solid #2c2f3a; border-radius: 10px;
@@ -197,7 +207,12 @@ input[type=text], input[type=password], input[type=number], textarea, select {
   padding: 10px 11px; font-size: 16px; width: 100%; font-family: inherit;
 }
 /* font-size меньше 16px в полях ввода — Safari на iOS зумит страницу при фокусе */
-textarea { min-height: 130px; resize: vertical; font-family: ui-monospace, monospace; font-size: 14px; }
+/* Поля редактирования текста растягиваются под весь экран скриптом
+   (autosizeTextareas в TG_INIT_SCRIPT) — он знает реальную высоту того, что
+   уже отрисовано над и под полем на КОНКРЕТНОЙ странице, в отличие от CSS,
+   где эта высота у каждой страницы своя и фиксированным числом не угадывается.
+   Это только безопасный запасной размер на случай, если JS не отработал. */
+textarea { min-height: 45vh; resize: vertical; font-family: ui-monospace, monospace; font-size: 14px; }
 button, .btn {
   background: #33374a; color: #e6e6e6; border: 1px solid #454a63;
   border-radius: 8px; padding: 11px 16px; font-size: 14px; cursor: pointer;
@@ -209,37 +224,41 @@ button.primary { background: #3a63c8; border-color: #3a63c8; }
 button.primary:hover { background: #4b74d6; }
 button.danger { background: #7a2c2c; border-color: #7a2c2c; }
 button.danger:hover { background: #932f2f; }
+button.icon, .btn.icon { min-height: 38px; min-width: 38px; padding: 6px; font-size: 15px; flex: 0 0 auto; }
 .pill { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; }
 .pill.on { background: #1f4a2c; color: #7be79b; }
 .pill.off { background: #4a2020; color: #ff9d9d; }
 .flash { padding: 11px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
 .flash.ok { background: #1f4a2c; color: #b7f3c6; }
 .flash.err { background: #4a2020; color: #ffbcbc; }
-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-td, th { text-align: left; padding: 7px 6px; border-bottom: 1px solid #262838; vertical-align: top; }
 .muted { color: #85899a; font-size: 12.5px; }
 .mono { font-family: ui-monospace, monospace; font-size: 12.5px; word-break: break-all; }
 pre.post { white-space: pre-wrap; word-break: break-word; background: #111216; border: 1px solid #2c2f3a;
            border-radius: 8px; padding: 10px 12px; font-size: 13px; }
 form.inline { display: inline; }
-/* Таблицы (ленты, посты) до 640px — карточками, а не сжатой сеткой:
-   на телефоне разбирать 4 колонки в 320px шире некуда. */
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+td, th { text-align: left; padding: 7px 6px; border-bottom: 1px solid #262838; vertical-align: top; }
+/* Списки (ленты, посты) — текст слева, управление справа, в одну строку.
+   Раньше это были <table>, разложенные на телефоне в карточки-стопки, где
+   каждая кнопка занимала свою строку на всю ширину — длинно и неудобно
+   пролистывать. Теперь это flex-строки: инфоблок сжимается/переносится
+   текстом, кнопки справа компактные и не растягиваются. */
+.list-item {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+  border: 1px solid #262838; border-radius: 10px; background: #16171d; margin-bottom: 10px;
+}
+.list-item:last-child { margin-bottom: 0; }
+.list-item-info { flex: 1 1 auto; min-width: 0; }
+.list-item-title { color: #e6e6e6; font-size: 14px; overflow-wrap: break-word; }
+.list-item-actions { display: flex; gap: 6px; flex-shrink: 0; align-items: center; }
 @media (max-width: 640px) {
   /* Инлайновые flex:2/flex:1 в формах (например «Ленты» — url шире названия)
      хороши на широком экране; на узком любой из них всё равно должен
      занимать всю ширину, иначе поле для ввода URL становится нечитаемо
      узким. !important нужен только против инлайновых стилей. */
   .row > * { flex: 1 1 100% !important; }
-  table, tbody, tr, td { display: block; width: 100%; }
-  thead { display: none; }
-  table { border-spacing: 0 10px; margin-top: -10px; }
-  tr { border: 1px solid #262838; border-radius: 10px; padding: 10px 12px;
-       background: #16171d; margin-bottom: 10px; }
-  tr:last-child { margin-bottom: 0; }
-  td { border-bottom: none; padding: 4px 0; }
-  td:has(> a.btn), td:has(> form) { padding-top: 8px; }
-  td form, td a.btn { width: 100%; }
-  td form button { width: 100%; }
+  .list-item { align-items: flex-start; }
+  .list-item-actions { flex-direction: column; }
 }
 @media (min-width: 641px) {
   header { padding-left: 20px; padding-right: 20px; }
@@ -257,6 +276,26 @@ form.inline { display: inline; }
 TG_INIT_SCRIPT = """<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script>
 (function () {
+  function cssPx(name, fallback) {
+    var v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(name));
+    return isNaN(v) ? fallback : v;
+  }
+  // Растягивает textarea от текущей позиции (какая бы она ни была на
+  // конкретной странице — это и есть вся разница с фиксированным числом
+  // в CSS) до низа экрана, оставляя место под нижнее меню и кнопки под полем.
+  function autosizeTextareas() {
+    var reserve = cssPx('--nav-h', 58) + cssPx('--tg-bottom', 0) + 130;
+    var list = document.querySelectorAll('textarea');
+    for (var i = 0; i < list.length; i++) {
+      var ta = list[i];
+      var top = ta.getBoundingClientRect().top;
+      var h = window.innerHeight - top - reserve;
+      ta.style.height = Math.max(160, h) + 'px';
+    }
+  }
+  window.addEventListener('load', autosizeTextareas);
+  window.addEventListener('resize', autosizeTextareas);
+
   var tg = window.Telegram && window.Telegram.WebApp;
   if (!tg) return;
   try { tg.ready(); tg.expand(); } catch (e) {}
@@ -264,15 +303,37 @@ TG_INIT_SCRIPT = """<script src="https://telegram.org/js/telegram-web-app.js"></
     var sa = tg.safeAreaInset || {}, csa = tg.contentSafeAreaInset || {};
     document.documentElement.style.setProperty('--tg-top', ((sa.top||0)+(csa.top||0)) + 'px');
     document.documentElement.style.setProperty('--tg-bottom', ((sa.bottom||0)+(csa.bottom||0)) + 'px');
+    autosizeTextareas();
   }
   applyInsets();
-  if (tg.onEvent) { tg.onEvent('safeAreaChanged', applyInsets); tg.onEvent('contentSafeAreaChanged', applyInsets); }
+  if (tg.onEvent) {
+    tg.onEvent('safeAreaChanged', applyInsets);
+    tg.onEvent('contentSafeAreaChanged', applyInsets);
+    tg.onEvent('viewportChanged', applyInsets);
+  }
 })();
 </script>"""
 
 
-def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok") -> str:
+# (путь, иконка, подпись) — единый источник для нижнего меню на каждой странице.
+NAV_ITEMS = [
+    ("/", "📊", "Статус"),
+    ("/feeds", "📰", "Ленты"),
+    ("/template", "📝", "Шаблон"),
+    ("/format", "🎨", "Формат"),
+    ("/settings", "⚙️", "Настройки"),
+    ("/posts", "📮", "Посты"),
+    ("/usage", "💰", "Расход"),
+]
+
+
+def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok", active: str = "") -> str:
     flash_html = f'<div class="flash {flash_kind}">{flash}</div>' if flash else ""
+    nav_html = "".join(
+        f'<a href="{path}"{" class=\"active\"" if path == active else ""}>'
+        f'<span class="ic">{icon}</span><span class="lbl">{label}</span></a>'
+        for path, icon, label in NAV_ITEMS
+    )
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -280,21 +341,11 @@ def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok") -> s
 {TG_INIT_SCRIPT}
 <style>{STYLE}</style></head><body>
 <header>
-  <div class="top-row">
-    <h1>📰 RSS → канал</h1>
-    <form class="inline logout" method="post" action="/logout"><button>Выйти</button></form>
-  </div>
-  <nav>
-    <a href="/">Статус</a>
-    <a href="/feeds">Ленты</a>
-    <a href="/template">Шаблон</a>
-    <a href="/format">Формат</a>
-    <a href="/settings">Настройки</a>
-    <a href="/posts">Посты</a>
-    <a href="/usage">Расход</a>
-  </nav>
+  <h1>📰 RSS → канал</h1>
+  <form class="inline logout" method="post" action="/logout"><button>Выйти</button></form>
 </header>
 <main>{flash_html}{body}</main>
+<nav class="bottom-nav">{nav_html}</nav>
 </body></html>"""
 
 
@@ -453,7 +504,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             <button type="submit">🔄 Проверить ленты сейчас</button></form>
         </div>
         """
-        return web.Response(text=_layout("Статус", body), content_type="text/html")
+        return web.Response(text=_layout("Статус", body, active="/"), content_type="text/html")
 
     async def pause_post(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -473,23 +524,27 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         for f in rows:
             checked = time.strftime("%d.%m %H:%M", time.localtime(f["last_check"])) if f["last_check"] else "—"
             err = f'<div class="muted" style="color:#ff9d9d">{_e(f["last_error"][:150])}</div>' if f["last_error"] else ""
-            own_prompt = f' <span class="pill on">свой промпт</span>' if f["template"] else ""
-            items += f"""<tr>
-              <td>#{f['id']}<br><span class="pill {'on' if f['enabled'] else 'off'}">{'вкл' if f['enabled'] else 'пауза'}</span></td>
-              <td>{_e(f['title'] or '(без названия)')}{own_prompt}<br><span class="mono muted">{_e(f['url'])}</span>{err}</td>
-              <td class="muted">{checked}<br>в архиве: {st.seen_count(f['id'])}</td>
-              <td>
-                <a class="btn" href="/feeds/{f['id']}/template">🤖 Промпт</a>
+            own_prompt = ' <span class="pill on">свой промпт</span>' if f["template"] else ""
+            items += f"""<div class="list-item">
+              <div class="list-item-info">
+                <div class="list-item-title">
+                  <b>#{f['id']}</b> {_e(f['title'] or '(без названия)')}
+                  <span class="pill {'on' if f['enabled'] else 'off'}">{'вкл' if f['enabled'] else 'пауза'}</span>{own_prompt}
+                </div>
+                <div class="muted mono">{_e(f['url'])}</div>
+                <div class="muted">проверена: {checked} · в архиве: {st.seen_count(f['id'])}</div>
+                {err}
+              </div>
+              <div class="list-item-actions">
+                <a class="btn icon" href="/feeds/{f['id']}/template" title="Свой промпт">🤖</a>
                 <form class="inline" method="post" action="/feeds/{f['id']}/toggle">{csrf_field(request)}
-                  <button type="submit">{'⏸' if f['enabled'] else '▶️'}</button></form>
+                  <button class="icon" type="submit" title="{'Поставить на паузу' if f['enabled'] else 'Включить'}">{'⏸' if f['enabled'] else '▶️'}</button></form>
                 <form class="inline" method="post" action="/feeds/{f['id']}/delete"
                       onsubmit="return confirm('Удалить ленту #{f['id']}?')">{csrf_field(request)}
-                  <button class="danger" type="submit">✕</button></form>
-              </td>
-            </tr>"""
-        table = (f"<table><thead><tr><th>id</th><th>Лента</th><th>Проверена</th><th></th></tr></thead>"
-                f"<tbody>{items}</tbody></table>"
-                if rows else "<p class='muted'>Лент пока нет.</p>")
+                  <button class="icon danger" type="submit" title="Удалить">✕</button></form>
+              </div>
+            </div>"""
+        list_html = items if rows else "<p class='muted'>Лент пока нет.</p>"
         body = f"""
         <h2>Добавить ленту</h2>
         <div class="card">
@@ -502,9 +557,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </form>
         </div>
         <h2>Ленты</h2>
-        <div class="card">{table}</div>
+        <div class="card">{list_html}</div>
         """
-        return web.Response(text=_layout("Ленты", body, flash, flash_kind), content_type="text/html")
+        return web.Response(text=_layout("Ленты", body, flash, flash_kind, active="/feeds"), content_type="text/html")
 
     async def feeds_add(request: web.Request) -> web.Response:
         form = request["form"]
@@ -579,7 +634,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         <p class="muted">Плейсхолдеры: <code>{{title}}</code> <code>{{summary}}</code>
           <code>{{link}}</code> <code>{{source}}</code> <code>{{published}}</code></p>
         """
-        return web.Response(text=_layout(f"Промпт ленты #{feed_id}", body, flash, flash_kind),
+        return web.Response(text=_layout(f"Промпт ленты #{feed_id}", body, flash, flash_kind, active="/feeds"),
                             content_type="text/html")
 
     async def feed_template_post(request: web.Request) -> web.Response:
@@ -623,7 +678,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           <form id="reset-template" method="post" action="/template/reset">{csrf_field(request)}</form>
         </div>
         """
-        return web.Response(text=_layout("Шаблон", body, flash, flash_kind), content_type="text/html")
+        return web.Response(text=_layout("Шаблон", body, flash, flash_kind, active="/template"), content_type="text/html")
 
     async def template_post(request: web.Request) -> web.Response:
         text = str(request["form"].get("text", "")).strip()
@@ -653,7 +708,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           <form id="reset-format" method="post" action="/format/reset">{csrf_field(request)}</form>
         </div>
         """
-        return web.Response(text=_layout("Формат", body, flash, flash_kind), content_type="text/html")
+        return web.Response(text=_layout("Формат", body, flash, flash_kind, active="/format"), content_type="text/html")
 
     async def format_post(request: web.Request) -> web.Response:
         text = str(request["form"].get("text", "")).strip()
@@ -743,7 +798,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </form>
         </div>
         """
-        return web.Response(text=_layout("Настройки", body, flash, flash_kind), content_type="text/html")
+        return web.Response(text=_layout("Настройки", body, flash, flash_kind, active="/settings"), content_type="text/html")
 
     async def settings_channel(request: web.Request) -> web.Response:
         target = str(request["form"].get("channel", "")).strip()
@@ -814,18 +869,22 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         st: Storage = app["st"]
         rows = st.posts(30)
         items = "".join(
-            f"""<tr>
-              <td>#{r['id']}<br><span class="muted">{_kind_label(r['kind'])}{' ✏️' if r['edited_at'] else ''}</span></td>
-              <td>{_e(r['title'][:120])}</td>
-              <td class="muted">{time.strftime('%d.%m %H:%M', time.localtime(r['posted_at']))}</td>
-              <td><a class="btn" href="/posts/{r['id']}">Открыть</a></td>
-            </tr>""" for r in rows
+            f"""<div class="list-item">
+              <div class="list-item-info">
+                <div class="list-item-title">
+                  <b>#{r['id']}</b> {_e(r['title'][:120])}
+                </div>
+                <div class="muted">{_kind_label(r['kind'])}{' · отредактирован ✏️' if r['edited_at'] else ''}
+                  · {time.strftime('%d.%m %H:%M', time.localtime(r['posted_at']))}</div>
+              </div>
+              <div class="list-item-actions">
+                <a class="btn" href="/posts/{r['id']}">Открыть</a>
+              </div>
+            </div>""" for r in rows
         )
-        table = (f"<table><thead><tr><th>id</th><th>Заголовок</th><th>Опубликован</th><th></th></tr></thead>"
-                f"<tbody>{items}</tbody></table>"
-                if rows else "<p class='muted'>Опубликованных постов пока нет.</p>")
-        body = f"<h2>Последние посты</h2><div class='card'>{table}</div>"
-        return web.Response(text=_layout("Посты", body), content_type="text/html")
+        list_html = items if rows else "<p class='muted'>Опубликованных постов пока нет.</p>"
+        body = f"<h2>Последние посты</h2><div class='card'>{list_html}</div>"
+        return web.Response(text=_layout("Посты", body, active="/posts"), content_type="text/html")
 
     async def post_detail(request: web.Request, draft: str | None = None,
                           flash: str = "", flash_kind: str = "ok") -> web.Response:
@@ -867,7 +926,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </form>
         </div>
         """
-        return web.Response(text=_layout(f"Пост #{row['id']}", body, flash, flash_kind), content_type="text/html")
+        return web.Response(text=_layout(f"Пост #{row['id']}", body, flash, flash_kind, active="/posts"), content_type="text/html")
 
     async def post_save(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -912,7 +971,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         pub: Publisher = app["publisher"]
         if pub.quota is None:
             body = "<p class='muted'>Учёт расхода недоступен.</p>"
-            return web.Response(text=_layout("Расход", body), content_type="text/html")
+            return web.Response(text=_layout("Расход", body, active="/usage"), content_type="text/html")
         info = await pub.quota.snapshot(force=True)
         rows = [
             ("Запросов сегодня", f"{info.requests}" + (f" из {info.request_limit} ({info.request_pct:.0f}%)" if info.request_limit else "")),
@@ -926,7 +985,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         body = "<h2>Расход за сутки (LLM/DeepSeek, не Claude)</h2><div class='card'><table>" + "".join(
             f"<tr><td class='muted'>{_e(k)}</td><td>{_e(v)}</td></tr>" for k, v in rows
         ) + "</table></div>"
-        return web.Response(text=_layout("Расход", body), content_type="text/html")
+        return web.Response(text=_layout("Расход", body, active="/usage"), content_type="text/html")
 
     async def _apply_edit(bot_: Bot, row, text: str) -> str | None:
         try:
