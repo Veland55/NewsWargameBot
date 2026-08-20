@@ -159,48 +159,94 @@ class WebAuth:
 
 
 # ======================== HTML-обвязка ========================
+# Мобильный — основной сценарий (панель открывают из Telegram на телефоне),
+# поэтому это не «десктоп + медиа-запрос для мелкого экрана», а наоборот:
+# базовые стили уже под палец и узкий экран, @media (min-width) добавляет
+# десктопные удобства (таблицы вместо карточек и т.п.) сверху.
 STYLE = """
 :root { color-scheme: dark; --tg-top: 0px; --tg-bottom: 0px; }
-* { box-sizing: border-box; }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html { overflow-x: hidden; }
 body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: #14151a;
-       color: #e6e6e6; margin: 0; padding: 0 0 calc(40px + var(--tg-bottom)); }
-header { background: #1c1e26; padding: calc(14px + var(--tg-top)) 20px 14px; border-bottom: 1px solid #2c2f3a;
-         display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
-header h1 { font-size: 17px; margin: 0; }
-nav a { color: #9ecbff; text-decoration: none; margin-right: 16px; font-size: 14px; }
-nav a:hover { text-decoration: underline; }
-main { max-width: 880px; margin: 24px auto; padding: 0 20px; }
-h2 { font-size: 16px; color: #ffd76a; border-bottom: 1px solid #2c2f3a; padding-bottom: 8px; }
+       color: #e6e6e6; margin: 0; padding: 0 0 calc(32px + var(--tg-bottom));
+       overflow-x: hidden; font-size: 15px; }
+header { background: #1c1e26; padding: calc(12px + var(--tg-top)) 14px 0; border-bottom: 1px solid #2c2f3a;
+         position: sticky; top: 0; z-index: 10; }
+header .top-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-bottom: 10px; }
+header h1 { font-size: 16px; margin: 0; }
+header .logout button { padding: 7px 12px; font-size: 12.5px; }
+nav { display: flex; gap: 6px; overflow-x: auto; -webkit-overflow-scrolling: touch;
+      padding-bottom: 10px; scrollbar-width: none; }
+nav::-webkit-scrollbar { display: none; }
+nav a { color: #c7cbd6; text-decoration: none; font-size: 13px; flex-shrink: 0;
+        padding: 8px 13px; border-radius: 999px; background: #262838; white-space: nowrap; }
+nav a:hover, nav a:active { background: #33374a; }
+main { max-width: 880px; margin: 16px auto; padding: 0 12px; }
+h2 { font-size: 15px; color: #ffd76a; border-bottom: 1px solid #2c2f3a; padding-bottom: 8px; }
 .card { background: #1c1e26; border: 1px solid #2c2f3a; border-radius: 10px;
-        padding: 16px 18px; margin-bottom: 18px; }
+        padding: 14px 14px; margin-bottom: 16px; overflow-x: auto; }
 .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+.row > * { flex: 1 1 220px; }
+.row > button, .row > .btn { flex: 0 1 auto; }
+/* Простая строка «подпись: значение» — не форма, без flex-разъезда полей */
+.line { margin-bottom: 8px; line-height: 1.6; }
 label { display: block; font-size: 12.5px; color: #9a9ea8; text-transform: uppercase;
         letter-spacing: .4px; margin-bottom: 4px; }
 input[type=text], input[type=password], input[type=number], textarea, select {
   background: #111216; color: #e6e6e6; border: 1px solid #33374a; border-radius: 7px;
-  padding: 8px 10px; font-size: 14px; width: 100%; font-family: inherit;
+  padding: 10px 11px; font-size: 16px; width: 100%; font-family: inherit;
 }
-textarea { min-height: 120px; resize: vertical; font-family: ui-monospace, monospace; }
-button, .btn { background: #33374a; color: #e6e6e6; border: 1px solid #454a63;
-       border-radius: 7px; padding: 8px 14px; font-size: 13.5px; cursor: pointer; }
+/* font-size меньше 16px в полях ввода — Safari на iOS зумит страницу при фокусе */
+textarea { min-height: 130px; resize: vertical; font-family: ui-monospace, monospace; font-size: 14px; }
+button, .btn {
+  background: #33374a; color: #e6e6e6; border: 1px solid #454a63;
+  border-radius: 8px; padding: 11px 16px; font-size: 14px; cursor: pointer;
+  min-height: 42px; display: inline-flex; align-items: center; justify-content: center;
+  gap: 6px; text-decoration: none;
+}
 button:hover, .btn:hover { background: #454a63; }
 button.primary { background: #3a63c8; border-color: #3a63c8; }
 button.primary:hover { background: #4b74d6; }
 button.danger { background: #7a2c2c; border-color: #7a2c2c; }
 button.danger:hover { background: #932f2f; }
-.pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; }
+.pill { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; }
 .pill.on { background: #1f4a2c; color: #7be79b; }
 .pill.off { background: #4a2020; color: #ff9d9d; }
-.flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
+.flash { padding: 11px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
 .flash.ok { background: #1f4a2c; color: #b7f3c6; }
 .flash.err { background: #4a2020; color: #ffbcbc; }
 table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 td, th { text-align: left; padding: 7px 6px; border-bottom: 1px solid #262838; vertical-align: top; }
 .muted { color: #85899a; font-size: 12.5px; }
 .mono { font-family: ui-monospace, monospace; font-size: 12.5px; word-break: break-all; }
-pre.post { white-space: pre-wrap; background: #111216; border: 1px solid #2c2f3a;
+pre.post { white-space: pre-wrap; word-break: break-word; background: #111216; border: 1px solid #2c2f3a;
            border-radius: 8px; padding: 10px 12px; font-size: 13px; }
 form.inline { display: inline; }
+/* Таблицы (ленты, посты) до 640px — карточками, а не сжатой сеткой:
+   на телефоне разбирать 4 колонки в 320px шире некуда. */
+@media (max-width: 640px) {
+  /* Инлайновые flex:2/flex:1 в формах (например «Ленты» — url шире названия)
+     хороши на широком экране; на узком любой из них всё равно должен
+     занимать всю ширину, иначе поле для ввода URL становится нечитаемо
+     узким. !important нужен только против инлайновых стилей. */
+  .row > * { flex: 1 1 100% !important; }
+  table, tbody, tr, td { display: block; width: 100%; }
+  thead { display: none; }
+  table { border-spacing: 0 10px; margin-top: -10px; }
+  tr { border: 1px solid #262838; border-radius: 10px; padding: 10px 12px;
+       background: #16171d; margin-bottom: 10px; }
+  tr:last-child { margin-bottom: 0; }
+  td { border-bottom: none; padding: 4px 0; }
+  td:has(> a.btn), td:has(> form) { padding-top: 8px; }
+  td form, td a.btn { width: 100%; }
+  td form button { width: 100%; }
+}
+@media (min-width: 641px) {
+  header { padding-left: 20px; padding-right: 20px; }
+  main { padding: 0 20px; margin: 24px auto; }
+  .card { padding: 16px 18px; }
+  .row > * { flex: 1 1 auto; }
+}
 """
 
 
@@ -234,7 +280,10 @@ def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok") -> s
 {TG_INIT_SCRIPT}
 <style>{STYLE}</style></head><body>
 <header>
-  <h1>📰 RSS → канал</h1>
+  <div class="top-row">
+    <h1>📰 RSS → канал</h1>
+    <form class="inline logout" method="post" action="/logout"><button>Выйти</button></form>
+  </div>
   <nav>
     <a href="/">Статус</a>
     <a href="/feeds">Ленты</a>
@@ -243,7 +292,6 @@ def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok") -> s
     <a href="/settings">Настройки</a>
     <a href="/posts">Посты</a>
     <a href="/usage">Расход</a>
-    <form class="inline" method="post" action="/logout"><button>Выйти</button></form>
   </nav>
 </header>
 <main>{flash_html}{body}</main>
@@ -258,7 +306,7 @@ def _login_page(error: str = "") -> str:
 <title>Вход — bot panel</title>
 {TG_INIT_SCRIPT}
 <style>{STYLE}</style></head><body>
-<main style="max-width:360px; margin-top:80px;">
+<main style="max-width:360px; margin-top:calc(60px + var(--tg-top));">
   <h2>Вход в панель</h2>
   {err_html}
   <div id="tgLoginNote" class="flash ok" style="display:none;">Вхожу через Telegram…</div>
@@ -266,7 +314,7 @@ def _login_page(error: str = "") -> str:
     <form method="post" action="/login">
       <label>Пароль</label>
       <input type="password" name="password" autofocus required>
-      <div style="margin-top:12px;"><button class="primary" type="submit">Войти</button></div>
+      <div style="margin-top:12px;"><button class="primary" type="submit" style="width:100%;">Войти</button></div>
     </form>
   </div>
 </main>
@@ -385,15 +433,15 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         body = f"""
         <h2>Состояние</h2>
         <div class="card">
-          <div class="row">Публикация: <b>{_e(mode)}</b></div>
-          <div class="row">Канал: <span class="mono">{_e(pub.channel or 'не задан')}</span></div>
-          <div class="row">Лент: {active} активных из {len(feeds)}
+          <div class="line">Публикация: <b>{_e(mode)}</b></div>
+          <div class="line">Канал: <span class="mono">{_e(pub.channel or 'не задан')}</span></div>
+          <div class="line">Лент: {active} активных из {len(feeds)}
             {f', с ошибками: {len(errors)}' if errors else ''}</div>
-          <div class="row">Модель LLM: <span class="mono">{_e(pub.llm.model)}</span>
+          <div class="line">Модель LLM: <span class="mono">{_e(pub.llm.model)}</span>
             <span class="pill {'on' if pub.llm.api_key else 'off'}">{'ключ задан' if pub.llm.api_key else 'нет ключа'}</span></div>
-          <div class="row">Claude: <span class="pill {'on' if pub.claude_mode else 'off'}">
+          <div class="line">Claude: <span class="pill {'on' if pub.claude_mode else 'off'}">
             {'включён, ' + _e(pub.claude.model) if pub.claude_mode else 'выключен'}</span></div>
-          <div class="row">VK: <span class="pill {'on' if pub.vk_on else 'off'}">
+          <div class="line">VK: <span class="pill {'on' if pub.vk_on else 'off'}">
             {'сообщество ' + _e(pub.vk_group) if pub.vk_on else 'выключен'}</span></div>
         </div>
         <div class="row">
@@ -437,7 +485,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                   <button class="danger" type="submit">✕</button></form>
               </td>
             </tr>"""
-        table = (f"<table><tr><th>id</th><th>Лента</th><th>Проверена</th><th></th></tr>{items}</table>"
+        table = (f"<table><thead><tr><th>id</th><th>Лента</th><th>Проверена</th><th></th></tr></thead>"
+                f"<tbody>{items}</tbody></table>"
                 if rows else "<p class='muted'>Лент пока нет.</p>")
         body = f"""
         <h2>Добавить ленту</h2>
@@ -580,7 +629,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           <form method="post" action="/settings/general">{csrf_field(request)}
             <div class="row">{num_fields}</div>
             <div class="row" style="margin-top:6px;">{toggle_fields}</div>
-            <div style="margin-top:12px;"><button class="primary" type="submit">Сохранить</button></div>
+            <div style="margin-top:12px;"><button class="primary" type="submit" style="width:100%;">Сохранить</button></div>
           </form>
         </div>
 
@@ -595,7 +644,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
         <h2>VK</h2>
         <div class="card">
-          <div class="row">Сейчас: <span class="pill {'on' if pub.vk_on else 'off'}">
+          <div class="line">Сейчас: <span class="pill {'on' if pub.vk_on else 'off'}">
             {'включено, сообщество ' + _e(pub.vk_group) if pub.vk_on else 'выключено'}</span>
             {'· ключ не задан (VK_TOKEN в .env)' if not (pub.vk and pub.vk.token) else ''}</div>
           <form method="post" action="/settings/vk">{csrf_field(request)}
@@ -610,7 +659,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
         <h2>Claude</h2>
         <div class="card">
-          <div class="row">Сейчас: <span class="pill {'on' if pub.claude_mode else 'off'}">
+          <div class="line">Сейчас: <span class="pill {'on' if pub.claude_mode else 'off'}">
             {'включён, ' + _e(pub.claude.model) if pub.claude_mode else 'выключен'}</span>
             {'· CLAUDE_API_KEY не задан в .env' if not (pub.claude and pub.claude.api_key) else ''}</div>
           <form method="post" action="/settings/claude">{csrf_field(request)}
@@ -701,7 +750,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
               <td><a class="btn" href="/posts/{r['id']}">Открыть</a></td>
             </tr>""" for r in rows
         )
-        table = (f"<table><tr><th>id</th><th>Заголовок</th><th>Опубликован</th><th></th></tr>{items}</table>"
+        table = (f"<table><thead><tr><th>id</th><th>Заголовок</th><th>Опубликован</th><th></th></tr></thead>"
+                f"<tbody>{items}</tbody></table>"
                 if rows else "<p class='muted'>Опубликованных постов пока нет.</p>")
         body = f"<h2>Последние посты</h2><div class='card'>{table}</div>"
         return web.Response(text=_layout("Посты", body), content_type="text/html")
