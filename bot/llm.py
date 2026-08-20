@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from typing import Callable
 
 import aiohttp
@@ -64,7 +65,13 @@ class LLMClient:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=self._timeout)
+            # family=AF_INET: на некоторых хостах исходящий IPv6 у Google
+            # для generativelanguage.googleapis.com гео-заблокирован
+            # ("User location is not supported"), хотя IPv4 с того же
+            # сервера проходит нормально — форсируем его для всех
+            # провайдеров на этом клиенте, не только для Gemini.
+            connector = aiohttp.TCPConnector(family=socket.AF_INET)
+            self._session = aiohttp.ClientSession(timeout=self._timeout, connector=connector)
         return self._session
 
     async def close(self) -> None:
