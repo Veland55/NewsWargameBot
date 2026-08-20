@@ -119,11 +119,11 @@ class WebAuth:
 
 # ======================== HTML-обвязка ========================
 STYLE = """
-:root { color-scheme: dark; }
+:root { color-scheme: dark; --tg-top: 0px; --tg-bottom: 0px; }
 * { box-sizing: border-box; }
 body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: #14151a;
-       color: #e6e6e6; margin: 0; padding: 0 0 40px; }
-header { background: #1c1e26; padding: 14px 20px; border-bottom: 1px solid #2c2f3a;
+       color: #e6e6e6; margin: 0; padding: 0 0 calc(40px + var(--tg-bottom)); }
+header { background: #1c1e26; padding: calc(14px + var(--tg-top)) 20px 14px; border-bottom: 1px solid #2c2f3a;
          display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
 header h1 { font-size: 17px; margin: 0; }
 nav a { color: #9ecbff; text-decoration: none; margin-right: 16px; font-size: 14px; }
@@ -163,12 +163,34 @@ form.inline { display: inline; }
 """
 
 
+# Открыто как Telegram Mini App (кнопка /panel или меню бота) — SDK молча
+# ни на что не влияет вне Telegram. ready()/expand() разворачивают на весь
+# экран, а --tg-top/--tg-bottom дают шапке отступ от родного заголовка
+# Telegram в полноэкранном режиме (см. STYLE выше).
+TG_INIT_SCRIPT = """<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+(function () {
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (!tg) return;
+  try { tg.ready(); tg.expand(); } catch (e) {}
+  function applyInsets() {
+    var sa = tg.safeAreaInset || {}, csa = tg.contentSafeAreaInset || {};
+    document.documentElement.style.setProperty('--tg-top', ((sa.top||0)+(csa.top||0)) + 'px');
+    document.documentElement.style.setProperty('--tg-bottom', ((sa.bottom||0)+(csa.bottom||0)) + 'px');
+  }
+  applyInsets();
+  if (tg.onEvent) { tg.onEvent('safeAreaChanged', applyInsets); tg.onEvent('contentSafeAreaChanged', applyInsets); }
+})();
+</script>"""
+
+
 def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok") -> str:
     flash_html = f'<div class="flash {flash_kind}">{flash}</div>' if flash else ""
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_e(title)} — bot panel</title>
+{TG_INIT_SCRIPT}
 <style>{STYLE}</style></head><body>
 <header>
   <h1>📰 RSS → канал</h1>
@@ -192,7 +214,9 @@ def _login_page(error: str = "") -> str:
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Вход — bot panel</title><style>{STYLE}</style></head><body>
+<title>Вход — bot panel</title>
+{TG_INIT_SCRIPT}
+<style>{STYLE}</style></head><body>
 <main style="max-width:360px; margin-top:80px;">
   <h2>Вход в панель</h2>
   {err_html}
@@ -754,10 +778,11 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str) 
 
 
 async def run_web_panel(storage: Storage, publisher: Publisher, bot: Bot,
-                        password: str, port: int) -> tuple[web.AppRunner, web.TCPSite]:
+                        password: str, port: int, host: str = "0.0.0.0"
+                        ) -> tuple[web.AppRunner, web.TCPSite]:
     app = create_app(storage, publisher, bot, password)
     runner = web.AppRunner(app, access_log=log)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, host, port)
     await site.start()
     return runner, site

@@ -11,6 +11,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramUnauthorizedError
+from aiogram.types import MenuButtonWebApp, WebAppInfo
 
 from . import handlers
 from .claude import ClaudeClient
@@ -63,7 +64,7 @@ async def run() -> None:
     handlers.setup(handlers.router, cfg.admin_ids)
     dp.include_router(handlers.router)
     # Прокидываем зависимости в хендлеры через DI aiogram.
-    dp.workflow_data.update(st=storage, publisher=publisher)
+    dp.workflow_data.update(st=storage, publisher=publisher, panel_url=cfg.web_panel_public_url)
 
     try:
         me = await bot.get_me()
@@ -100,9 +101,28 @@ async def run() -> None:
 
     web_runner = None
     if cfg.web_panel_password:
+        # Если задан публичный https-адрес — значит перед ботом уже стоит
+        # nginx (см. SETUP.md), и слушать можно только localhost: свой порт
+        # наружу светить незачем, только через прокси. Без публичного адреса
+        # (сценарий "просто http по IP") слушаем все интерфейсы, иначе панель
+        # была бы недоступна снаружи вообще.
+        bind_host = "127.0.0.1" if cfg.web_panel_public_url else "0.0.0.0"
         web_runner, _ = await run_web_panel(storage, publisher, bot,
-                                            cfg.web_panel_password, cfg.web_panel_port)
-        log.info("веб-панель на http://0.0.0.0:%s (пароль задан)", cfg.web_panel_port)
+                                            cfg.web_panel_password, cfg.web_panel_port,
+                                            host=bind_host)
+        where = cfg.web_panel_public_url or f"http://{bind_host}:{cfg.web_panel_port}"
+        log.info("веб-панель: %s (слушает %s:%s)", where, bind_host, cfg.web_panel_port)
+
+        if cfg.web_panel_public_url:
+            button = MenuButtonWebApp(text="Панель", web_app=WebAppInfo(url=cfg.web_panel_public_url))
+            for admin_id in cfg.admin_ids:
+                try:
+                    await bot.set_chat_menu_button(chat_id=admin_id, menu_button=button)
+                except TelegramAPIError as exc:
+                    # Обычно значит, что админ ещё ни разу не писал боту —
+                    # Telegram не даёт поставить кнопку меню для незнакомого чата.
+                    log.warning("не удалось поставить кнопку меню для %s: %s "
+                                "(admin должен хотя бы раз написать боту)", admin_id, exc)
     else:
         log.info("веб-панель выключена — WEB_PANEL_PASSWORD не задан в .env")
 

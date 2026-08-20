@@ -8,8 +8,9 @@ import time
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import BaseFilter, Command, CommandObject
-from aiogram.types import (BufferedInputFile, InputMediaPhoto,
-                           LinkPreviewOptions, Message)
+from aiogram.types import (BufferedInputFile, InlineKeyboardButton,
+                           InlineKeyboardMarkup, InputMediaPhoto,
+                           LinkPreviewOptions, Message, WebAppInfo)
 
 from .db import DEFAULTS, Storage
 from .llm import LLMError
@@ -25,6 +26,8 @@ router = Router(name="admin")
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 HELP = """<b>RSS → DeepSeek → канал</b>
+
+/panel — открыть веб-панель управления внутри Telegram (если подключена)
 
 <b>Ленты</b>
 /add &lt;url&gt; [название] — добавить ленту
@@ -148,6 +151,22 @@ async def cmd_start(message: Message, st: Storage) -> None:
         await _reply(message, "▶️ Публикация возобновлена.\n\n" + HELP)
     else:
         await _reply(message, HELP)
+
+
+@router.message(Command("panel"))
+async def cmd_panel(message: Message, panel_url: str = "") -> None:
+    if not panel_url:
+        await _reply(
+            message,
+            "Веб-панель не подключена к боту: не задан <code>WEB_PANEL_PUBLIC_URL</code> "
+            "в .env (нужен настоящий https-адрес — Telegram не откроет по-другому). "
+            "Подробности — SETUP.md, раздел «Веб-панель управления».",
+        )
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🖥 Открыть панель", web_app=WebAppInfo(url=panel_url))
+    ]])
+    await message.answer("Панель управления ботом:", reply_markup=kb)
 
 
 @router.message(Command("stop"))

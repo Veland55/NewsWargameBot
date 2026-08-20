@@ -38,6 +38,7 @@ class Config:
     claude_model: str = "claude-sonnet-5"
     web_panel_password: str = ""
     web_panel_port: int = 8090
+    web_panel_public_url: str = ""
     db_path: Path = ROOT / "data" / "bot.db"
     log_level: str = "INFO"
 
@@ -97,6 +98,7 @@ class Config:
             claude_model=os.getenv("CLAUDE_MODEL", "claude-sonnet-5").strip(),
             web_panel_password=os.getenv("WEB_PANEL_PASSWORD", "").strip(),
             web_panel_port=int(os.getenv("WEB_PANEL_PORT", "8090") or 8090),
+            web_panel_public_url=os.getenv("WEB_PANEL_PUBLIC_URL", "").strip().rstrip("/"),
             db_path=db_path,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
