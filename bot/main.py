@@ -62,10 +62,14 @@ async def run() -> None:
     # Отдельного протокол-клиента, как для Claude, тут не нужно.
     # reasoning_effort="low": свежие модели Gemini «думают» перед ответом и без
     # этого тратят весь max_tokens на невидимые рассуждения, возвращая пустой
-    # текст (finish_reason=length) — приходится повторять запрос с удвоенным
-    # лимитом. С low модель почти не думает и укладывается в лимит с первого раза.
+    # или обрезанный на середине текст (finish_reason=length). low сильно
+    # сокращает эти рассуждения, но не до нуля — на подробных шаблонах всё
+    # равно уходит 600-1000 токенов до первого слова ответа, поэтому берём
+    # стартовый max_tokens побольше общего дефолта (800), чтобы не обрезать
+    # пост на первой же попытке; LLMClient.complete всё равно подстрахует
+    # повтором с удвоенным лимитом, если и этого не хватит.
     gemini = LLMClient(cfg.gemini_base_url, cfg.gemini_api_key, cfg.gemini_model,
-                       reasoning_effort="low")
+                       reasoning_effort="low", max_tokens=1600)
     publisher = Publisher(bot, storage, llm, cfg.channel_id,
                           admin_ids=cfg.admin_ids, quota=quota, vk=vk, claude=claude, gemini=gemini)
 

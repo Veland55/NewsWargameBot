@@ -149,6 +149,12 @@ class LLMClient:
         headers = self._auth_headers
 
         last_error = "неизвестная ошибка"
+        # Обрезанный, но непустой ответ (finish_reason=length) раньше считался
+        # успехом и уходил в канал на полуслове, без хештегов в конце —
+        # держим его тут как запасной вариант, а сами всё равно пробуем
+        # дотянуть до чистого finish_reason=stop с большим лимитом.
+        truncated_text: str | None = None
+        truncated_usage: dict | None = None
         for attempt in range(1, self.retries + 2):
             try:
                 session = await self._get_session()
@@ -158,25 +164,30 @@ class LLMClient:
                     body = await resp.text()
                     if resp.status == 200:
                         try:
-                            text, usage = self._extract(body)
+                            text, finish, usage = self._extract(body)
                         except LLMEmpty as exc:
                             # Пустой ответ раньше сразу ронял запрос, минуя
                             # повторы, — и новость уходила необработанной.
                             last_error = str(exc)
-                            if exc.finish_reason == "length":
-                                # Бюджет вышел до того, как модель начала
-                                # отвечать: на повтор даём больше места.
-                                payload["max_tokens"] = min(
-                                    4000, int(payload["max_tokens"] * 2))
-                                last_error += (f"; повышаю лимит до "
-                                               f"{payload['max_tokens']} токенов")
+                            finish = exc.finish_reason
                         else:
-                            if self.on_usage:
-                                try:
-                                    self.on_usage(usage)
-                                except Exception:
-                                    log.exception("сбой в учёте расхода")
-                            return text
+                            if finish != "length":
+                                if self.on_usage:
+                                    try:
+                                        self.on_usage(usage)
+                                    except Exception:
+                                        log.exception("сбой в учёте расхода")
+                                return text
+                            last_error = f"ответ обрезан на {len(text)} символах (finish_reason=length)"
+                            truncated_text, truncated_usage = text, usage
+                        if finish == "length":
+                            # Бюджет вышел до того, как модель дописала
+                            # ответ (или не начала вовсе) — на повтор даём
+                            # больше места.
+                            payload["max_tokens"] = min(
+                                4000, int(payload["max_tokens"] * 2))
+                            last_error += (f"; повышаю лимит до "
+                                           f"{payload['max_tokens']} токенов")
                     else:
                         last_error = f"HTTP {resp.status}: {body[:300]}"
                         # 4xx (кроме 429) повторять смысла нет. Проверка
@@ -195,11 +206,21 @@ class LLMClient:
                             attempt, last_error, delay)
                 await asyncio.sleep(delay)
 
+        if truncated_text is not None:
+            # Так и не дотянули до чистого finish_reason=stop — публикуем
+            # обрезанный черновик, это лучше, чем совсем ничего.
+            log.warning("отдаю обрезанный ответ после всех попыток: %s", last_error)
+            if self.on_usage and truncated_usage:
+                try:
+                    self.on_usage(truncated_usage)
+                except Exception:
+                    log.exception("сбой в учёте расхода")
+            return truncated_text
         raise LLMError(last_error)
 
     @staticmethod
-    def _extract(body: str) -> tuple[str, dict]:
-        """Возвращает (текст ответа, сведения о расходе токенов)."""
+    def _extract(body: str) -> tuple[str, str, dict]:
+        """Возвращает (текст ответа, finish_reason, сведения о расходе токенов)."""
         import json
 
         try:
@@ -220,8 +241,8 @@ class LLMClient:
             raise LLMError(f"неожиданная структура ответа: {body[:300]}") from exc
 
         text = (content or "").strip()
+        finish = str(choice.get("finish_reason") or "")
         if not text:
-            finish = str(choice.get("finish_reason") or "")
             # Рассуждающие модели кладут ход мыслей отдельно; в пост он не
             # годится, но по нему видно, на что ушёл бюджет.
             thinking = (message.get("reasoning")
@@ -238,4 +259,4 @@ class LLMClient:
             # OpenRouter кладёт сюда стоимость запроса в кредитах
             "cost": float(raw.get("cost") or 0.0),
         }
-        return text, usage
+        return text, finish, usage
