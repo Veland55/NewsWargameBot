@@ -17,7 +17,7 @@ from .llm import LLMError
 from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, _ext_for,
                         html_problem, tg_len)
 from .quota import until_reset
-from .rss import discover_sitemap, fetch, fetch_sitemap
+from .rss import Entry, discover_sitemap, fetch, fetch_article_entry, fetch_sitemap
 from .vk import VKError, to_plain
 
 log = logging.getLogger(__name__)
@@ -366,12 +366,11 @@ async def cmd_test(message: Message, command: CommandObject, st: Storage,
         return
 
     await _reply(message, f"Забираю ленту и прогоняю через {_e(publisher.active_backend_label)}…")
-    result = await fetch(feed["url"])
-    if result.error or not result.entries:
-        await _reply(message, f"❌ {_e(result.error or 'в ленте нет записей')}")
+    entry, error = await _last_entry(feed)
+    if error:
+        await _reply(message, f"❌ {_e(error)}")
         return
 
-    entry = result.entries[-1]
     started = time.monotonic()
     try:
         post = await publisher.build_post(entry, feed)
@@ -1068,12 +1067,12 @@ async def cmd_vk(message: Message, command: CommandObject, st: Storage,
             await _reply(message, "Сначала настройте доступ.\n\n" + VK_HELP)
             return
         await _reply(message, "Беру последнюю новость и публикую её в VK…")
-        result = await fetch(feed["url"])
-        if result.error or not result.entries:
-            await _reply(message, f"❌ {_e(result.error or 'в ленте нет записей')}")
+        entry, error = await _last_entry(feed)
+        if error:
+            await _reply(message, f"❌ {_e(error)}")
             return
         try:
-            post = await publisher.build_post(result.entries[-1], feed)
+            post = await publisher.build_post(entry, feed)
         except LLMError as exc:
             await _reply(message, f"❌ Модель вернула ошибку: <code>{_e(exc)}</code>")
             return
@@ -1174,12 +1173,11 @@ async def cmd_claude(message: Message, command: CommandObject, st: Storage,
             return
         images_note = " (качаю картинки со страницы — это дольше обычного)" if feed["multi_images"] else ""
         await _reply(message, f"Забираю ленту и прогоняю через Claude{images_note}…")
-        result = await fetch(feed["url"])
-        if result.error or not result.entries:
-            await _reply(message, f"❌ {_e(result.error or 'в ленте нет записей')}")
+        entry, error = await _last_entry(feed)
+        if error:
+            await _reply(message, f"❌ {_e(error)}")
             return
 
-        entry = result.entries[-1]
         was_on = st.get("claude_mode")
         st.set("claude_mode", "1")   # build_post смотрит на это состояние
         try:
@@ -1277,12 +1275,11 @@ async def cmd_gemini(message: Message, command: CommandObject, st: Storage,
             await _reply(message, "GEMINI_API_KEY не задан.\n\n" + GEMINI_HELP)
             return
         await _reply(message, "Забираю ленту и прогоняю через Gemini…")
-        result = await fetch(feed["url"])
-        if result.error or not result.entries:
-            await _reply(message, f"❌ {_e(result.error or 'в ленте нет записей')}")
+        entry, error = await _last_entry(feed)
+        if error:
+            await _reply(message, f"❌ {_e(error)}")
             return
 
-        entry = result.entries[-1]
         was_on = st.get("gemini_mode")
         st.set("gemini_mode", "1")   # build_post смотрит на это состояние
         try:
@@ -1431,6 +1428,33 @@ def _parse_id(args: str | None) -> int | None:
         return int((args or "").split()[0])
     except (ValueError, IndexError):
         return None
+
+
+async def _last_entry(feed: sqlite3.Row) -> tuple[Entry | None, str | None]:
+    """Последняя запись ленты для /test, /vk test, /claude test, /gemini test —
+    учитывает вид источника. Для sitemap fetch() (RSS-парсер) на XML-адресе
+    sitemap просто не даёт записей — эти команды раньше молча говорили
+    «в ленте нет записей» даже для рабочего источника без RSS.
+    Возвращает (запись, None) или (None, текст ошибки).
+    """
+    if feed["kind"] == "sitemap":
+        result = await fetch_sitemap(feed["url"], feed["article_path"])
+        if result.error:
+            return None, result.error
+        if not result.entries:
+            return None, "в sitemap нет подходящих записей"
+        thin = result.entries[-1]
+        full = await fetch_article_entry(thin.link, thin.published_ts, thin.published)
+        if full is None:
+            return None, "не удалось прочитать страницу последней статьи"
+        return full, None
+
+    result = await fetch(feed["url"])
+    if result.error:
+        return None, result.error
+    if not result.entries:
+        return None, "в ленте нет записей"
+    return result.entries[-1], None
 
 
 def _tail(text: str | None) -> str:
