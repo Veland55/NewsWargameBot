@@ -83,8 +83,8 @@ CREATE INDEX IF NOT EXISTS idx_posts_posted ON posts (posted_at DESC);
 
 -- Новости, похожие на уже опубликованный пост (с другой ленты или под
 -- другим guid этой же) — не публикуются сами, ждут ручного разбора в
--- веб-панели («Дубли»): посмотреть и опубликовать, если совпадение ложное,
--- или удалить, если дубль настоящий. См. Publisher._drop_duplicates.
+-- веб-панели (раздел «Ленты»): посмотреть и опубликовать, если совпадение
+-- ложное, или удалить, если дубль настоящий. См. Publisher._drop_duplicates.
 CREATE TABLE IF NOT EXISTS dedup_candidates (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     feed_id         INTEGER,

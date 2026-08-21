@@ -66,7 +66,7 @@ HELP = """<b>RSS → ИИ → канал</b>
 
 Несколько картинок альбомом вместо одной (до 10, работает при любом режиме — обычном, Claude, Gemini): <code>/multiimages on</code>, сколько штук — <code>/set max_images 6</code>. Вернуть как раньше — <code>/multiimages off</code>
 
-Новость, похожая на уже опубликованную с другой ленты, сама в канал не уходит — ждёт разбора: <code>/duplicates</code> (посмотреть картинки, опубликовать или удалить — удобнее в веб-панели, «Дубли»). Выключить: <code>/set dedup_enabled 0</code>
+Новость, похожая на уже опубликованную с другой ленты, сама в канал не уходит — ждёт разбора: <code>/duplicates</code> (посмотреть картинки, опубликовать или удалить — удобнее в веб-панели, раздел «Ленты»). Выключить: <code>/set dedup_enabled 0</code>
 
 <b>Настройки</b>
 /status — состояние бота
@@ -1278,7 +1278,7 @@ async def cmd_usage(message: Message, st: Storage, publisher: Publisher) -> None
 @router.message(Command("duplicates"))
 async def cmd_duplicates(message: Message, st: Storage) -> None:
     """Список читать можно и тут, а смотреть картинки, публиковать или
-    удалять — удобнее в веб-панели («Дубли»), там же вся карточка."""
+    удалять — удобнее в веб-панели, раздел «Ленты», там же вся карточка."""
     rows = st.dedup_candidates(10)
     if not rows:
         await _reply(message, "Дублей на разбор нет.")
@@ -1288,7 +1288,7 @@ async def cmd_duplicates(message: Message, st: Storage) -> None:
         lines.append(f"· {_e(r['title'][:80])}\n"
                      f"  {_e(r['source'] or 'без ленты')} · похоже на пост #{r['matched_post_id']} "
                      f"({r['score']:.0%})")
-    lines.append("\nПосмотреть картинки, опубликовать или удалить — в веб-панели, «Дубли».")
+    lines.append("\nПосмотреть картинки, опубликовать или удалить — в веб-панели, раздел «Ленты».")
     await _reply(message, "\n".join(lines))
 
 

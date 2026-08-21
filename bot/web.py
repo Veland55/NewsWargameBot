@@ -285,6 +285,9 @@ main.wide { max-width: 1180px; }
    зарезервирован только под бренд/активную вкладку, иначе взгляд цепляется
    за заголовки, а не за сами элементы управления. */
 h2 { font-size: 20px; color: var(--text); font-weight: 700; margin: 30px 0 12px; letter-spacing: -.2px; }
+/* Якорные переходы (например дашборд → #duplicates) иначе утыкаются
+   заголовком прямо под залипающую шапку — застревает, накрытый ей. */
+h2[id] { scroll-margin-top: calc(76px + var(--tg-top)); }
 h2:first-child { margin-top: 4px; }
 /* h3 — подзаголовок группы полей внутри карточки, нарочно тише и мельче h2,
    чтобы иерархия читалась с одного взгляда. */
@@ -574,7 +577,6 @@ NAV_ITEMS = [
     ("/content", "📝", "Контент"),
     ("/settings", "⚙️", "Настройки"),
     ("/posts", "📮", "Посты"),
-    ("/duplicates", "🔁", "Дубли"),
 ]
 
 
@@ -783,7 +785,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                    if pub.vk_on else '<span class="pill neutral">выключен</span>'),
         ]
         if dupes:
-            stats.append(("Дубли", f'<a href="/duplicates" class="pill off" style="text-decoration:none;">{dupes} на разбор</a>'))
+            stats.append(("Дубли", f'<a href="/feeds#duplicates" class="pill warn" style="text-decoration:none;">{dupes} на разбор ›</a>'))
         stat_html = "".join(
             f'<div class="stat-card"><div class="stat-label">{_e(k)}</div>'
             f'<div class="stat-value">{v}</div></div>' for k, v in stats
@@ -819,8 +821,43 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         return _redirect("/")
 
     # --- ленты ---------------------------------------------------------------
+    def _dupes_section_html(st: "Storage") -> str:
+        """Дубли между лентами показываются здесь же, на «Лентах» — это тоже
+        решение по выдаче лент, а не отдельная самостоятельная сущность.
+        Пусто — секция не рендерится вовсе, чтобы не мозолить глаза, когда
+        разбирать нечего (как бейдж на дашборде)."""
+        dupes = st.dedup_candidates(50)
+        if not dupes:
+            return ""
+        items = ""
+        for r in dupes:
+            matched = st.post(r["matched_post_id"]) if r["matched_post_id"] else None
+            matched_html = (f'<a href="/posts/{r["matched_post_id"]}">пост #{r["matched_post_id"]}</a>'
+                            if matched else f'пост #{r["matched_post_id"]} (уже удалён)')
+            thumb = (f'<img src="{_safe_href(r["image"])}" alt="" '
+                    f'style="width:64px; height:64px; object-fit:cover; border-radius:8px; flex-shrink:0;">'
+                    if r["image"] else '<div style="width:64px; height:64px; border-radius:8px; '
+                    'background:var(--field-bg); flex-shrink:0;"></div>')
+            when = time.strftime("%d.%m %H:%M", time.localtime(r["detected_at"]))
+            items += f"""<div class="list-item">
+              {thumb}
+              <div class="list-item-info">
+                <div class="list-item-title">{_e(r['title'][:140])} <span class="pill neutral">{r['score']:.0%}</span></div>
+                <div class="muted">{_e(r['source'] or 'без ленты')} · найдено {when} · похоже на {matched_html}</div>
+              </div>
+              <div class="list-item-actions">
+                <a class="btn icon" href="/duplicates/{r['id']}" title="Подробнее">›</a>
+              </div>
+            </div>"""
+        return f"""
+        <h2 id="duplicates">Дубли <span class="muted" style="font-weight:400;">({len(dupes)})</span></h2>
+        <div class="section-hint">Похожи на уже опубликованные с другой ленты — не в канале, ждут решения.</div>
+        <div class="list">{items}</div>
+        """
+
     async def feeds_get(request: web.Request, flash: str = "", flash_kind: str = "ok") -> web.Response:
         st: Storage = app["st"]
+        dupes_html = _dupes_section_html(st)
         rows = st.feeds()
         items = ""
         for f in rows:
@@ -852,6 +889,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             "<div class='muted'>Лент пока нет — добавьте первую выше.</div></div>"
         )
         body = f"""
+        {dupes_html}
+        <h2>Ленты <span class="muted" style="font-weight:400;">({len(rows)})</span></h2>
         <details>
           <summary class="disclosure">Добавить ленту</summary>
           <div class="card" style="margin-top:10px;">
@@ -864,8 +903,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             </form>
           </div>
         </details>
-        <h2 class="page-heading">Ленты <span class="muted" style="font-weight:400;">({len(rows)})</span></h2>
-        <div class="list">{list_html}</div>
+        <div class="list" style="margin-top:10px;">{list_html}</div>
         """
         return web.Response(text=_layout("Ленты", body, flash, flash_kind, active="/feeds"), content_type="text/html")
 
@@ -1413,43 +1451,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                     summary=row["summary"], published=row["published"], published_ts=0,
                     image=row["image"])
 
-    async def duplicates_get(request: web.Request, flash: str = "", flash_kind: str = "ok") -> web.Response:
-        st: Storage = app["st"]
-        rows = st.dedup_candidates(50)
-        items = ""
-        for r in rows:
-            matched = st.post(r["matched_post_id"]) if r["matched_post_id"] else None
-            matched_html = (f'<a href="/posts/{r["matched_post_id"]}">пост #{r["matched_post_id"]}</a>'
-                            if matched else f'пост #{r["matched_post_id"]} (уже удалён)')
-            thumb = (f'<img src="{_safe_href(r["image"])}" alt="" '
-                    f'style="width:64px; height:64px; object-fit:cover; border-radius:8px; flex-shrink:0;">'
-                    if r["image"] else '<div style="width:64px; height:64px; border-radius:8px; '
-                    'background:var(--field-bg); flex-shrink:0;"></div>')
-            when = time.strftime("%d.%m %H:%M", time.localtime(r["detected_at"]))
-            items += f"""<div class="list-item">
-              {thumb}
-              <div class="list-item-info">
-                <div class="list-item-title">{_e(r['title'][:140])}</div>
-                <div class="muted">{_e(r['source'] or 'без ленты')} · найдено {when} ·
-                  похоже на {matched_html} ({r['score']:.0%})</div>
-              </div>
-              <div class="list-item-actions">
-                <a class="btn icon" href="/duplicates/{r['id']}" title="Подробнее">›</a>
-              </div>
-            </div>"""
-        list_html = items if rows else (
-            "<div style='padding:28px 16px; text-align:center;'>"
-            "<div style='font-size:28px; margin-bottom:8px;'>🔁</div>"
-            "<div class='muted'>Дублей на разбор нет.</div></div>"
-        )
-        body = f"""
-        <h2>Дубли <span class="muted" style="font-weight:400;">({len(rows)})</span></h2>
-        <div class="section-hint">Новости, похожие на уже опубликованные с другой ленты — не в канале,
-          ждут решения. Настройки — /status или <code>/set dedup_enabled</code>/<code>dedup_threshold</code>/<code>dedup_window_days</code>.</div>
-        <div class="list">{list_html}</div>
-        """
-        return web.Response(text=_layout("Дубли", body, flash, flash_kind, active="/duplicates"), content_type="text/html")
-
     async def duplicate_detail(request: web.Request) -> web.Response:
         st: Storage = app["st"]
         cid = int(request.match_info["id"])
@@ -1464,7 +1465,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                       f'style="max-width:100%; border-radius:10px; margin-top:10px;">'
                       if row["image"] else "")
         body = f"""
-        <div><a href="/duplicates" class="back-link">‹ Все дубли</a></div>
+        <div><a href="/feeds#duplicates" class="back-link">‹ Ленты</a></div>
         <h2 class="page-heading after-back">Дубль #{row['id']}</h2>
         <div class="card">
           <div class="line"><b>{_e(row['title'])}</b></div>
@@ -1484,7 +1485,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </div>
         </div>
         """
-        return web.Response(text=_layout(f"Дубль #{row['id']}", body, active="/duplicates"), content_type="text/html")
+        return web.Response(text=_layout(f"Дубль #{row['id']}", body, active="/feeds"), content_type="text/html")
 
     async def duplicate_publish(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -1496,15 +1497,15 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         feed = st.feed(row["feed_id"]) if row["feed_id"] else None
         error = await pub.publish_now(_dedup_entry(row), feed)
         if error:
-            return await duplicates_get(request, flash=error, flash_kind="err")
+            return await feeds_get(request, flash=error, flash_kind="err")
         st.delete_dedup_candidate(cid)
-        return await duplicates_get(request, flash="Опубликовано.")
+        return await feeds_get(request, flash="Опубликовано.")
 
     async def duplicate_delete(request: web.Request) -> web.Response:
         st: Storage = app["st"]
         cid = int(request.match_info["id"])
         st.delete_dedup_candidate(cid)
-        return await duplicates_get(request, flash="Убрано из очереди.")
+        return await feeds_get(request, flash="Убрано из очереди.")
 
     app.router.add_get("/login", login_get)
     app.router.add_post("/login", login_post)
@@ -1536,7 +1537,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/posts/{id}/save", post_save)
     app.router.add_post("/posts/{id}/regen", post_regen)
     app.router.add_post("/posts/{id}/image/{msg_id}/delete", post_delete_image)
-    app.router.add_get("/duplicates", duplicates_get)
     app.router.add_get("/duplicates/{id}", duplicate_detail)
     app.router.add_post("/duplicates/{id}/publish", duplicate_publish)
     app.router.add_post("/duplicates/{id}/delete", duplicate_delete)
