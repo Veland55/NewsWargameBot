@@ -25,9 +25,9 @@ CREATE TABLE IF NOT EXISTS feeds (
     last_check    INTEGER NOT NULL DEFAULT 0,
     last_error    TEXT,
     multi_images  INTEGER NOT NULL DEFAULT 0,  -- несколько картинок альбомом вместо одной
-    kind          TEXT NOT NULL DEFAULT 'rss', -- 'rss' или 'sitemap' (сайт без RSS)
-    article_path  TEXT NOT NULL DEFAULT '',    -- для sitemap: часть пути, которая есть только у статей
-    listing_url   TEXT NOT NULL DEFAULT '',    -- для sitemap: страница со списком новостей (подстраховка)
+    kind          TEXT NOT NULL DEFAULT 'rss', -- 'rss' или 'search' (сайт без RSS — см. bot/search.py)
+    article_path  TEXT NOT NULL DEFAULT '',    -- для search: часть пути сайта, ограничивающая запрос site:
+    listing_url   TEXT NOT NULL DEFAULT '',    -- не используется (осталось от старой реализации через sitemap.xml)
     added_at      INTEGER NOT NULL
 );
 
@@ -190,6 +190,7 @@ class Storage:
             self._migrate()
             self._migrate_settings_keys()
             self._migrate_multi_images_to_feeds()
+            self._migrate_sitemap_kind_to_search()
             self._conn.commit()
 
     def _migrate(self) -> None:
@@ -229,6 +230,16 @@ class Storage:
             if row["value"] == "1":
                 self._conn.execute("UPDATE feeds SET multi_images = 1")
             self._conn.execute("DELETE FROM settings WHERE key = 'multi_images'")
+
+    def _migrate_sitemap_kind_to_search(self) -> None:
+        """Источники без RSS перешли с разбора sitemap.xml на обнаружение
+        через веб-поиск (см. bot/search.py) — прежний kind='sitemap' стал
+        kind='search', сам механизм переписан полностью. Уже добавленные
+        такими лентами источники не должны молча перестать опрашиваться —
+        переносим разово; listing_url (подстраховка старой реализации)
+        больше не используется, чистим заодно."""
+        self._conn.execute("UPDATE feeds SET kind = 'search' WHERE kind = 'sitemap'")
+        self._conn.execute("UPDATE feeds SET listing_url = '' WHERE listing_url != ''")
 
     def _migrate_settings_keys(self) -> None:
         """Переименования ключей в settings, случившиеся после того, как ими
@@ -275,21 +286,19 @@ class Storage:
 
     # --- ленты -----------------------------------------------------------
     def add_feed(self, url: str, title: str = "", kind: str = "rss",
-                article_path: str = "", listing_url: str = "") -> int | None:
+                article_path: str = "") -> int | None:
         """Возвращает id новой ленты или None, если такая уже есть.
 
-        kind='sitemap' — источник без RSS: url тогда хранит адрес самого
-        sitemap.xml (см. bot.rss.discover_sitemap), article_path — часть
-        пути, которая есть только у статей, listing_url — необязательная
-        страница со списком новостей, подстраховка сверх sitemap.xml
-        (см. bot.rss.fetch_sitemap / fetch_listing_articles).
+        kind='search' — источник без RSS: новые статьи находятся через
+        веб-поиск (см. bot/search.py), url хранит адрес сайта, article_path —
+        часть пути, ограничивающая поисковый запрос (site:домен/путь).
         """
         with self._lock:
             try:
                 cur = self._conn.execute(
-                    "INSERT INTO feeds (url, title, kind, article_path, listing_url, added_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (url, title, kind, article_path, listing_url, int(time.time())),
+                    "INSERT INTO feeds (url, title, kind, article_path, added_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (url, title, kind, article_path, int(time.time())),
                 )
                 self._conn.commit()
                 return int(cur.lastrowid)

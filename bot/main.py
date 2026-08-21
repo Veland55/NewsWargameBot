@@ -21,6 +21,7 @@ from .llm import LLMClient
 from .publisher import Publisher
 from .quota import Quota
 from .rss import FETCH_TIMEOUT, close_http
+from .search import SearchClient
 from .vk import VKClient
 from .web import run_web_panel
 
@@ -70,8 +71,13 @@ async def run() -> None:
     # повтором с удвоенным лимитом, если и этого не хватит.
     gemini = LLMClient(cfg.gemini_base_url, cfg.gemini_api_key, cfg.gemini_model,
                        reasoning_effort="low", max_tokens=1600)
+    # Сайты без RSS (см. bot/search.py) находят новые статьи через веб-поиск,
+    # не разбором ленты — своим средствам сайта узнать «что нового» доверять
+    # нельзя, кэш CDN нередко отдаёт устаревший снимок.
+    search = SearchClient(cfg.google_search_api_key, cfg.google_search_cse_id)
     publisher = Publisher(bot, storage, llm, cfg.channel_id,
-                          admin_ids=cfg.admin_ids, quota=quota, vk=vk, claude=claude, gemini=gemini)
+                          admin_ids=cfg.admin_ids, quota=quota, vk=vk, claude=claude,
+                          gemini=gemini, search=search)
 
     dp = Dispatcher()
     handlers.setup(handlers.router, cfg.admin_ids)
@@ -108,6 +114,9 @@ async def run() -> None:
     if storage.get("gemini_mode") == "1" and not gemini.api_key:
         log.warning("режим Gemini включён командой, но GEMINI_API_KEY не задан — "
                     "работает обычный LLM")
+    if not search.configured and any(f["kind"] == "search" for f in storage.feeds()):
+        log.warning("есть сайты без RSS (/addsite), но GOOGLE_SEARCH_API_KEY/"
+                    "GOOGLE_SEARCH_CSE_ID не заданы — они не будут опрашиваться")
     if not publisher.channel:
         log.warning("канал не задан — укажите CHANNEL_ID в .env или /setchannel")
     if publisher.debug:
@@ -156,6 +165,7 @@ async def run() -> None:
         await vk.close()
         await claude.close()
         await gemini.close()
+        await search.close()
         await close_http()
         await bot.session.close()
         storage.close()

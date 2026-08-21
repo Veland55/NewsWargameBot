@@ -35,7 +35,7 @@ from .llm import LLMError
 from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, html_problem,
                         tg_len)
 from .quota import until_reset
-from .rss import Entry, discover_sitemap, fetch, fetch_sitemap, resolve_article_path
+from .rss import Entry, fetch
 
 log = logging.getLogger(__name__)
 
@@ -863,14 +863,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         own_prompt = ' <span class="pill neutral">свой промпт</span>' if f["template"] else ""
         multi = ' <span class="pill neutral">неск. картинок</span>' if f["multi_images"] else ""
         path_hint = (f' <span class="pill neutral">{_e(f["article_path"])}</span>'
-                    if f["kind"] == "sitemap" and f["article_path"] else "")
-        listing_hint = (' <span class="pill neutral">+ страница новостей</span>'
-                        if f["kind"] == "sitemap" and f["listing_url"] else "")
+                    if f["kind"] == "search" and f["article_path"] else "")
         return f"""<div class="list-item">
           <div class="list-item-info">
             <div class="list-item-title">
               <b>#{f['id']}</b> {_e(f['title'] or '(без названия)')}
-              <span class="pill {'on' if f['enabled'] else 'neutral'}">{'вкл' if f['enabled'] else 'пауза'}</span>{own_prompt}{multi}{path_hint}{listing_hint}
+              <span class="pill {'on' if f['enabled'] else 'neutral'}">{'вкл' if f['enabled'] else 'пауза'}</span>{own_prompt}{multi}{path_hint}
             </div>
             <div class="muted mono ellipsis">{_e(f['url'])}</div>
             <div class="muted">проверена: {checked} · в архиве: {st.seen_count(f['id'])}</div>
@@ -892,8 +890,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         st: Storage = app["st"]
         dupes_html = _dupes_section_html(st)
         rows = st.feeds()
-        rss_rows = [f for f in rows if f["kind"] != "sitemap"]
-        sitemap_rows = [f for f in rows if f["kind"] == "sitemap"]
+        rss_rows = [f for f in rows if f["kind"] != "search"]
+        search_rows = [f for f in rows if f["kind"] == "search"]
 
         rss_list = "".join(_feed_row_html(f, request, st)
                            for f in rss_rows) or (
@@ -901,10 +899,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             "<div style='font-size:28px; margin-bottom:8px;'>📰</div>"
             "<div class='muted'>Лент пока нет — добавьте первую выше.</div></div>"
         )
-        sitemap_list = "".join(_feed_row_html(f, request, st)
-                               for f in sitemap_rows) or (
+        search_list = "".join(_feed_row_html(f, request, st)
+                              for f in search_rows) or (
             "<div style='padding:28px 16px; text-align:center;'>"
-            "<div style='font-size:28px; margin-bottom:8px;'>🗺️</div>"
+            "<div style='font-size:28px; margin-bottom:8px;'>🔎</div>"
             "<div class='muted'>Сайтов без RSS пока нет — добавьте первый выше.</div></div>"
         )
 
@@ -925,38 +923,30 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         </details>
         <div class="list" style="margin-top:10px;">{rss_list}</div>
 
-        <h2>Сайты без RSS <span class="muted" style="font-weight:400;">({len(sitemap_rows)})</span></h2>
-        <div class="section-hint">Новости с сайтов, где нет RSS-ленты — проверяются через sitemap.xml сайта,
-          без браузера и без JS, обычный лёгкий запрос раз в цикл опроса.</div>
+        <h2>Сайты без RSS <span class="muted" style="font-weight:400;">({len(search_rows)})</span></h2>
+        <div class="section-hint">Новости с сайтов, где нет RSS-ленты — находятся через веб-поиск, а не
+          разбором ленты: у собственных средств сайта узнать «что нового» (sitemap.xml, страница списка
+          новостей) кэш нередко отдаёт устаревший снимок, поиск от этого не зависит. Нужен ключ поиска —
+          см. SETUP.md.</div>
         <details>
           <summary class="disclosure">Добавить сайт без RSS</summary>
           <div class="card" style="margin-top:10px;">
-            <form method="post" action="/feeds/add-sitemap">{csrf_field(request)}
+            <form method="post" action="/feeds/add-search">{csrf_field(request)}
               <div class="row" style="align-items:flex-end;">
                 <div style="flex:2;"><label>Адрес сайта</label><input type="text" name="url" placeholder="https://example.com/" required></div>
                 <div style="flex:1;"><label>Название (необязательно)</label><input type="text" name="title"></div>
               </div>
               <div class="row" style="align-items:flex-end; margin-top:8px;">
-                <div style="flex:1;"><label>Часть адреса статей (необязательно)</label>
+                <div style="flex:2;"><label>Часть адреса статей (необязательно)</label>
                   <input type="text" name="article_path" placeholder="/articles/"></div>
-              </div>
-              <div class="field-hint" style="margin-top:4px;">Нужна, если в sitemap сайта вперемешку и
-                новости, и другие страницы (товары, категории) — без неё заберём всё подряд. Если
-                вставили в «Адрес сайта» ссылку на конкретный раздел — попробуем определить фильтр
-                по нему сами; не получится — попросим ввести отдельно.</div>
-              <div class="row" style="align-items:flex-end; margin-top:8px;">
-                <div style="flex:2;"><label>Страница со списком новостей (необязательно)</label>
-                  <input type="text" name="listing_url" placeholder="https://example.com/news/"></div>
                 <button class="primary" type="submit">Добавить</button>
               </div>
-              <div class="field-hint" style="margin-top:4px;">Подстраховка сверх sitemap.xml — если
-                у sitemap сайта бывает задержка с новыми статьями, страница списка новостей нередко
-                обновляется быстрее. Работает не для всех сайтов — если формат окажется неподходящим,
-                просто не даст эффекта, ничего не сломает.</div>
+              <div class="field-hint" style="margin-top:4px;">Сужает поисковый запрос (site:домен + этот
+                путь) — нужна, если на сайте вперемешку новости и другие страницы (товары, категории).</div>
             </form>
           </div>
         </details>
-        <div class="list" style="margin-top:10px;">{sitemap_list}</div>
+        <div class="list" style="margin-top:10px;">{search_list}</div>
         """
         return web.Response(text=_layout("Ленты", body, flash, flash_kind, active="/feeds"), content_type="text/html")
 
@@ -977,35 +967,34 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         app["publisher"].wake()
         return _redirect("/feeds")
 
-    async def feeds_add_sitemap(request: web.Request) -> web.Response:
+    async def feeds_add_search(request: web.Request) -> web.Response:
         form = request["form"]
         url = str(form.get("url", "")).strip()
         title = str(form.get("title", "")).strip()
         article_path = str(form.get("article_path", "")).strip()
-        listing_url = str(form.get("listing_url", "")).strip()
         if not url.startswith(("http://", "https://")):
             return await feeds_get(request, "Нужна ссылка, начинающаяся на http:// или https://", "err")
-        sitemap_url = await discover_sitemap(url)
-        if sitemap_url is None:
+        publisher: Publisher = app["publisher"]
+        if publisher.search is None or not publisher.search.configured:
             return await feeds_get(
                 request,
-                "Не нашли sitemap.xml — ни в robots.txt, ни по стандартному адресу. "
-                "Для этого сайта такой способ не подойдёт.", "err")
-        article_path, path_error = await resolve_article_path(sitemap_url, url, article_path)
-        if path_error:
-            return await feeds_get(request, path_error, "err")
-        result = await fetch_sitemap(sitemap_url, article_path, listing_url=listing_url)
-        if result.error:
-            return await feeds_get(request, f"sitemap.xml недоступен: {result.error}", "err")
-        if not result.entries:
+                "Поиск не настроен — нужны GOOGLE_SEARCH_API_KEY и GOOGLE_SEARCH_CSE_ID "
+                "в .env. Как получить — SETUP.md, раздел «Сайты без RSS».", "err")
+        domain = urlsplit(url).netloc
+        if not domain:
+            return await feeds_get(request, "Не разобрал домен в этой ссылке.", "err")
+        query = f"site:{domain}{article_path}" if article_path else f"site:{domain}"
+        items, error = await publisher.search.search(query, date_restrict="w1")
+        if error:
+            return await feeds_get(request, f"Поиск не ответил: {error}", "err")
+        if not items:
             return await feeds_get(
                 request,
-                "sitemap.xml прочитался, но подходящих записей не нашлось — "
-                "проверьте «часть адреса статей», если она заполнена.", "err")
-        feed_id = app["st"].add_feed(sitemap_url, title, kind="sitemap", article_path=article_path,
-                                     listing_url=listing_url)
+                f"По запросу «{query}» поиск ничего не нашёл за последнюю неделю — либо сайт "
+                f"не публиковал новостей, либо часть адреса статей выбрана неверно.", "err")
+        feed_id = app["st"].add_feed(url, title, kind="search", article_path=article_path)
         if feed_id is None:
-            return await feeds_get(request, "Такой sitemap уже добавлен.", "err")
+            return await feeds_get(request, "Такой сайт уже добавлен.", "err")
         app["publisher"].wake()
         return _redirect("/feeds")
 
@@ -1609,7 +1598,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/checknow", checknow_post)
     app.router.add_get("/feeds", feeds_get)
     app.router.add_post("/feeds/add", feeds_add)
-    app.router.add_post("/feeds/add-sitemap", feeds_add_sitemap)
+    app.router.add_post("/feeds/add-search", feeds_add_search)
     app.router.add_post("/feeds/{id}/delete", feeds_delete)
     app.router.add_post("/feeds/{id}/toggle", feeds_toggle)
     app.router.add_post("/feeds/{id}/multiimages", feeds_toggle_multi)

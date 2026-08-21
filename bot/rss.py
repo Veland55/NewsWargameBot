@@ -591,287 +591,50 @@ async def fetch(url: str, etag: str | None = None, modified: str | None = None) 
         return FetchResult(entries=[], error="таймаут загрузки ленты")
 
 
-# ─── Источники без RSS: sitemap.xml вместо ленты ───────────────────────────
+# ─── Источники без RSS: обнаружение через веб-поиск ────────────────────────
 #
-# У сайта нет RSS/Atom — значит опрашивать нечего в привычном смысле. Но
-# sitemap.xml для поисковиков есть почти всегда, и в нём уже лежит именно то,
-# что нужно: адрес каждой страницы и дата последнего изменения (<lastmod>).
-# Ни headless-браузер, ни JS не нужны — просто XML-файл, один HTTP-запрос за
-# цикл опроса (условный GET через If-Modified-Since — как и с RSS-лентами,
-# см. FetchResult.modified). Заголовок, описание и картинку sitemap не даёт —
-# их дочитываем со страницы самой статьи, но только для записей, что уже
-# прошли is_seen/backfill/max_age/flood_guard (см. Publisher._process_feed) —
-# то есть за один проход это обычно 0-3 страницы, а не весь sitemap разом.
-MAX_SITEMAP_BYTES = 8 * 1024 * 1024
-MAX_SUBSITEMAPS = 5   # если sitemap.xml — индекс: не более стольких файлов разом
-SITEMAP_TIMEOUT = 20
-
-_SITEMAP_ENTRY_RE = re.compile(r"<url>(.*?)</url>", re.I | re.S)
-_LOC_RE = re.compile(r"<loc>(.*?)</loc>", re.I | re.S)
-_LASTMOD_RE = re.compile(r"<lastmod>(.*?)</lastmod>", re.I | re.S)
-_SITEMAP_INDEX_RE = re.compile(r"<sitemap>\s*<loc>(.*?)</loc>", re.I | re.S)
-_SITEMAP_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})")
+# У сайта нет RSS/Atom — а собственные средства сайта узнать «что нового»
+# (sitemap.xml, страница списка новостей) могут отдавать устаревший снимок
+# из-за кэша CDN, который не обходится обычными HTTP-приёмами (см. историю
+# в SETUP.md — на warhammer-community.com sitemap.xml оказался закэширован
+# на 50+ часов, и ни параметры против кэша, ни заголовки no-cache, ни
+# служебные заголовки Next.js это не обходят). Обнаружение самих новых
+# адресов теперь на bot/search.py (веб-поиск, не зависит от кэша сайта);
+# здесь остаётся только дочитывание заголовка/описания/картинки со страницы
+# уже найденной статьи — отдельные страницы статей у таких сайтов, в
+# отличие от их списков, как правило кэшируются нормально и открываются
+# свежими.
+ARTICLE_FETCH_LIMIT = 1024 * 1024
+ARTICLE_FETCH_TIMEOUT = 20
 _TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
-
-# Страница со списком новостей — подстраховка сверх sitemap.xml (см.
-# fetch_listing_articles ниже): у части сайтов sitemap успевает обновиться
-# не сразу после публикации, а <lastmod> в нём иногда значит не «дату
-# публикации», а «когда страницу последний раз технически трогали» — эти
-# два случая на практике расходятся. Формат хрупкий, специфичен для
-# конкретного сайта (заточен под Next.js RSC-разметку) — поэтому только
-# опционально, по отдельному полю ленты, и при любом сбое просто ничего не
-# находит, не ломая обычный путь через sitemap.
-_NEXT_F_RE = re.compile(r"self\.__next_f\.push\(\[.*?\]\)", re.S)
-_LISTING_URI_RE = re.compile(r'\\"uri\\":\\"(/articles/[^\\"]+)\\"')
-_LISTING_DATE_RE = re.compile(r'\\"date_universal\\":\\"([^\\"]*)\\"')
-_LISTING_OBJ_START_RE = re.compile(r'\{\\"title\\":')
-
-
-def _sitemap_date(raw: str) -> float:
-    m = _SITEMAP_DATE_RE.match(raw.strip())
-    if not m:
-        return 0.0
-    y, mo, d, h, mi, s = (int(x) for x in m.groups())
-    try:
-        return float(calendar.timegm((y, mo, d, h, mi, s, 0, 0, 0)))
-    except (ValueError, OverflowError):
-        return 0.0
 
 
 async def _fetch_text(url: str, headers: dict | None = None) -> tuple[int, dict, str] | None:
     """(статус, заголовки ответа, тело) или None — сеть подвела."""
     try:
         async with _http().get(url, headers=headers,
-                               timeout=aiohttp.ClientTimeout(total=SITEMAP_TIMEOUT)) as resp:
+                               timeout=aiohttp.ClientTimeout(total=ARTICLE_FETCH_TIMEOUT)) as resp:
             status = resp.status
-            resp_headers = dict(resp.headers)
             buf = bytearray()
             async for chunk in resp.content.iter_chunked(64 * 1024):
                 buf += chunk
-                if len(buf) >= MAX_SITEMAP_BYTES:
+                if len(buf) >= ARTICLE_FETCH_LIMIT:
                     break
     except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeDecodeError):
         return None
-    return status, resp_headers, buf.decode("utf-8", "replace")
-
-
-async def discover_sitemap(site_url: str) -> str | None:
-    """Ищет sitemap.xml сайта: сперва в robots.txt — так его сами объявляют
-    поисковикам (Sitemap: ...), иначе пробуем стандартный путь /sitemap.xml.
-    None — не нашли (сайт отдаёт что-то нестандартное, этот способ тут не
-    сработает).
-    """
-    parts = urlsplit(site_url)
-    if not parts.scheme or not parts.netloc:
-        return None
-    origin = f"{parts.scheme}://{parts.netloc}"
-
-    robots = await _fetch_text(f"{origin}/robots.txt")
-    if robots and robots[0] == 200:
-        m = re.search(r"(?im)^Sitemap:\s*(\S+)", robots[2])
-        if m:
-            return m.group(1).strip()
-
-    guess = f"{origin}/sitemap.xml"
-    xml = await _fetch_text(guess)
-    if xml and xml[0] == 200 and ("<urlset" in xml[2] or "<sitemapindex" in xml[2]):
-        return guess
-    return None
-
-
-def _listing_locale(listing_url: str) -> str:
-    parts = urlsplit(listing_url).path.strip("/").split("/")
-    return parts[0] if parts and parts[0] else ""
-
-
-def _combine_listing_date(ymd: tuple[int, int, int], fallback_ts: float) -> float:
-    """День — из date_universal страницы списка, час — из fallback_ts, если
-    он был (обычно lastmod из sitemap для той же записи), иначе полночь."""
-    if fallback_ts:
-        t = datetime.fromtimestamp(fallback_ts, tz=timezone.utc)
-        hh, mm, ss = t.hour, t.minute, t.second
-    else:
-        hh = mm = ss = 0
-    y, mo, d = ymd
-    try:
-        return float(calendar.timegm((y, mo, d, hh, mm, ss, 0, 0, 0)))
-    except (ValueError, OverflowError):
-        return 0.0
-
-
-async def fetch_listing_articles(listing_url: str) -> list[tuple[str, tuple[int, int, int] | None]]:
-    """(адрес статьи, дата публикации как (год, месяц, день) или None) со
-    страницы списка новостей сайта — как их отдаёт сам сайт своим
-    посетителям, а не то, что успело попасть в sitemap.xml. Лучше всего
-    работает на Next.js-сайтах, что вставляют данные списка прямо в HTML
-    (self.__next_f.push) — ищем в них поля uri/date_universal. Сайт устроен
-    иначе или разметка сменилась при редеплое — просто вернём пустой
-    список, sitemap.xml как был основным источником, так и остаётся.
-
-    Дату отдаём отдельно от времени суток нарочно: date_universal — только
-    календарный день, без часов; подставлять к нему полночь и напрямую
-    сравнивать с точным временем из sitemap значило бы почти всегда
-    проигрывать записям того же дня без коррекции — только из-за разницы
-    в точности, а не в реальной свежести (см. вызывающий код).
-    """
-    try:
-        got = await _fetch_text(listing_url, {"User-Agent": PAGE_UA})
-        if got is None:
-            return []
-        status, _headers, page = got
-        if status != 200:
-            return []
-        origin = f"{urlsplit(listing_url).scheme}://{urlsplit(listing_url).netloc}"
-        locale = _listing_locale(listing_url)
-        prefix = f"{origin}/{locale}" if locale else origin
-
-        joined = "".join(_NEXT_F_RE.findall(page))
-        # Границы объектов статьи в исходном массиве — без них окно поиска
-        # date_universal перед uri может залезть в СОСЕДНИЙ объект (если у
-        # текущей статьи даты вовсе нет) и приписать чужую дату.
-        obj_starts = [m.start() for m in _LISTING_OBJ_START_RE.finditer(joined)]
-        out: list[tuple[str, tuple[int, int, int] | None]] = []
-        seen: set[str] = set()
-        for m in _LISTING_URI_RE.finditer(joined):
-            full = f"{prefix}{m.group(1)}/"
-            if full in seen:
-                continue
-            seen.add(full)
-            obj_start = 0
-            for pos in obj_starts:
-                if pos > m.start():
-                    break
-                obj_start = pos
-            window = joined[obj_start:m.start()]
-            dates = _LISTING_DATE_RE.findall(window)
-            ymd = None
-            if dates:
-                dm = re.match(r"(\d{4})-(\d{2})-(\d{2})", dates[-1])
-                if dm:
-                    ymd = tuple(int(x) for x in dm.groups())
-            out.append((full, ymd))
-        return out
-    except Exception:
-        log.debug("не удалось прочитать список новостей %s", listing_url[:90], exc_info=True)
-        return []
-
-
-async def fetch_sitemap(sitemap_url: str, article_path: str = "",
-                        modified: str | None = None, listing_url: str = "") -> FetchResult:
-    """FetchResult с «пустыми» записями — только адрес и дата (published_ts),
-    заголовок/описание/картинка ещё не дочитаны (см. fetch_article_entry).
-    article_path — часть пути, которая есть только у статей: без неё в
-    список попали бы все страницы сайта, не только новости. listing_url —
-    необязательная подстраховка сверх sitemap.xml (см. fetch_listing_articles).
-    """
-    headers = {"If-Modified-Since": modified} if modified else None
-    got = await _fetch_text(sitemap_url, headers)
-    if got is None:
-        return FetchResult(entries=[], error="sitemap.xml не отвечает")
-    status, resp_headers, xml = got
-    if status == 304:
-        return FetchResult(entries=[], not_modified=True)
-    if status != 200:
-        return FetchResult(entries=[], error=f"HTTP {status}")
-
-    if "<sitemapindex" in xml:
-        subs = _SITEMAP_INDEX_RE.findall(xml)[:MAX_SUBSITEMAPS]
-        parts = await asyncio.gather(*(_fetch_text(html.unescape(u.strip())) for u in subs))
-        xml = "".join(p[2] for p in parts if p and p[0] == 200)
-
-    entries: list[Entry] = []
-    for block in _SITEMAP_ENTRY_RE.findall(xml):
-        loc_m = _LOC_RE.search(block)
-        if not loc_m:
-            continue
-        loc = html.unescape(loc_m.group(1).strip())
-        if article_path and article_path not in loc:
-            continue
-        lastmod_m = _LASTMOD_RE.search(block)
-        ts = _sitemap_date(lastmod_m.group(1)) if lastmod_m else 0.0
-        published = (datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                    if ts else "")
-        entries.append(Entry(key_parts=(loc,), title="", link=loc, summary="",
-                             published=published, published_ts=ts, image=""))
-
-    if listing_url:
-        by_link = {e.link: e for e in entries}
-        for link, ymd in await fetch_listing_articles(listing_url):
-            if article_path and article_path not in link:
-                continue
-            if not ymd:
-                continue
-            if link in by_link:
-                # Настоящая дата публикации со страницы списка надёжнее
-                # lastmod из sitemap — тот иногда сдвигается более поздней
-                # технической правкой страницы, а не новой публикацией. Час
-                # берём из уже имевшегося ts (если был), день — из listing:
-                # так не теряем точность при сравнении с записями того же дня.
-                e = by_link[link]
-                e.published_ts = _combine_listing_date(ymd, e.published_ts)
-                e.published = datetime.fromtimestamp(e.published_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            else:
-                # Новая запись, которой не было в sitemap — часа суток
-                # взять неоткуда, берём полночь того дня.
-                ts = _combine_listing_date(ymd, 0.0)
-                published = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                new_entry = Entry(key_parts=(link,), title="", link=link, summary="",
-                                  published=published, published_ts=ts, image="")
-                entries.append(new_entry)
-                by_link[link] = new_entry
-                by_link[link] = new_entry
-
-    entries.sort(key=lambda e: e.published_ts)
-    return FetchResult(entries=entries, modified=resp_headers.get("Last-Modified"))
-
-
-async def resolve_article_path(sitemap_url: str, site_url: str,
-                                article_path: str) -> tuple[str, str | None]:
-    """Если article_path не задан явно — многие при добавлении сайта вставляют
-    в «Адрес сайта» ссылку на конкретный раздел (например .../news/), ожидая,
-    что именно он и станет фильтром. discover_sitemap отбрасывает путь и
-    смотрит только домен — без этой проверки такой раздел молча терялся бы,
-    и в источник попадали вообще все страницы сайта.
-
-    Пробуем путь из site_url как кандидат в article_path: если под ним
-    нашлись СВОИ статьи (не только сама страница раздела — у неё тоже есть
-    запись в sitemap, но это не новость) — берём его. Если нет — путь ничего
-    не фильтрует (структура адресов сайта не привязана к разделам), и лучше
-    явно сказать об этом, чем молча подключить сайт без фильтра.
-
-    Возвращает (article_path, ошибка). Ошибка — только когда КАНДИДАТ
-    оказался бесполезным; сам article_path при этом остаётся как был (пустым).
-    """
-    if article_path:
-        return article_path, None
-    candidate = urlsplit(site_url).path
-    if not candidate or candidate == "/":
-        return "", None
-
-    probe = await fetch_sitemap(sitemap_url, candidate)
-    if probe.error:
-        return "", None  # sitemap и так недоступен — об этом скажет основной fetch_sitemap
-    own_page = site_url.rstrip("/")
-    real = [e for e in probe.entries if e.link.rstrip("/") != own_page]
-    if real:
-        return candidate, None
-    return "", (f"адрес «{site_url}» сам по себе не годится в фильтр — под ним не нашлось "
-                f"статей, только страница раздела. У этого сайта категория, похоже, не "
-                f"отражена в адресе статьи. Впишите адрес сайта целиком (например "
-                f"https://{urlsplit(site_url).netloc}/) и, если нужно, отдельно укажите "
-                f"часть адреса статей во втором поле.")
+    return status, buf.decode("utf-8", "replace")
 
 
 async def fetch_article_entry(url: str, published_ts: float, published: str) -> Entry | None:
     """Заголовок, описание и картинка со страницы статьи — источник без RSS
-    (sitemap) даёт только адрес и дату правки, остальное только на странице
+    даёт только адрес (см. bot/search.py), остальное только на странице
     самой новости. None — страница не прочиталась или на ней нет заголовка
     (не статья — например снятая с публикации страница).
     """
     got = await _fetch_text(url, {"User-Agent": PAGE_UA})
     if got is None:
         return None
-    status, _headers, page = got
+    status, page = got
     if status != 200:
         return None
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import logging
 import time
+from urllib.parse import urlsplit
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -17,8 +18,7 @@ from .llm import LLMError
 from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, _ext_for,
                         html_problem, tg_len)
 from .quota import until_reset
-from .rss import (Entry, discover_sitemap, fetch, fetch_article_entry,
-                  fetch_sitemap, resolve_article_path)
+from .rss import Entry, fetch, fetch_article_entry
 from .vk import VKError, to_plain
 
 log = logging.getLogger(__name__)
@@ -38,11 +38,11 @@ HELP = """<b>RSS → ИИ → канал</b>
 /test &lt;id&gt; — прогнать последнюю новость через шаблон без публикации
 
 <b>Сайты без RSS-ленты</b>
-/addsite &lt;url&gt; [часть адреса статей] — добавить сайт, новости через sitemap.xml
-(без браузера и без JS; удобнее через веб-панель, раздел «Ленты» → «Сайты без RSS»).
-/setlisting &lt;id&gt; &lt;url&gt; — страница со списком новостей сайта, подстраховка сверх
-sitemap.xml на случай его задержки (работает не для всех сайтов).
-Управление такое же, как у обычных лент — /list, /pause, /del и т.д.
+/addsite &lt;url&gt; [часть адреса статей] — добавить сайт, новые статьи находятся
+через веб-поиск, а не разбором ленты (нужны GOOGLE_SEARCH_API_KEY и
+GOOGLE_SEARCH_CSE_ID в .env — см. SETUP.md). Удобнее через веб-панель,
+раздел «Ленты» → «Сайты без RSS». Управление такое же, как у обычных
+лент — /list, /pause, /del и т.д.
 
 <b>Опубликованные посты</b>
 /posts [n] — последние опубликованные посты (по умолчанию 10)
@@ -235,18 +235,29 @@ async def cmd_add(message: Message, st: Storage, publisher: Publisher) -> None:
 
 @router.message(Command("addsite"))
 async def cmd_addsite(message: Message, st: Storage, publisher: Publisher) -> None:
-    """Сайт без RSS — новости достаём через sitemap.xml (см. bot/rss.py,
-    discover_sitemap/fetch_sitemap): без браузера и без JS, просто XML-файл.
+    """Сайт без RSS — новые статьи находятся через веб-поиск (см. bot/search.py),
+    не разбором ленты: у многих сайтов свои средства узнать «что нового»
+    (sitemap.xml, страница списка новостей) отдают устаревший из-за кэша
+    CDN снимок, поиск от этого не зависит. Нужны GOOGLE_SEARCH_API_KEY и
+    GOOGLE_SEARCH_CSE_ID в .env — см. SETUP.md, раздел «Сайты без RSS».
     """
+    if publisher.search is None or not publisher.search.configured:
+        await _reply(
+            message,
+            "❌ Поиск не настроен — нужны <code>GOOGLE_SEARCH_API_KEY</code> и "
+            "<code>GOOGLE_SEARCH_CSE_ID</code> в .env. Как получить — SETUP.md, "
+            "раздел «Сайты без RSS».",
+        )
+        return
+
     args = (message.text or "").split(maxsplit=2)[1:]
     if not args:
         await _reply(
             message,
             "Как использовать: <code>/addsite https://example.com/ [/articles/]</code>\n"
             "Второй аргумент необязателен — часть адреса, которая есть только у "
-            "статей (если в sitemap сайта вперемешку и новости, и другие страницы). "
-            "Если вставить в первый аргумент адрес конкретного раздела — попробую "
-            "определить фильтр по нему сам; не получится — попрошу ввести отдельно.",
+            "статей (если на сайте вперемешку новости и другие страницы) — "
+            "сузит поисковый запрос.",
         )
         return
 
@@ -255,79 +266,40 @@ async def cmd_addsite(message: Message, st: Storage, publisher: Publisher) -> No
     if not url.startswith(("http://", "https://")):
         await _reply(message, "Нужна ссылка, начинающаяся на http:// или https://")
         return
-
-    await _reply(message, "Ищу sitemap.xml…")
-    sitemap_url = await discover_sitemap(url)
-    if sitemap_url is None:
-        await _reply(message, "❌ Не нашли sitemap.xml — ни в robots.txt, ни по "
-                              "стандартному адресу. Для этого сайта такой способ не подойдёт.")
+    domain = urlsplit(url).netloc
+    if not domain:
+        await _reply(message, "Не разобрал домен в этой ссылке.")
         return
 
-    article_path, path_error = await resolve_article_path(sitemap_url, url, article_path)
-    if path_error:
-        await _reply(message, f"❌ {_e(path_error)}")
+    await _reply(message, "Проверяю поиск…")
+    query = f"site:{domain}{article_path}" if article_path else f"site:{domain}"
+    items, error = await publisher.search.search(query, date_restrict="w1")
+    if error:
+        await _reply(message, f"❌ Поиск не ответил: <code>{_e(error)}</code>")
+        return
+    if not items:
+        await _reply(
+            message,
+            "❌ По запросу <code>" + _e(query) + "</code> поиск ничего не нашёл за последнюю "
+            "неделю — либо сайт не публиковал новостей, либо часть адреса статей "
+            "выбрана неверно.",
+        )
         return
 
-    result = await fetch_sitemap(sitemap_url, article_path)
-    if result.error:
-        await _reply(message, f"❌ sitemap.xml недоступен: <code>{_e(result.error)}</code>")
-        return
-    if not result.entries:
-        await _reply(message, "❌ sitemap.xml прочитался, но подходящих записей не нашлось — "
-                              "проверьте «часть адреса статей», если она указана.")
-        return
-
-    feed_id = st.add_feed(sitemap_url, "", kind="sitemap", article_path=article_path)
+    feed_id = st.add_feed(url, "", kind="search", article_path=article_path)
     if feed_id is None:
-        await _reply(message, "Такой sitemap уже добавлен — /list")
+        await _reply(message, "Такой сайт уже добавлен — /list")
         return
 
-    last = result.entries[-1]
     await _reply(
         message,
         f"✅ Сайт <b>#{feed_id}</b> добавлен: {_e(url)}\n"
-        f"sitemap: <code>{_e(sitemap_url)}</code>\n"
-        f"Статей нашлось: {len(result.entries)}\n"
-        f"Последняя по дате: {_e(last.link[:150])}\n\n"
+        f"Запрос: <code>{_e(query)}</code>\n"
+        f"Нашлось сейчас: {len(items)}\n"
+        f"Например: {_e(items[0]['title'][:150])}\n\n"
         f"Заголовок и картинку бот дочитает со страницы самой статьи, когда решит её публиковать.",
     )
     publisher.wake()
-
-
-@router.message(Command("setlisting"))
-async def cmd_setlisting(message: Message, command: CommandObject, st: Storage) -> None:
-    """Страница со списком новостей сайта — подстраховка сверх sitemap.xml
-    для ленты без RSS (см. bot/rss.py, fetch_listing_articles): у sitemap
-    бывает задержка с новыми статьями, страница списка нередко обновляется
-    быстрее. Работает не для всех сайтов (зависит от того, как устроена
-    страница) — если эффекта нет, просто ничего не меняется."""
-    feed_id, url = _split_id_and_text(command.args)
-    feed = st.feed(feed_id) if feed_id is not None else None
-    if feed is None:
-        await _reply(
-            message,
-            "Как использовать: <code>/setlisting 15 https://example.com/news/</code> "
-            "(id смотрите в /list)\n"
-            "Убрать: <code>/setlisting 15 off</code>",
-        )
-        return
-    if feed["kind"] != "sitemap":
-        await _reply(message, "Это не сайт без RSS — у обычных лент своих новостей не бывает.")
-        return
-    if not url:
-        current = feed["listing_url"] or "не задана"
-        await _reply(message, f"Страница со списком новостей для #{feed_id}: <code>{_e(current)}</code>")
-        return
-    if url.lower() in ("off", "выкл", "0", "-"):
-        st.update_feed(feed_id, listing_url="")
-        await _reply(message, f"✅ Убрал страницу списка новостей у #{feed_id} — sitemap.xml как был "
-                              f"единственным источником, так и остаётся.")
-        return
-    if not url.startswith(("http://", "https://")):
-        await _reply(message, "Нужна ссылка, начинающаяся на http:// или https://")
-        return
-    st.update_feed(feed_id, listing_url=url)
-    await _reply(message, f"✅ Сохранил. Проверить: <code>/test {feed_id}</code>")
 
 
 def _feed_list_lines(f: sqlite3.Row, st: Storage) -> list[str]:
@@ -347,10 +319,8 @@ def _feed_list_lines(f: sqlite3.Row, st: Storage) -> list[str]:
         lines.append(f"   📝 свой промпт — <code>/feedtemplate {f['id']}</code>")
     if f["multi_images"]:
         lines.append(f"   🖼 несколько картинок — <code>/feedimages {f['id']}</code>")
-    if f["kind"] == "sitemap" and f["article_path"]:
-        lines.append(f"   🗺 статьи: <code>{_e(f['article_path'])}</code>")
-    if f["kind"] == "sitemap" and f["listing_url"]:
-        lines.append(f"   📰 + страница новостей — <code>/setlisting {f['id']}</code>")
+    if f["kind"] == "search" and f["article_path"]:
+        lines.append(f"   🔎 статьи: <code>{_e(f['article_path'])}</code>")
     return lines
 
 
@@ -361,15 +331,15 @@ async def cmd_list(message: Message, st: Storage) -> None:
         await _reply(message, "Лент пока нет. Добавить: <code>/add &lt;url&gt;</code>")
         return
 
-    rss_feeds = [f for f in feeds if f["kind"] != "sitemap"]
-    sitemap_feeds = [f for f in feeds if f["kind"] == "sitemap"]
+    rss_feeds = [f for f in feeds if f["kind"] != "search"]
+    search_feeds = [f for f in feeds if f["kind"] == "search"]
 
     lines = ["<b>Ленты</b>"]
     for f in rss_feeds:
         lines += _feed_list_lines(f, st)
-    if sitemap_feeds:
+    if search_feeds:
         lines.append("\n<b>Сайты без RSS</b>")
-        for f in sitemap_feeds:
+        for f in search_feeds:
             lines += _feed_list_lines(f, st)
     await _reply(message, "\n".join(lines))
 
@@ -414,7 +384,7 @@ async def cmd_test(message: Message, command: CommandObject, st: Storage,
         return
 
     await _reply(message, f"Забираю ленту и прогоняю через {_e(publisher.active_backend_label)}…")
-    entry, error = await _last_entry(feed)
+    entry, error = await _last_entry(feed, publisher)
     if error:
         await _reply(message, f"❌ {_e(error)}")
         return
@@ -1115,7 +1085,7 @@ async def cmd_vk(message: Message, command: CommandObject, st: Storage,
             await _reply(message, "Сначала настройте доступ.\n\n" + VK_HELP)
             return
         await _reply(message, "Беру последнюю новость и публикую её в VK…")
-        entry, error = await _last_entry(feed)
+        entry, error = await _last_entry(feed, publisher)
         if error:
             await _reply(message, f"❌ {_e(error)}")
             return
@@ -1221,7 +1191,7 @@ async def cmd_claude(message: Message, command: CommandObject, st: Storage,
             return
         images_note = " (качаю картинки со страницы — это дольше обычного)" if feed["multi_images"] else ""
         await _reply(message, f"Забираю ленту и прогоняю через Claude{images_note}…")
-        entry, error = await _last_entry(feed)
+        entry, error = await _last_entry(feed, publisher)
         if error:
             await _reply(message, f"❌ {_e(error)}")
             return
@@ -1323,7 +1293,7 @@ async def cmd_gemini(message: Message, command: CommandObject, st: Storage,
             await _reply(message, "GEMINI_API_KEY не задан.\n\n" + GEMINI_HELP)
             return
         await _reply(message, "Забираю ленту и прогоняю через Gemini…")
-        entry, error = await _last_entry(feed)
+        entry, error = await _last_entry(feed, publisher)
         if error:
             await _reply(message, f"❌ {_e(error)}")
             return
@@ -1435,7 +1405,7 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
             "dedup_enabled", "dedup_window_days", "dedup_threshold")
     dupes = st.count_dedup_candidates()
     multi_feeds = sum(1 for f in feeds if f["multi_images"])
-    sitemap_feeds = sum(1 for f in feeds if f["kind"] == "sitemap")
+    search_feeds = sum(1 for f in feeds if f["kind"] == "search")
     mode = "⏸ на паузе" if paused else "▶️ работает"
     if publisher.debug:
         mode = "🔧 отладка — посты в личку, /debug off чтобы публиковать"
@@ -1455,7 +1425,7 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
                        if publisher.gemini_mode else "выключен") + "\n"
         f"Ленты: {active} активных из {len(feeds)}"
         + (f", с ошибками: {len(errors)}" if errors else "")
-        + (f", без RSS (sitemap): {sitemap_feeds}" if sitemap_feeds else "") + "\n"
+        + (f", без RSS (поиск): {search_feeds}" if search_feeds else "") + "\n"
         + (f"Несколько картинок: у {multi_feeds} из {len(feeds)} лент — /feedimages <id>\n"
            if multi_feeds else "")
         + (f"Дублей на разбор: {dupes} — /duplicates или веб-панель\n" if dupes else "")
@@ -1478,23 +1448,28 @@ def _parse_id(args: str | None) -> int | None:
         return None
 
 
-async def _last_entry(feed: sqlite3.Row) -> tuple[Entry | None, str | None]:
+async def _last_entry(feed: sqlite3.Row, publisher: Publisher) -> tuple[Entry | None, str | None]:
     """Последняя запись ленты для /test, /vk test, /claude test, /gemini test —
-    учитывает вид источника. Для sitemap fetch() (RSS-парсер) на XML-адресе
-    sitemap просто не даёт записей — эти команды раньше молча говорили
-    «в ленте нет записей» даже для рабочего источника без RSS.
+    учитывает вид источника. Для search fetch() (RSS-парсер) на источнике
+    без RSS просто не даёт записей — эти команды раньше молча говорили
+    «в ленте нет записей» даже для рабочего источника.
     Возвращает (запись, None) или (None, текст ошибки).
     """
-    if feed["kind"] == "sitemap":
-        result = await fetch_sitemap(feed["url"], feed["article_path"], listing_url=feed["listing_url"])
-        if result.error:
-            return None, result.error
-        if not result.entries:
-            return None, "в sitemap нет подходящих записей"
-        thin = result.entries[-1]
-        full = await fetch_article_entry(thin.link, thin.published_ts, thin.published)
+    if feed["kind"] == "search":
+        if publisher.search is None or not publisher.search.configured:
+            return None, "поиск не настроен — см. GOOGLE_SEARCH_API_KEY в .env"
+        domain = urlsplit(feed["url"]).netloc or feed["url"].strip("/")
+        path = feed["article_path"]
+        query = f"site:{domain}{path}" if path else f"site:{domain}"
+        items, error = await publisher.search.search(query, date_restrict="w1")
+        if error:
+            return None, error
+        items = [it for it in items if not path or path in (it.get("link") or "")]
+        if not items:
+            return None, "поиск ничего не нашёл за последнюю неделю"
+        full = await fetch_article_entry(items[0]["link"], time.time(), "")
         if full is None:
-            return None, "не удалось прочитать страницу последней статьи"
+            return None, "не удалось прочитать страницу статьи"
         return full, None
 
     result = await fetch(feed["url"])

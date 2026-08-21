@@ -9,6 +9,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from aiogram import Bot
 from aiogram.exceptions import (TelegramAPIError, TelegramBadRequest,
@@ -20,9 +21,10 @@ from .claude import ClaudeClient
 from .db import Storage, entry_key
 from .llm import LLMClient, LLMError
 from .quota import Quota
-from .rss import (Entry, download_image, fetch, fetch_article_entry,
-                  fetch_sitemap, image_dedup_key, page_image, page_images,
-                  strip_html)
+from .rss import (Entry, FetchResult, download_image, fetch,
+                  fetch_article_entry, image_dedup_key, page_image,
+                  page_images, strip_html)
+from .search import SearchClient
 from .vk import VKClient, VKError, to_plain
 
 log = logging.getLogger(__name__)
@@ -228,7 +230,7 @@ class Publisher:
     def __init__(self, bot: Bot, storage: Storage, llm: LLMClient, default_channel: str,
                  admin_ids: set[int] | None = None, quota: "Quota | None" = None,
                  vk: "VKClient | None" = None, claude: "ClaudeClient | None" = None,
-                 gemini: "LLMClient | None" = None):
+                 gemini: "LLMClient | None" = None, search: "SearchClient | None" = None):
         self.bot = bot
         self.st = storage
         self.llm = llm
@@ -238,6 +240,7 @@ class Publisher:
         self.admin_ids = set(admin_ids or ())
         self.quota = quota
         self.vk = vk
+        self.search = search
         self._wake = asyncio.Event()
         self._running = False
         # /checknow и фоновый цикл не должны опрашивать ленты одновременно —
@@ -503,15 +506,8 @@ class Publisher:
         #  * с прошлого раза остался хвост непубликованных новостей — на 304
         #    мы бы его не увидели до следующего обновления ленты.
         skip_cache = debug or bool(feed["pending"])
-        if kind == "sitemap":
-            # sitemap.xml не знает etag, только Last-Modified — но feeds.etag
-            # для источников без RSS попросту не заполняется, так что тут
-            # всегда участвует только modified.
-            result = await fetch_sitemap(
-                feed["url"], feed["article_path"],
-                None if skip_cache else feed["modified"],
-                listing_url=feed["listing_url"],
-            )
+        if kind == "search":
+            result = await self._fetch_search(feed)
         else:
             result = await fetch(
                 feed["url"],
@@ -540,14 +536,14 @@ class Publisher:
             updates["title"] = result.feed_title[:120]
 
         # Пары (ключ, запись): ключ считаем один раз и попутно убираем дубли
-        # внутри самой выдачи — ленты иногда повторяют один guid дважды.
-        # У sitemap-записей на этом этапе ещё нет заголовка (see ниже) —
-        # is_empty их забраковал бы все разом, поэтому для kind='sitemap'
-        # проверку пропускаем: пустые «на самом деле» отсеются на hydrate.
+        # внутри самой выдачи. У search-записей на этом этапе ещё нет
+        # заголовка (см. ниже) — is_empty их забраковал бы все разом,
+        # поэтому для kind='search' проверку пропускаем: пустые «на самом
+        # деле» отсеются на hydrate.
         fresh: list[tuple[str, Entry]] = []
         batch_keys: set[str] = set()
         for entry in result.entries:
-            if entry.is_empty and kind != "sitemap":
+            if entry.is_empty and kind != "search":
                 continue
             key = entry_key(*entry.key_parts)
             if key in batch_keys or self.st.is_seen(feed_id, key):
@@ -568,17 +564,17 @@ class Publisher:
             fresh = keep
 
         fresh = self._drop_stale(feed_id, fresh)
-        if kind == "sitemap":
-            # flood_guard — до дочитывания страниц, не после: иначе сбитый
-            # sitemap (например много правок разом) обернулся бы десятками
-            # ненужных запросов к сайту источника ради записей, которые всё
-            # равно отсеются. _drop_stale/_guard_flood смотрят только на
-            # published_ts и счётчик — заголовок им не нужен.
+        if kind == "search":
+            # flood_guard — до дочитывания страниц, не после: иначе сбитая
+            # выдача поиска обернулась бы лишними запросами к сайту-
+            # источнику ради записей, которые всё равно отсеются.
+            # _drop_stale/_guard_flood смотрят только на published_ts и
+            # счётчик — заголовок им не нужен.
             if not first_poll:
                 fresh = self._guard_flood(feed_id, fresh)
-            fresh = await self._hydrate_sitemap_entries(fresh)
+            fresh = await self._hydrate_search_entries(fresh)
         fresh = self._drop_duplicates(feed, fresh)
-        if not first_poll and kind != "sitemap":
+        if not first_poll and kind != "search":
             fresh = self._guard_flood(feed_id, fresh)
 
         # Берём не больше max_per_cycle за проход; остаток — на следующем.
@@ -782,14 +778,55 @@ class Publisher:
         self._postponed_flood.append((feed_id, len(dropped)))
         return keep
 
-    async def _hydrate_sitemap_entries(self, fresh: list[tuple[str, Entry]]
-                                       ) -> list[tuple[str, Entry]]:
-        """Источник без RSS (sitemap) даёт только адрес и дату — заголовок,
-        описание и картинку дочитываем со страницы самой статьи, по одной
-        странице за раз (не параллельно — это чужой сайт, не наш CDN, незачем
-        бить по нему пачкой запросов). К этому моменту список уже прорежен
+    async def _fetch_search(self, feed: sqlite3.Row) -> FetchResult:
+        """Источник без RSS: новые статьи ищем через веб-поиск (bot/search.py)
+        вместо разбора ленты — сайт может отдавать устаревший кэш на
+        собственных страницах со списком новостей, поиск от этого не
+        зависит (см. SETUP.md, раздел «Сайты без RSS», история вопроса).
+
+        Google не всегда даёт точную дату публикации для произвольного
+        сайта — считать её не пытаемся, только применяем окно свежести
+        `dateRestrict` на стороне поиска (за последнюю неделю) и раздаём
+        псевдо-даты по порядку самой выдачи (первая строго новее второй и
+        т.д.), только чтобы дальше по конвейеру всё сортировалось и
+        публиковалось в разумном порядке — is_seen решает вопрос повторов
+        сам по себе, без опоры на эти даты.
+        """
+        if self.search is None or not self.search.configured:
+            return FetchResult(entries=[], error="поиск не настроен — см. GOOGLE_SEARCH_API_KEY в .env")
+        domain = urlsplit(feed["url"]).netloc or feed["url"].strip("/")
+        path = feed["article_path"]
+        query = f"site:{domain}{path}" if path else f"site:{domain}"
+        items, error = await self.search.search(query, date_restrict="w1")
+        if error:
+            return FetchResult(entries=[], error=error)
+
+        now = time.time()
+        entries: list[Entry] = []
+        seen_links: set[str] = set()
+        # Первый результат выдачи — самый релевантный (для голого site:-запроса
+        # это обычно самое новое/популярное) — а Entry везде в этом коде идут
+        # от старых к новым, поэтому разворачиваем порядок.
+        for i, item in enumerate(reversed(items)):
+            link = item.get("link") or ""
+            if not link or (path and path not in link):
+                continue
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+            ts = now - (len(items) - i)
+            entries.append(Entry(key_parts=(link,), title="", link=link, summary="",
+                                 published="", published_ts=ts, image=""))
+        return FetchResult(entries=entries)
+
+    async def _hydrate_search_entries(self, fresh: list[tuple[str, Entry]]
+                                      ) -> list[tuple[str, Entry]]:
+        """Источник без RSS (search) даёт только адрес — заголовок, описание
+        и картинку дочитываем со страницы самой статьи, по одной странице
+        за раз (не параллельно — это чужой сайт, не наш CDN, незачем бить
+        по нему пачкой запросов). К этому моменту список уже прорежен
         is_seen/backfill/max_age/flood_guard, так что за проход это обычно
-        считанные страницы, а не весь sitemap.
+        считанные страницы, а не вся выдача поиска.
         """
         out: list[tuple[str, Entry]] = []
         for key, entry in fresh:
