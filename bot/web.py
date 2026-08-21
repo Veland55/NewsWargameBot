@@ -49,7 +49,7 @@ SETTINGS_EDITABLE = (
     "max_age_days", "flood_guard", "keep_seen",
     "alert_thresholds", "free_daily_limit", "max_images",
 )
-SETTINGS_TOGGLES = ("require_russian", "disable_preview", "images", "og_image", "multi_images")
+SETTINGS_TOGGLES = ("require_russian", "disable_preview", "images", "og_image")
 
 # (заголовок группы, [(ключ, короткая подпись, единица, подсказка), ...]) —
 # человекочитаемые подписи для полей SETTINGS_EDITABLE вместо голых
@@ -73,7 +73,7 @@ GENERAL_GROUPS: list[tuple[str, list[tuple[str, str, str, str]]]] = [
         ("free_daily_limit", "Суточный лимит", "запросов", "0 — определить автоматически по модели"),
     ]),
     ("Картинки", [
-        ("max_images", "Картинок в альбом", "1-10", "Сколько скачивать за раз при «нескольких картинках» ниже"),
+        ("max_images", "Картинок в альбом", "1-10", "Сколько скачивать за раз лентам с «несколькими картинками» — включается у каждой ленты отдельно, на «Лентах»"),
     ]),
 ]
 
@@ -83,7 +83,6 @@ TOGGLE_LABELS: dict[str, tuple[str, str]] = {
     "disable_preview": ("Без превью ссылок", "Не показывать превью ссылки в посте"),
     "images": ("Прикладывать картинку", "Картинка из новости — к посту"),
     "og_image": ("Картинка со страницы", "Если в ленте её нет — взять со страницы новости"),
-    "multi_images": ("Несколько картинок альбомом", "До 10 картинок со страницы новости вместо одной — дольше обычного, работает при любом режиме"),
 }
 
 TG_AUTH_DATE_TTL = 24 * 3600     # старше суток initData не принимаем (см. verify_telegram_init_data)
@@ -864,11 +863,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             checked = time.strftime("%d.%m %H:%M", time.localtime(f["last_check"])) if f["last_check"] else "—"
             err = f'<div class="muted" style="color:var(--red)">{_e(f["last_error"][:150])}</div>' if f["last_error"] else ""
             own_prompt = ' <span class="pill neutral">свой промпт</span>' if f["template"] else ""
+            multi = ' <span class="pill neutral">неск. картинок</span>' if f["multi_images"] else ""
             items += f"""<div class="list-item">
               <div class="list-item-info">
                 <div class="list-item-title">
                   <b>#{f['id']}</b> {_e(f['title'] or '(без названия)')}
-                  <span class="pill {'on' if f['enabled'] else 'neutral'}">{'вкл' if f['enabled'] else 'пауза'}</span>{own_prompt}
+                  <span class="pill {'on' if f['enabled'] else 'neutral'}">{'вкл' if f['enabled'] else 'пауза'}</span>{own_prompt}{multi}
                 </div>
                 <div class="muted mono ellipsis">{_e(f['url'])}</div>
                 <div class="muted">проверена: {checked} · в архиве: {st.seen_count(f['id'])}</div>
@@ -876,6 +876,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
               </div>
               <div class="list-item-actions">
                 <a class="btn icon" href="/feeds/{f['id']}/template" title="Свой промпт">🤖</a>
+                <form class="inline" method="post" action="/feeds/{f['id']}/multiimages">{csrf_field(request)}
+                  <button class="icon" type="submit" title="{'Одна картинка, как раньше' if f['multi_images'] else 'Публиковать несколько картинок альбомом'}">🖼</button></form>
                 <form class="inline" method="post" action="/feeds/{f['id']}/toggle">{csrf_field(request)}
                   <button class="icon" type="submit" title="{'Поставить на паузу' if f['enabled'] else 'Включить'}">{'⏸' if f['enabled'] else '▶️'}</button></form>
                 <form class="inline" method="post" action="/feeds/{f['id']}/delete"
@@ -935,6 +937,14 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         row = st.feed(feed_id)
         if row is not None:
             st.set_enabled(feed_id, not row["enabled"])
+        return _redirect("/feeds")
+
+    async def feeds_toggle_multi(request: web.Request) -> web.Response:
+        feed_id = int(request.match_info["id"])
+        st: Storage = app["st"]
+        row = st.feed(feed_id)
+        if row is not None:
+            st.set_multi_images(feed_id, not row["multi_images"])
         return _redirect("/feeds")
 
     # --- свой промпт для отдельной ленты ----------------------------------
@@ -1518,6 +1528,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/feeds/add", feeds_add)
     app.router.add_post("/feeds/{id}/delete", feeds_delete)
     app.router.add_post("/feeds/{id}/toggle", feeds_toggle)
+    app.router.add_post("/feeds/{id}/multiimages", feeds_toggle_multi)
     app.router.add_get("/feeds/{id}/template", feed_template_get)
     app.router.add_post("/feeds/{id}/template", feed_template_post)
     app.router.add_post("/feeds/{id}/template/reset", feed_template_reset)

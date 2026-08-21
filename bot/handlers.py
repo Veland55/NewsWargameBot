@@ -64,7 +64,7 @@ HELP = """<b>RSS → ИИ → канал</b>
 
 Картинка из новости прикладывается сама, отдельного плейсхолдера не нужно: до 1024 символов — фото с подписью, длиннее — превью над текстом. Если картинки нет в самой ленте, бот берёт её со страницы новости (og:image). Выключить: <code>/set images 0</code>, только дочитывание со страницы — <code>/set og_image 0</code>
 
-Несколько картинок альбомом вместо одной (до 10, работает при любом режиме — обычном, Claude, Gemini): <code>/multiimages on</code>, сколько штук — <code>/set max_images 6</code>. Вернуть как раньше — <code>/multiimages off</code>
+Несколько картинок альбомом вместо одной (до 10, работает при любом режиме — обычном, Claude, Gemini) — настройка отдельной ленты, не общая: <code>/feedimages &lt;id&gt; on</code>, сколько штук — <code>/set max_images 6</code> (общее для всех). Вернуть как раньше — <code>/feedimages &lt;id&gt; off</code>
 
 Новость, похожая на уже опубликованную с другой ленты, сама в канал не уходит — ждёт разбора: <code>/duplicates</code> (посмотреть картинки, опубликовать или удалить — удобнее в веб-панели, раздел «Ленты»). Выключить: <code>/set dedup_enabled 0</code>
 
@@ -74,7 +74,7 @@ HELP = """<b>RSS → ИИ → канал</b>
 /interval &lt;мин&gt; — периодичность проверки
 /set &lt;ключ&gt; &lt;значение&gt; — прочие параметры (см. /status)
 /setchannel &lt;@канал|id&gt; — куда публиковать
-/multiimages — одна картинка или несколько альбомом (см. выше)
+/feedimages &lt;id&gt; — одна картинка или несколько альбомом для этой ленты (см. выше)
 /vk — дублирование постов в сообщество VK
 /claude — обработка через платный Claude
 /gemini — обработка через Gemini (обычно бесплатно), взаимоисключимо с Claude
@@ -248,6 +248,8 @@ async def cmd_list(message: Message, st: Storage) -> None:
             lines.append(f"   ⚠️ {_e(f['last_error'][:150])}")
         if f["template"]:
             lines.append(f"   📝 свой промпт — <code>/feedtemplate {f['id']}</code>")
+        if f["multi_images"]:
+            lines.append(f"   🖼 несколько картинок — <code>/feedimages {f['id']}</code>")
     await _reply(message, "\n".join(lines))
 
 
@@ -492,7 +494,7 @@ async def cmd_set(message: Message, command: CommandObject, st: Storage) -> None
         "interval", "max_per_cycle", "post_delay", "backfill",
         "max_age_days", "flood_guard",
         "on_llm_error", "require_russian", "disable_preview", "images",
-        "og_image", "multi_images", "max_images", "keep_seen",
+        "og_image", "max_images", "keep_seen",
         "alert_thresholds", "free_daily_limit",
         "dedup_enabled", "dedup_window_days", "dedup_threshold",
     }
@@ -832,36 +834,43 @@ async def cmd_debug(message: Message, command: CommandObject, st: Storage,
                           f"<code>/debug off</code>")
 
 
-@router.message(Command("multiimages"))
-async def cmd_multiimages(message: Message, command: CommandObject, st: Storage,
-                          publisher: Publisher) -> None:
+@router.message(Command("feedimages"))
+async def cmd_feedimages(message: Message, command: CommandObject, st: Storage) -> None:
     """Переключатель «одна картинка, как раньше» / «несколько картинок
-    альбомом» — работает при любом режиме обработки текста, не только
-    Claude. Сам тумблер — publisher.multi_images / st.get('multi_images')."""
-    arg = (command.args or "").strip().lower()
+    альбомом» — свойство отдельной ленты (feeds.multi_images), не общая
+    настройка: разные источники по-разному годятся для альбома (см.
+    Storage.set_multi_images)."""
+    parts = (command.args or "").split(maxsplit=1)
+    feed_id = int(parts[0]) if parts and parts[0].isdigit() else None
+    feed = st.feed(feed_id) if feed_id is not None else None
+    if feed is None:
+        await _reply(message, "Как использовать: <code>/feedimages 1</code> (id ленты из /list)\n"
+                              "Включить: <code>/feedimages 1 on</code> · выключить: <code>/feedimages 1 off</code>")
+        return
+    name = feed["title"] or feed["url"]
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
     if arg in ("on", "вкл", "1"):
-        st.set("multi_images", "1")
+        st.set_multi_images(feed_id, True)
         await _reply(
             message,
-            f"🖼 <b>Несколько картинок включено.</b>\n\n"
+            f"🖼 <b>Несколько картинок для «{_e(name)}» включено.</b>\n\n"
             f"Вместо одной бот качает со страницы новости до "
-            f"{_e(st.get('max_images'))} картинок и публикует альбомом — "
-            f"при любом режиме (обычном, Claude, Gemini). Дольше обычного.\n\n"
-            f"Сколько картинок: <code>/set max_images N</code> (1-10)\n"
-            f"Вернуть одну картинку, как раньше: <code>/multiimages off</code>",
+            f"{_e(st.get('max_images'))} картинок и публикует альбомом.\n\n"
+            f"Сколько картинок: <code>/set max_images N</code> (1-10, общее для всех лент)\n"
+            f"Вернуть одну картинку: <code>/feedimages {feed_id} off</code>",
         )
         return
     if arg in ("off", "выкл", "0"):
-        st.set("multi_images", "0")
-        await _reply(message, "✅ Вернул одну картинку на пост, как раньше. "
-                              "Включить снова — <code>/multiimages on</code>")
+        st.set_multi_images(feed_id, False)
+        await _reply(message, f"✅ У «{_e(name)}» — одна картинка на пост, как раньше. "
+                              f"Включить снова — <code>/feedimages {feed_id} on</code>")
         return
-    state = "включено 🖼" if publisher.multi_images else "выключено (одна картинка, как раньше)"
+    state = "включено 🖼" if feed["multi_images"] else "выключено (одна картинка)"
     await _reply(
         message,
-        f"Несколько картинок в посте: {state}\n"
-        f"Штук за раз: <code>{_e(st.get('max_images'))}</code>\n\n"
-        f"<code>/multiimages on</code> · <code>/multiimages off</code> — переключить\n"
+        f"Несколько картинок для «{_e(name)}»: {state}\n"
+        f"Штук за раз: <code>{_e(st.get('max_images'))}</code> (общее для всех лент)\n\n"
+        f"<code>/feedimages {feed_id} on</code> · <code>/feedimages {feed_id} off</code> — переключить\n"
         f"<code>/set max_images N</code> — сколько картинок (1-10)",
     )
 
@@ -1030,7 +1039,7 @@ CLAUDE_HELP = """<b>Режим Claude</b>
 
 Промпт и формат поста — общие (/template, /format). В /usage не
 считается — свой отдельный платный счёт. Несколько картинок альбомом
-вместо одной — отдельная настройка, не завязана на Claude: /multiimages
+вместо одной — настройка отдельной ленты, не завязана на Claude: /feedimages
 
 <b>Команды</b>
 /claude — статус
@@ -1089,7 +1098,7 @@ async def cmd_claude(message: Message, command: CommandObject, st: Storage,
         if claude is None or not claude.api_key:
             await _reply(message, "CLAUDE_API_KEY не задан.\n\n" + CLAUDE_HELP)
             return
-        images_note = " (качаю картинки со страницы — это дольше обычного)" if publisher.multi_images else ""
+        images_note = " (качаю картинки со страницы — это дольше обычного)" if feed["multi_images"] else ""
         await _reply(message, f"Забираю ленту и прогоняю через Claude{images_note}…")
         result = await fetch(feed["url"])
         if result.error or not result.entries:
@@ -1302,10 +1311,11 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
     keys = ("interval", "max_per_cycle", "post_delay", "backfill",
             "max_age_days", "flood_guard", "on_llm_error",
             "require_russian", "disable_preview", "images", "og_image",
-            "multi_images", "max_images",
+            "max_images",
             "keep_seen", "alert_thresholds", "free_daily_limit",
             "dedup_enabled", "dedup_window_days", "dedup_threshold")
     dupes = st.count_dedup_candidates()
+    multi_feeds = sum(1 for f in feeds if f["multi_images"])
     mode = "⏸ на паузе" if paused else "▶️ работает"
     if publisher.debug:
         mode = "🔧 отладка — посты в личку, /debug off чтобы публиковать"
@@ -1325,6 +1335,8 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
                        if publisher.gemini_mode else "выключен") + "\n"
         f"Ленты: {active} активных из {len(feeds)}"
         + (f", с ошибками: {len(errors)}" if errors else "") + "\n"
+        + (f"Несколько картинок: у {multi_feeds} из {len(feeds)} лент — /feedimages <id>\n"
+           if multi_feeds else "")
         + (f"Дублей на разбор: {dupes} — /duplicates или веб-панель\n" if dupes else "")
         + f"Модель: <code>{_e(llm.model)}</code>\n"
         f"Endpoint: <code>{_e(llm.endpoint)}</code>\n"

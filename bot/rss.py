@@ -336,7 +336,7 @@ async def page_image(url: str) -> str | None:
 
 
 # Все картинки со страницы новости — режим «несколько картинок» (см.
-# publisher.py, Publisher.multi_images): в отличие от page_image() читаем
+# publisher.py, Publisher.multi_images_for): в отличие от page_image() читаем
 # страницу целиком, а не только <head>, и собираем несколько картинок вместо
 # одной. Дороже по времени и трафику, чем обычный путь, поэтому включается
 # отдельным тумблером, а не работает всегда.
@@ -463,9 +463,13 @@ def _body_images(page: str, article_url: str, primary_folder: str | None) -> lis
 
 
 async def page_images(url: str, limit: int = MAX_ARTICLE_IMAGES) -> list[str]:
-    """Все подходящие картинки со страницы новости: og:image(-подобные) в
-    приоритете (их расставляет сам источник — сигнал надёжнее), затем
-    добавляем <img> из тела статьи, пока не наберём `limit`.
+    """Все подходящие картинки со страницы новости: в приоритете свои
+    иллюстрации из тела статьи — это буквально то, что видел читатель.
+    og:image — запасной вариант, только если в теле не нашлось ничего:
+    на части сайтов (например ontabletop.com/beastsofwar.com) og:image —
+    отдельно смонтированная обложка для соцсетей, которой в самом тексте
+    статьи нет вообще, и смешивать её с настоящими иллюстрациями значит
+    добавлять в пост картинку, которой не было в новости.
     """
     if not url.lower().startswith(("http://", "https://")):
         return []
@@ -493,8 +497,8 @@ async def page_images(url: str, limit: int = MAX_ARTICLE_IMAGES) -> list[str]:
     head = page[:head_end] if head_end != -1 else page
 
     metas = _meta_images(head)
-    ordered: list[str] = []
-    seen: set[str] = set()
+    meta_ordered: list[str] = []
+    meta_seen: set[str] = set()
     primary_folder: str | None = None
     for key in META_KEYS:
         if key not in metas:
@@ -505,23 +509,27 @@ async def page_images(url: str, limit: int = MAX_ARTICLE_IMAGES) -> list[str]:
         if not (_is_image(candidate) or candidate.lower().startswith(("http://", "https://"))):
             continue
         dedup_key = image_dedup_key(candidate)
-        if dedup_key in seen:
+        if dedup_key in meta_seen:
             continue
-        seen.add(dedup_key)
-        ordered.append(candidate)
+        meta_seen.add(dedup_key)
+        meta_ordered.append(candidate)
         if primary_folder is None:
             primary_folder = _date_folder(candidate)
 
+    # primary_folder нужен _body_images ещё до решения, чьи картинки в итоге
+    # пойдут в пост — он отсекает чужие статьи из виджета «похожие материалы».
+    body_ordered: list[str] = []
+    seen: set[str] = set()
     for candidate in _body_images(page, url, primary_folder):
-        if len(ordered) >= limit:
+        if len(body_ordered) >= limit:
             break
         dedup_key = image_dedup_key(candidate)
         if dedup_key in seen:
             continue
         seen.add(dedup_key)
-        ordered.append(candidate)
+        body_ordered.append(candidate)
 
-    return ordered[:limit]
+    return body_ordered or meta_ordered[:limit]
 
 
 # Telegram сам режет фото крупнее 10 МБ при отправке (sendPhoto/sendMediaGroup);

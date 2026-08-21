@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS feeds (
     pending       INTEGER NOT NULL DEFAULT 0,  -- остался непубликованный хвост
     last_check    INTEGER NOT NULL DEFAULT 0,
     last_error    TEXT,
+    multi_images  INTEGER NOT NULL DEFAULT 0,  -- несколько картинок альбомом вместо одной
     added_at      INTEGER NOT NULL
 );
 
@@ -141,9 +142,8 @@ DEFAULTS: dict[str, str] = {
     "disable_preview": "0",
     "images": "1",             # прикладывать картинку из новости к посту
     "og_image": "1",           # если в ленте картинки нет — взять со страницы новости
-    "multi_images": "0",       # несколько картинок со страницы альбомом вместо одной;
-                               # работает при любом активном бэкенде текста (обычном, Claude, Gemini)
-    "max_images": "6",         # сколько картинок скачивать за раз при multi_images (1-10)
+    "max_images": "6",         # сколько картинок скачивать за раз, если у ленты
+                               # включено «несколько картинок» (feeds.multi_images, 1-10)
     "vk_enabled": "1",         # дублировать посты в VK, если задан VK_TOKEN
     "vk_group_id": "",         # переопределяет VK_GROUP_ID из .env
     "claude_mode": "0",        # обработка через платный Claude вместо LLM_* из .env
@@ -186,6 +186,7 @@ class Storage:
             self._conn.executescript(SCHEMA)
             self._migrate()
             self._migrate_settings_keys()
+            self._migrate_multi_images_to_feeds()
             self._conn.commit()
 
     def _migrate(self) -> None:
@@ -195,7 +196,8 @@ class Storage:
         новые поля доносим руками — иначе обновление ломает старую базу.
         """
         added: dict[str, list[tuple[str, str]]] = {
-            "feeds": [("pending", "INTEGER NOT NULL DEFAULT 0")],
+            "feeds": [("pending", "INTEGER NOT NULL DEFAULT 0"),
+                      ("multi_images", "INTEGER NOT NULL DEFAULT 0")],
             "posts": [("extra_message_ids", "TEXT NOT NULL DEFAULT ''")],
         }
         for table, columns in added.items():
@@ -206,6 +208,21 @@ class Storage:
             for name, decl in columns:
                 if name not in have:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    def _migrate_multi_images_to_feeds(self) -> None:
+        """«Несколько картинок» была общей настройкой на всех, теперь это
+        свойство каждой ленты. Кто уже включил её глобально — не должен
+        молча потерять картинки после обновления: разово переносим на все
+        существующие ленты, затем сам глобальный ключ удаляем (разовое
+        дело — как в _migrate_settings_keys, старый ключ больше не нужен
+        даже если переносить было нечего)."""
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = 'multi_images'"
+        ).fetchone()
+        if row is not None:
+            if row["value"] == "1":
+                self._conn.execute("UPDATE feeds SET multi_images = 1")
+            self._conn.execute("DELETE FROM settings WHERE key = 'multi_images'")
 
     def _migrate_settings_keys(self) -> None:
         """Переименования ключей в settings, случившиеся после того, как ими
@@ -289,6 +306,14 @@ class Storage:
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE feeds SET enabled = ? WHERE id = ?", (int(enabled), feed_id)
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def set_multi_images(self, feed_id: int, enabled: bool) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE feeds SET multi_images = ? WHERE id = ?", (int(enabled), feed_id)
             )
             self._conn.commit()
             return cur.rowcount > 0

@@ -216,7 +216,7 @@ def render(template: str, values: dict[str, str], escape: bool) -> str:
 class Post:
     text: str
     image: str = ""
-    # Несколько картинок (/set multi_images 1) — уже скачанные байты, не
+    # Несколько картинок (/feedimages <id> on) — уже скачанные байты, не
     # ссылки: Telegram лучше принимает файл, чем адрес за нестабильным CDN
     # источника.
     images: list[tuple[bytes, str]] = field(default_factory=list)
@@ -273,13 +273,14 @@ class Publisher:
         return (self.st.get("gemini_mode") == "1"
                 and self.gemini is not None and bool(self.gemini.api_key))
 
-    @property
-    def multi_images(self) -> bool:
+    @staticmethod
+    def multi_images_for(feed: sqlite3.Row | None) -> bool:
         """Несколько картинок со страницы новости альбомом вместо одной —
-        независимо от того, какой бэкенд обрабатывает текст (обычный,
-        Claude или Gemini). Раньше это было побочным эффектом /claude on;
-        теперь отдельный тумблер, /set multi_images 1."""
-        return self.st.get("multi_images") == "1"
+        свойство конкретной ленты (/feedimages), не завязано на то, какой
+        бэкенд обрабатывает текст (обычный, Claude или Gemini). Без ленты
+        (например при ручной публикации найденного дубля) — одна картинка,
+        как раньше по умолчанию."""
+        return bool(feed is not None and feed["multi_images"])
 
     @property
     def _active_llm(self) -> "LLMClient | ClaudeClient":
@@ -624,7 +625,7 @@ class Publisher:
         post_format = self.st.get("post_format")
         text = _shorten(render(post_format, {**raw_values, "ai": ai_text}, escape=True))
 
-        if self.multi_images:
+        if self.multi_images_for(feed):
             image_url, images = await self._images_of_page(entry)
             return Post(text=text, image=image_url, images=images, link=entry.link)
         return Post(text=text, image=await self._image_of(entry), link=entry.link)
@@ -881,7 +882,8 @@ class Publisher:
 
     async def _images_of_page(self, entry: Entry) -> tuple[str, list[tuple[bytes, str]]]:
         """Несколько картинок со страницы новости — режим «несколько картинок»
-        (/set multi_images 1), работает при любом активном бэкенде текста.
+        включается для конкретной ленты (/feedimages <id> on), работает при
+        любом активном бэкенде текста.
 
         В отличие от _image_of (одна картинка, может остаться просто ссылкой),
         здесь качаем сами: несколько ссылок из разных источников надёжнее
@@ -942,7 +944,7 @@ class Publisher:
             "ai": summary,
         }
         text = _shorten(render(self.st.get("post_format"), values, escape=True))
-        if self.multi_images:
+        if self.multi_images_for(feed):
             image_url, images = await self._images_of_page(entry)
             return Post(text=text, image=image_url, images=images, link=entry.link)
         return Post(text=text, image=await self._image_of(entry), link=entry.link)
