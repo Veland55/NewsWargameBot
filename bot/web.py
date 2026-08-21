@@ -35,7 +35,7 @@ from .llm import LLMError
 from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, html_problem,
                         tg_len)
 from .quota import until_reset
-from .rss import Entry, fetch
+from .rss import Entry, discover_sitemap, fetch, fetch_sitemap
 
 log = logging.getLogger(__name__)
 
@@ -854,45 +854,61 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         <div class="list">{items}</div>
         """
 
+    def _feed_row_html(f: sqlite3.Row, request: web.Request, st: "Storage") -> str:
+        """Строка ленты или сайта без RSS — разметка общая: управление (свой
+        промпт, несколько картинок, пауза, удаление) не зависит от того,
+        откуда берутся новости."""
+        checked = time.strftime("%d.%m %H:%M", time.localtime(f["last_check"])) if f["last_check"] else "—"
+        err = f'<div class="muted" style="color:var(--red)">{_e(f["last_error"][:150])}</div>' if f["last_error"] else ""
+        own_prompt = ' <span class="pill neutral">свой промпт</span>' if f["template"] else ""
+        multi = ' <span class="pill neutral">неск. картинок</span>' if f["multi_images"] else ""
+        path_hint = (f' <span class="pill neutral">{_e(f["article_path"])}</span>'
+                    if f["kind"] == "sitemap" and f["article_path"] else "")
+        return f"""<div class="list-item">
+          <div class="list-item-info">
+            <div class="list-item-title">
+              <b>#{f['id']}</b> {_e(f['title'] or '(без названия)')}
+              <span class="pill {'on' if f['enabled'] else 'neutral'}">{'вкл' if f['enabled'] else 'пауза'}</span>{own_prompt}{multi}{path_hint}
+            </div>
+            <div class="muted mono ellipsis">{_e(f['url'])}</div>
+            <div class="muted">проверена: {checked} · в архиве: {st.seen_count(f['id'])}</div>
+            {err}
+          </div>
+          <div class="list-item-actions">
+            <a class="btn icon" href="/feeds/{f['id']}/template" title="Свой промпт">🤖</a>
+            <form class="inline" method="post" action="/feeds/{f['id']}/multiimages">{csrf_field(request)}
+              <button class="icon" type="submit" title="{'Одна картинка, как раньше' if f['multi_images'] else 'Публиковать несколько картинок альбомом'}">🖼</button></form>
+            <form class="inline" method="post" action="/feeds/{f['id']}/toggle">{csrf_field(request)}
+              <button class="icon" type="submit" title="{'Поставить на паузу' if f['enabled'] else 'Включить'}">{'⏸' if f['enabled'] else '▶️'}</button></form>
+            <form class="inline" method="post" action="/feeds/{f['id']}/delete"
+                  onsubmit="return confirm('Удалить #{f['id']}?')">{csrf_field(request)}
+              <button class="icon" type="submit" title="Удалить">✕</button></form>
+          </div>
+        </div>"""
+
     async def feeds_get(request: web.Request, flash: str = "", flash_kind: str = "ok") -> web.Response:
         st: Storage = app["st"]
         dupes_html = _dupes_section_html(st)
         rows = st.feeds()
-        items = ""
-        for f in rows:
-            checked = time.strftime("%d.%m %H:%M", time.localtime(f["last_check"])) if f["last_check"] else "—"
-            err = f'<div class="muted" style="color:var(--red)">{_e(f["last_error"][:150])}</div>' if f["last_error"] else ""
-            own_prompt = ' <span class="pill neutral">свой промпт</span>' if f["template"] else ""
-            multi = ' <span class="pill neutral">неск. картинок</span>' if f["multi_images"] else ""
-            items += f"""<div class="list-item">
-              <div class="list-item-info">
-                <div class="list-item-title">
-                  <b>#{f['id']}</b> {_e(f['title'] or '(без названия)')}
-                  <span class="pill {'on' if f['enabled'] else 'neutral'}">{'вкл' if f['enabled'] else 'пауза'}</span>{own_prompt}{multi}
-                </div>
-                <div class="muted mono ellipsis">{_e(f['url'])}</div>
-                <div class="muted">проверена: {checked} · в архиве: {st.seen_count(f['id'])}</div>
-                {err}
-              </div>
-              <div class="list-item-actions">
-                <a class="btn icon" href="/feeds/{f['id']}/template" title="Свой промпт">🤖</a>
-                <form class="inline" method="post" action="/feeds/{f['id']}/multiimages">{csrf_field(request)}
-                  <button class="icon" type="submit" title="{'Одна картинка, как раньше' if f['multi_images'] else 'Публиковать несколько картинок альбомом'}">🖼</button></form>
-                <form class="inline" method="post" action="/feeds/{f['id']}/toggle">{csrf_field(request)}
-                  <button class="icon" type="submit" title="{'Поставить на паузу' if f['enabled'] else 'Включить'}">{'⏸' if f['enabled'] else '▶️'}</button></form>
-                <form class="inline" method="post" action="/feeds/{f['id']}/delete"
-                      onsubmit="return confirm('Удалить ленту #{f['id']}?')">{csrf_field(request)}
-                  <button class="icon" type="submit" title="Удалить">✕</button></form>
-              </div>
-            </div>"""
-        list_html = items if rows else (
+        rss_rows = [f for f in rows if f["kind"] != "sitemap"]
+        sitemap_rows = [f for f in rows if f["kind"] == "sitemap"]
+
+        rss_list = "".join(_feed_row_html(f, request, st)
+                           for f in rss_rows) or (
             "<div style='padding:28px 16px; text-align:center;'>"
             "<div style='font-size:28px; margin-bottom:8px;'>📰</div>"
             "<div class='muted'>Лент пока нет — добавьте первую выше.</div></div>"
         )
+        sitemap_list = "".join(_feed_row_html(f, request, st)
+                               for f in sitemap_rows) or (
+            "<div style='padding:28px 16px; text-align:center;'>"
+            "<div style='font-size:28px; margin-bottom:8px;'>🗺️</div>"
+            "<div class='muted'>Сайтов без RSS пока нет — добавьте первый выше.</div></div>"
+        )
+
         body = f"""
         {dupes_html}
-        <h2>Ленты <span class="muted" style="font-weight:400;">({len(rows)})</span></h2>
+        <h2>Ленты <span class="muted" style="font-weight:400;">({len(rss_rows)})</span></h2>
         <details>
           <summary class="disclosure">Добавить ленту</summary>
           <div class="card" style="margin-top:10px;">
@@ -905,7 +921,30 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             </form>
           </div>
         </details>
-        <div class="list" style="margin-top:10px;">{list_html}</div>
+        <div class="list" style="margin-top:10px;">{rss_list}</div>
+
+        <h2>Сайты без RSS <span class="muted" style="font-weight:400;">({len(sitemap_rows)})</span></h2>
+        <div class="section-hint">Новости с сайтов, где нет RSS-ленты — проверяются через sitemap.xml сайта,
+          без браузера и без JS, обычный лёгкий запрос раз в цикл опроса.</div>
+        <details>
+          <summary class="disclosure">Добавить сайт без RSS</summary>
+          <div class="card" style="margin-top:10px;">
+            <form method="post" action="/feeds/add-sitemap">{csrf_field(request)}
+              <div class="row" style="align-items:flex-end;">
+                <div style="flex:2;"><label>Адрес сайта</label><input type="text" name="url" placeholder="https://example.com/" required></div>
+                <div style="flex:1;"><label>Название (необязательно)</label><input type="text" name="title"></div>
+              </div>
+              <div class="row" style="align-items:flex-end; margin-top:8px;">
+                <div style="flex:2;"><label>Часть адреса статей (необязательно)</label>
+                  <input type="text" name="article_path" placeholder="/articles/"></div>
+                <button class="primary" type="submit">Добавить</button>
+              </div>
+              <div class="field-hint" style="margin-top:4px;">Нужна, если в sitemap сайта вперемешку и
+                новости, и другие страницы (товары, категории) — без неё заберём всё подряд.</div>
+            </form>
+          </div>
+        </details>
+        <div class="list" style="margin-top:10px;">{sitemap_list}</div>
         """
         return web.Response(text=_layout("Ленты", body, flash, flash_kind, active="/feeds"), content_type="text/html")
 
@@ -923,6 +962,33 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         feed_id = app["st"].add_feed(url, title or result.feed_title[:120])
         if feed_id is None:
             return await feeds_get(request, "Такая лента уже добавлена.", "err")
+        app["publisher"].wake()
+        return _redirect("/feeds")
+
+    async def feeds_add_sitemap(request: web.Request) -> web.Response:
+        form = request["form"]
+        url = str(form.get("url", "")).strip()
+        title = str(form.get("title", "")).strip()
+        article_path = str(form.get("article_path", "")).strip()
+        if not url.startswith(("http://", "https://")):
+            return await feeds_get(request, "Нужна ссылка, начинающаяся на http:// или https://", "err")
+        sitemap_url = await discover_sitemap(url)
+        if sitemap_url is None:
+            return await feeds_get(
+                request,
+                "Не нашли sitemap.xml — ни в robots.txt, ни по стандартному адресу. "
+                "Для этого сайта такой способ не подойдёт.", "err")
+        result = await fetch_sitemap(sitemap_url, article_path)
+        if result.error:
+            return await feeds_get(request, f"sitemap.xml недоступен: {result.error}", "err")
+        if not result.entries:
+            return await feeds_get(
+                request,
+                "sitemap.xml прочитался, но подходящих записей не нашлось — "
+                "проверьте «часть адреса статей», если она заполнена.", "err")
+        feed_id = app["st"].add_feed(sitemap_url, title, kind="sitemap", article_path=article_path)
+        if feed_id is None:
+            return await feeds_get(request, "Такой sitemap уже добавлен.", "err")
         app["publisher"].wake()
         return _redirect("/feeds")
 
@@ -1526,6 +1592,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/checknow", checknow_post)
     app.router.add_get("/feeds", feeds_get)
     app.router.add_post("/feeds/add", feeds_add)
+    app.router.add_post("/feeds/add-sitemap", feeds_add_sitemap)
     app.router.add_post("/feeds/{id}/delete", feeds_delete)
     app.router.add_post("/feeds/{id}/toggle", feeds_toggle)
     app.router.add_post("/feeds/{id}/multiimages", feeds_toggle_multi)

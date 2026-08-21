@@ -17,7 +17,7 @@ from .llm import LLMError
 from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, _ext_for,
                         html_problem, tg_len)
 from .quota import until_reset
-from .rss import fetch
+from .rss import discover_sitemap, fetch, fetch_sitemap
 from .vk import VKError, to_plain
 
 log = logging.getLogger(__name__)
@@ -35,6 +35,11 @@ HELP = """<b>RSS → ИИ → канал</b>
 /del &lt;id&gt; — удалить ленту
 /pause &lt;id&gt; · /resume &lt;id&gt; — выключить/включить ленту
 /test &lt;id&gt; — прогнать последнюю новость через шаблон без публикации
+
+<b>Сайты без RSS-ленты</b>
+/addsite &lt;url&gt; [часть адреса статей] — добавить сайт, новости через sitemap.xml
+(без браузера и без JS; удобнее через веб-панель, раздел «Ленты» → «Сайты без RSS»).
+Управление такое же, как у обычных лент — /list, /pause, /del и т.д.
 
 <b>Опубликованные посты</b>
 /posts [n] — последние опубликованные посты (по умолчанию 10)
@@ -225,6 +230,82 @@ async def cmd_add(message: Message, st: Storage, publisher: Publisher) -> None:
     publisher.wake()
 
 
+@router.message(Command("addsite"))
+async def cmd_addsite(message: Message, st: Storage, publisher: Publisher) -> None:
+    """Сайт без RSS — новости достаём через sitemap.xml (см. bot/rss.py,
+    discover_sitemap/fetch_sitemap): без браузера и без JS, просто XML-файл.
+    """
+    args = (message.text or "").split(maxsplit=2)[1:]
+    if not args:
+        await _reply(
+            message,
+            "Как использовать: <code>/addsite https://example.com/ [/articles/]</code>\n"
+            "Второй аргумент необязателен — часть адреса, которая есть только у "
+            "статей (если в sitemap сайта вперемешку и новости, и другие страницы).",
+        )
+        return
+
+    url = args[0].strip()
+    article_path = args[1].strip() if len(args) > 1 else ""
+    if not url.startswith(("http://", "https://")):
+        await _reply(message, "Нужна ссылка, начинающаяся на http:// или https://")
+        return
+
+    await _reply(message, "Ищу sitemap.xml…")
+    sitemap_url = await discover_sitemap(url)
+    if sitemap_url is None:
+        await _reply(message, "❌ Не нашли sitemap.xml — ни в robots.txt, ни по "
+                              "стандартному адресу. Для этого сайта такой способ не подойдёт.")
+        return
+
+    result = await fetch_sitemap(sitemap_url, article_path)
+    if result.error:
+        await _reply(message, f"❌ sitemap.xml недоступен: <code>{_e(result.error)}</code>")
+        return
+    if not result.entries:
+        await _reply(message, "❌ sitemap.xml прочитался, но подходящих записей не нашлось — "
+                              "проверьте «часть адреса статей», если она указана.")
+        return
+
+    feed_id = st.add_feed(sitemap_url, "", kind="sitemap", article_path=article_path)
+    if feed_id is None:
+        await _reply(message, "Такой sitemap уже добавлен — /list")
+        return
+
+    last = result.entries[-1]
+    await _reply(
+        message,
+        f"✅ Сайт <b>#{feed_id}</b> добавлен: {_e(url)}\n"
+        f"sitemap: <code>{_e(sitemap_url)}</code>\n"
+        f"Статей нашлось: {len(result.entries)}\n"
+        f"Последняя по дате: {_e(last.link[:150])}\n\n"
+        f"Заголовок и картинку бот дочитает со страницы самой статьи, когда решит её публиковать.",
+    )
+    publisher.wake()
+
+
+def _feed_list_lines(f: sqlite3.Row, st: Storage) -> list[str]:
+    mark = "✅" if f["enabled"] else "⏸"
+    checked = (
+        time.strftime("%d.%m %H:%M", time.localtime(f["last_check"]))
+        if f["last_check"] else "ещё не проверялась"
+    )
+    lines = [
+        f"\n{mark} <b>#{f['id']}</b> {_e(f['title'] or '(без названия)')}\n"
+        f"   <code>{_e(f['url'])}</code>\n"
+        f"   проверена: {checked}, в архиве: {st.seen_count(f['id'])}"
+    ]
+    if f["last_error"]:
+        lines.append(f"   ⚠️ {_e(f['last_error'][:150])}")
+    if f["template"]:
+        lines.append(f"   📝 свой промпт — <code>/feedtemplate {f['id']}</code>")
+    if f["multi_images"]:
+        lines.append(f"   🖼 несколько картинок — <code>/feedimages {f['id']}</code>")
+    if f["kind"] == "sitemap" and f["article_path"]:
+        lines.append(f"   🗺 статьи: <code>{_e(f['article_path'])}</code>")
+    return lines
+
+
 @router.message(Command("list"))
 async def cmd_list(message: Message, st: Storage) -> None:
     feeds = st.feeds()
@@ -232,24 +313,16 @@ async def cmd_list(message: Message, st: Storage) -> None:
         await _reply(message, "Лент пока нет. Добавить: <code>/add &lt;url&gt;</code>")
         return
 
+    rss_feeds = [f for f in feeds if f["kind"] != "sitemap"]
+    sitemap_feeds = [f for f in feeds if f["kind"] == "sitemap"]
+
     lines = ["<b>Ленты</b>"]
-    for f in feeds:
-        mark = "✅" if f["enabled"] else "⏸"
-        checked = (
-            time.strftime("%d.%m %H:%M", time.localtime(f["last_check"]))
-            if f["last_check"] else "ещё не проверялась"
-        )
-        lines.append(
-            f"\n{mark} <b>#{f['id']}</b> {_e(f['title'] or '(без названия)')}\n"
-            f"   <code>{_e(f['url'])}</code>\n"
-            f"   проверена: {checked}, в архиве: {st.seen_count(f['id'])}"
-        )
-        if f["last_error"]:
-            lines.append(f"   ⚠️ {_e(f['last_error'][:150])}")
-        if f["template"]:
-            lines.append(f"   📝 свой промпт — <code>/feedtemplate {f['id']}</code>")
-        if f["multi_images"]:
-            lines.append(f"   🖼 несколько картинок — <code>/feedimages {f['id']}</code>")
+    for f in rss_feeds:
+        lines += _feed_list_lines(f, st)
+    if sitemap_feeds:
+        lines.append("\n<b>Сайты без RSS</b>")
+        for f in sitemap_feeds:
+            lines += _feed_list_lines(f, st)
     await _reply(message, "\n".join(lines))
 
 
@@ -1317,6 +1390,7 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
             "dedup_enabled", "dedup_window_days", "dedup_threshold")
     dupes = st.count_dedup_candidates()
     multi_feeds = sum(1 for f in feeds if f["multi_images"])
+    sitemap_feeds = sum(1 for f in feeds if f["kind"] == "sitemap")
     mode = "⏸ на паузе" if paused else "▶️ работает"
     if publisher.debug:
         mode = "🔧 отладка — посты в личку, /debug off чтобы публиковать"
@@ -1335,7 +1409,8 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
         f"Gemini: " + (f"включён, <code>{_e(gemini.model)}</code>"
                        if publisher.gemini_mode else "выключен") + "\n"
         f"Ленты: {active} активных из {len(feeds)}"
-        + (f", с ошибками: {len(errors)}" if errors else "") + "\n"
+        + (f", с ошибками: {len(errors)}" if errors else "")
+        + (f", без RSS (sitemap): {sitemap_feeds}" if sitemap_feeds else "") + "\n"
         + (f"Несколько картинок: у {multi_feeds} из {len(feeds)} лент — /feedimages <id>\n"
            if multi_feeds else "")
         + (f"Дублей на разбор: {dupes} — /duplicates или веб-панель\n" if dupes else "")

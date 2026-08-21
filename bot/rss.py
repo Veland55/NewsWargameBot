@@ -273,8 +273,15 @@ async def close_http() -> None:
     _session = None
 
 
-def _meta_images(head: str) -> dict[str, str]:
-    """Все интересные метатеги разом — страницу разбираем за один проход."""
+# Заголовок и описание статьи для источников без RSS (см. fetch_article_entry
+# ниже) — те же самые метатеги, которыми соцсети рисуют превью ссылки.
+TITLE_KEYS = ("og:title", "twitter:title")
+DESCRIPTION_KEYS = ("og:description", "twitter:description", "description")
+
+
+def _meta_tags(head: str, keys: tuple[str, ...] = META_KEYS) -> dict[str, str]:
+    """Метатеги страницы, отфильтрованные по нужным ключам — страницу
+    разбираем за один проход, какой бы набор ключей ни спрашивали."""
     found: dict[str, str] = {}
     for tag in _META_RE.finditer(head):
         attrs: dict[str, str] = {}
@@ -282,9 +289,13 @@ def _meta_images(head: str) -> dict[str, str]:
             value = m.group(3) or m.group(4) or m.group(5) or ""
             attrs[m.group(1).lower()] = value
         key = (attrs.get("property") or attrs.get("name") or "").lower()
-        if key in META_KEYS and attrs.get("content") and key not in found:
+        if key in keys and attrs.get("content") and key not in found:
             found[key] = attrs["content"]
     return found
+
+
+def _meta_images(head: str) -> dict[str, str]:
+    return _meta_tags(head, META_KEYS)
 
 
 async def page_image(url: str) -> str | None:
@@ -578,3 +589,165 @@ async def fetch(url: str, etag: str | None = None, modified: str | None = None) 
         )
     except asyncio.TimeoutError:
         return FetchResult(entries=[], error="таймаут загрузки ленты")
+
+
+# ─── Источники без RSS: sitemap.xml вместо ленты ───────────────────────────
+#
+# У сайта нет RSS/Atom — значит опрашивать нечего в привычном смысле. Но
+# sitemap.xml для поисковиков есть почти всегда, и в нём уже лежит именно то,
+# что нужно: адрес каждой страницы и дата последнего изменения (<lastmod>).
+# Ни headless-браузер, ни JS не нужны — просто XML-файл, один HTTP-запрос за
+# цикл опроса (условный GET через If-Modified-Since — как и с RSS-лентами,
+# см. FetchResult.modified). Заголовок, описание и картинку sitemap не даёт —
+# их дочитываем со страницы самой статьи, но только для записей, что уже
+# прошли is_seen/backfill/max_age/flood_guard (см. Publisher._process_feed) —
+# то есть за один проход это обычно 0-3 страницы, а не весь sitemap разом.
+MAX_SITEMAP_BYTES = 8 * 1024 * 1024
+MAX_SUBSITEMAPS = 5   # если sitemap.xml — индекс: не более стольких файлов разом
+SITEMAP_TIMEOUT = 20
+
+_SITEMAP_ENTRY_RE = re.compile(r"<url>(.*?)</url>", re.I | re.S)
+_LOC_RE = re.compile(r"<loc>(.*?)</loc>", re.I | re.S)
+_LASTMOD_RE = re.compile(r"<lastmod>(.*?)</lastmod>", re.I | re.S)
+_SITEMAP_INDEX_RE = re.compile(r"<sitemap>\s*<loc>(.*?)</loc>", re.I | re.S)
+_SITEMAP_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})")
+_TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+
+
+def _sitemap_date(raw: str) -> float:
+    m = _SITEMAP_DATE_RE.match(raw.strip())
+    if not m:
+        return 0.0
+    y, mo, d, h, mi, s = (int(x) for x in m.groups())
+    try:
+        return float(calendar.timegm((y, mo, d, h, mi, s, 0, 0, 0)))
+    except (ValueError, OverflowError):
+        return 0.0
+
+
+async def _fetch_text(url: str, headers: dict | None = None) -> tuple[int, dict, str] | None:
+    """(статус, заголовки ответа, тело) или None — сеть подвела."""
+    try:
+        async with _http().get(url, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=SITEMAP_TIMEOUT)) as resp:
+            status = resp.status
+            resp_headers = dict(resp.headers)
+            buf = bytearray()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                buf += chunk
+                if len(buf) >= MAX_SITEMAP_BYTES:
+                    break
+    except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeDecodeError):
+        return None
+    return status, resp_headers, buf.decode("utf-8", "replace")
+
+
+async def discover_sitemap(site_url: str) -> str | None:
+    """Ищет sitemap.xml сайта: сперва в robots.txt — так его сами объявляют
+    поисковикам (Sitemap: ...), иначе пробуем стандартный путь /sitemap.xml.
+    None — не нашли (сайт отдаёт что-то нестандартное, этот способ тут не
+    сработает).
+    """
+    parts = urlsplit(site_url)
+    if not parts.scheme or not parts.netloc:
+        return None
+    origin = f"{parts.scheme}://{parts.netloc}"
+
+    robots = await _fetch_text(f"{origin}/robots.txt")
+    if robots and robots[0] == 200:
+        m = re.search(r"(?im)^Sitemap:\s*(\S+)", robots[2])
+        if m:
+            return m.group(1).strip()
+
+    guess = f"{origin}/sitemap.xml"
+    xml = await _fetch_text(guess)
+    if xml and xml[0] == 200 and ("<urlset" in xml[2] or "<sitemapindex" in xml[2]):
+        return guess
+    return None
+
+
+async def fetch_sitemap(sitemap_url: str, article_path: str = "",
+                        modified: str | None = None) -> FetchResult:
+    """FetchResult с «пустыми» записями — только адрес и дата (published_ts),
+    заголовок/описание/картинка ещё не дочитаны (см. fetch_article_entry).
+    article_path — часть пути, которая есть только у статей: без неё в
+    список попали бы все страницы сайта, не только новости.
+    """
+    headers = {"If-Modified-Since": modified} if modified else None
+    got = await _fetch_text(sitemap_url, headers)
+    if got is None:
+        return FetchResult(entries=[], error="sitemap.xml не отвечает")
+    status, resp_headers, xml = got
+    if status == 304:
+        return FetchResult(entries=[], not_modified=True)
+    if status != 200:
+        return FetchResult(entries=[], error=f"HTTP {status}")
+
+    if "<sitemapindex" in xml:
+        subs = _SITEMAP_INDEX_RE.findall(xml)[:MAX_SUBSITEMAPS]
+        parts = await asyncio.gather(*(_fetch_text(html.unescape(u.strip())) for u in subs))
+        xml = "".join(p[2] for p in parts if p and p[0] == 200)
+
+    entries: list[Entry] = []
+    for block in _SITEMAP_ENTRY_RE.findall(xml):
+        loc_m = _LOC_RE.search(block)
+        if not loc_m:
+            continue
+        loc = html.unescape(loc_m.group(1).strip())
+        if article_path and article_path not in loc:
+            continue
+        lastmod_m = _LASTMOD_RE.search(block)
+        ts = _sitemap_date(lastmod_m.group(1)) if lastmod_m else 0.0
+        published = (datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                    if ts else "")
+        entries.append(Entry(key_parts=(loc,), title="", link=loc, summary="",
+                             published=published, published_ts=ts, image=""))
+    entries.sort(key=lambda e: e.published_ts)
+    return FetchResult(entries=entries, modified=resp_headers.get("Last-Modified"))
+
+
+async def fetch_article_entry(url: str, published_ts: float, published: str) -> Entry | None:
+    """Заголовок, описание и картинка со страницы статьи — источник без RSS
+    (sitemap) даёт только адрес и дату правки, остальное только на странице
+    самой новости. None — страница не прочиталась или на ней нет заголовка
+    (не статья — например снятая с публикации страница).
+    """
+    got = await _fetch_text(url, {"User-Agent": PAGE_UA})
+    if got is None:
+        return None
+    status, _headers, page = got
+    if status != 200:
+        return None
+
+    head_end = page.lower().find("</head")
+    head = page[:head_end] if head_end != -1 else page
+    metas = _meta_tags(head, TITLE_KEYS + DESCRIPTION_KEYS + META_KEYS)
+
+    title = ""
+    for key in TITLE_KEYS:
+        if metas.get(key):
+            title = html.unescape(metas[key]).strip()
+            break
+    if not title:
+        m = _TITLE_TAG_RE.search(head)
+        title = strip_html(m.group(1)) if m else ""
+    if not title:
+        return None
+
+    summary = ""
+    for key in DESCRIPTION_KEYS:
+        if metas.get(key):
+            summary = html.unescape(metas[key]).strip()
+            break
+
+    image = ""
+    for key in META_KEYS:
+        if not metas.get(key):
+            continue
+        candidate = urljoin(url, html.unescape(metas[key].strip()))
+        if _is_image(candidate) or candidate.lower().startswith(("http://", "https://")):
+            image = candidate
+            break
+
+    return Entry(key_parts=(url,), title=title, link=url, summary=summary,
+                published=published, published_ts=published_ts, image=image)

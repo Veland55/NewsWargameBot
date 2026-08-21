@@ -20,8 +20,9 @@ from .claude import ClaudeClient
 from .db import Storage, entry_key
 from .llm import LLMClient, LLMError
 from .quota import Quota
-from .rss import (Entry, download_image, fetch, image_dedup_key, page_image,
-                  page_images, strip_html)
+from .rss import (Entry, download_image, fetch, fetch_article_entry,
+                  fetch_sitemap, image_dedup_key, page_image, page_images,
+                  strip_html)
 from .vk import VKClient, VKError, to_plain
 
 log = logging.getLogger(__name__)
@@ -495,17 +496,27 @@ class Publisher:
     # --- внутреннее ------------------------------------------------------
     async def _process_feed(self, feed: sqlite3.Row) -> int:
         feed_id = feed["id"]
+        kind = feed["kind"]
         debug = self.debug
         # Условный GET обходим в двух случаях:
         #  * отладка — иначе на 304 нельзя прогнать ту же новость повторно;
         #  * с прошлого раза остался хвост непубликованных новостей — на 304
         #    мы бы его не увидели до следующего обновления ленты.
         skip_cache = debug or bool(feed["pending"])
-        result = await fetch(
-            feed["url"],
-            None if skip_cache else feed["etag"],
-            None if skip_cache else feed["modified"],
-        )
+        if kind == "sitemap":
+            # sitemap.xml не знает etag, только Last-Modified — но feeds.etag
+            # для источников без RSS попросту не заполняется, так что тут
+            # всегда участвует только modified.
+            result = await fetch_sitemap(
+                feed["url"], feed["article_path"],
+                None if skip_cache else feed["modified"],
+            )
+        else:
+            result = await fetch(
+                feed["url"],
+                None if skip_cache else feed["etag"],
+                None if skip_cache else feed["modified"],
+            )
         now = int(time.time())
 
         if result.error:
@@ -529,10 +540,13 @@ class Publisher:
 
         # Пары (ключ, запись): ключ считаем один раз и попутно убираем дубли
         # внутри самой выдачи — ленты иногда повторяют один guid дважды.
+        # У sitemap-записей на этом этапе ещё нет заголовка (see ниже) —
+        # is_empty их забраковал бы все разом, поэтому для kind='sitemap'
+        # проверку пропускаем: пустые «на самом деле» отсеются на hydrate.
         fresh: list[tuple[str, Entry]] = []
         batch_keys: set[str] = set()
         for entry in result.entries:
-            if entry.is_empty:
+            if entry.is_empty and kind != "sitemap":
                 continue
             key = entry_key(*entry.key_parts)
             if key in batch_keys or self.st.is_seen(feed_id, key):
@@ -553,8 +567,17 @@ class Publisher:
             fresh = keep
 
         fresh = self._drop_stale(feed_id, fresh)
+        if kind == "sitemap":
+            # flood_guard — до дочитывания страниц, не после: иначе сбитый
+            # sitemap (например много правок разом) обернулся бы десятками
+            # ненужных запросов к сайту источника ради записей, которые всё
+            # равно отсеются. _drop_stale/_guard_flood смотрят только на
+            # published_ts и счётчик — заголовок им не нужен.
+            if not first_poll:
+                fresh = self._guard_flood(feed_id, fresh)
+            fresh = await self._hydrate_sitemap_entries(fresh)
         fresh = self._drop_duplicates(feed, fresh)
-        if not first_poll:
+        if not first_poll and kind != "sitemap":
             fresh = self._guard_flood(feed_id, fresh)
 
         # Берём не больше max_per_cycle за проход; остаток — на следующем.
@@ -757,6 +780,24 @@ class Publisher:
                     "прочитанными", feed_id, len(fresh), len(keep))
         self._postponed_flood.append((feed_id, len(dropped)))
         return keep
+
+    async def _hydrate_sitemap_entries(self, fresh: list[tuple[str, Entry]]
+                                       ) -> list[tuple[str, Entry]]:
+        """Источник без RSS (sitemap) даёт только адрес и дату — заголовок,
+        описание и картинку дочитываем со страницы самой статьи, по одной
+        странице за раз (не параллельно — это чужой сайт, не наш CDN, незачем
+        бить по нему пачкой запросов). К этому моменту список уже прорежен
+        is_seen/backfill/max_age/flood_guard, так что за проход это обычно
+        считанные страницы, а не весь sitemap.
+        """
+        out: list[tuple[str, Entry]] = []
+        for key, entry in fresh:
+            full = await fetch_article_entry(entry.link, entry.published_ts, entry.published)
+            if full is None:
+                log.info("статья не прочиталась, отложена: %s", entry.link[:90])
+                continue
+            out.append((key, full))
+        return out
 
     def _find_duplicate(self, entry: Entry) -> tuple[int, float] | None:
         """Пост за последние dedup_window_days дней, больше всего похожий на
