@@ -118,11 +118,12 @@ DEFAULTS: dict[str, str] = {
     "disable_preview": "0",
     "images": "1",             # прикладывать картинку из новости к посту
     "og_image": "1",           # если в ленте картинки нет — взять со страницы новости
+    "multi_images": "0",       # несколько картинок со страницы альбомом вместо одной;
+                               # работает при любом активном бэкенде текста (обычном, Claude, Gemini)
+    "max_images": "6",         # сколько картинок скачивать за раз при multi_images (1-10)
     "vk_enabled": "1",         # дублировать посты в VK, если задан VK_TOKEN
     "vk_group_id": "",         # переопределяет VK_GROUP_ID из .env
-    "claude_mode": "0",        # обработка через платный Claude вместо LLM_* из .env,
-                               # плюс несколько картинок со страницы новости вместо одной
-    "claude_max_images": "6",  # сколько картинок со страницы прикладывать (1-10)
+    "claude_mode": "0",        # обработка через платный Claude вместо LLM_* из .env
     "gemini_mode": "0",        # обработка через Gemini вместо LLM_* из .env (обычно бесплатно);
                                # взаимоисключим с claude_mode — включение одного гасит другой
     "keep_seen": "500",        # сколько отметок хранить на ленту
@@ -158,6 +159,7 @@ class Storage:
             self._conn.execute("PRAGMA journal_size_limit=4194304")
             self._conn.executescript(SCHEMA)
             self._migrate()
+            self._migrate_settings_keys()
             self._conn.commit()
 
     def _migrate(self) -> None:
@@ -177,6 +179,22 @@ class Storage:
             for name, decl in columns:
                 if name not in have:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    def _migrate_settings_keys(self) -> None:
+        """Переименования ключей в settings, случившиеся после того, как ими
+        кто-то уже мог попользоваться — иначе на старой базе значение молча
+        подменялось бы дефолтом из DEFAULTS. Разовое дело: старый ключ каждый
+        раз удаляется, даже если переносить было уже нечего."""
+        renames = {"claude_max_images": "max_images"}  # картинки альбомом стали общей настройкой
+        for old, new in renames.items():
+            row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (old,)).fetchone()
+            if row is not None:
+                exists = self._conn.execute("SELECT 1 FROM settings WHERE key = ?", (new,)).fetchone()
+                if exists is None:
+                    self._conn.execute(
+                        "INSERT INTO settings (key, value) VALUES (?, ?)", (new, row["value"])
+                    )
+                self._conn.execute("DELETE FROM settings WHERE key = ?", (old,))
 
     def close(self) -> None:
         with self._lock:

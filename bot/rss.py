@@ -335,10 +335,11 @@ async def page_image(url: str) -> str | None:
     return ""
 
 
-# Все картинки со страницы новости — для режима Claude (см. publisher.py):
-# в отличие от page_image() читаем страницу целиком, а не только <head>, и
-# собираем несколько картинок вместо одной. Это дороже по времени и трафику,
-# поэтому используется только там, где за это специально платят.
+# Все картинки со страницы новости — режим «несколько картинок» (см.
+# publisher.py, Publisher.multi_images): в отличие от page_image() читаем
+# страницу целиком, а не только <head>, и собираем несколько картинок вместо
+# одной. Дороже по времени и трафику, чем обычный путь, поэтому включается
+# отдельным тумблером, а не работает всегда.
 ARTICLE_LIMIT = 1024 * 1024
 MAX_ARTICLE_IMAGES = 6
 
@@ -417,7 +418,9 @@ async def page_images(url: str, limit: int = MAX_ARTICLE_IMAGES) -> list[str]:
     return ordered[:limit]
 
 
-MAX_IMAGE_BYTES = 20 * 1024 * 1024
+# Telegram сам режет фото крупнее 10 МБ при отправке (sendPhoto/sendMediaGroup);
+# качать больше этого — тратить трафик на то, что всё равно не уйдёт в канал.
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 async def download_image(url: str, referer: str = "") -> tuple[bytes, str] | None:

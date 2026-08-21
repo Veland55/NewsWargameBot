@@ -63,6 +63,8 @@ HELP = """<b>RSS → ИИ → канал</b>
 
 Картинка из новости прикладывается сама, отдельного плейсхолдера не нужно: до 1024 символов — фото с подписью, длиннее — превью над текстом. Если картинки нет в самой ленте, бот берёт её со страницы новости (og:image). Выключить: <code>/set images 0</code>, только дочитывание со страницы — <code>/set og_image 0</code>
 
+Несколько картинок альбомом вместо одной (до 10, работает при любом режиме — обычном, Claude, Gemini): <code>/set multi_images 1</code>, сколько штук — <code>/set max_images 6</code>
+
 <b>Настройки</b>
 /status — состояние бота
 /model · /setmodel &lt;название&gt; — модель LLM
@@ -70,7 +72,7 @@ HELP = """<b>RSS → ИИ → канал</b>
 /set &lt;ключ&gt; &lt;значение&gt; — прочие параметры (см. /status)
 /setchannel &lt;@канал|id&gt; — куда публиковать
 /vk — дублирование постов в сообщество VK
-/claude — обработка через платный Claude + несколько картинок из новости
+/claude — обработка через платный Claude
 /gemini — обработка через Gemini (обычно бесплатно), взаимоисключимо с Claude
 /checknow — проверить ленты немедленно
 /stop · /start — глобальная пауза и снятие паузы"""
@@ -486,8 +488,8 @@ async def cmd_set(message: Message, command: CommandObject, st: Storage) -> None
         "interval", "max_per_cycle", "post_delay", "backfill",
         "max_age_days", "flood_guard",
         "on_llm_error", "require_russian", "disable_preview", "images",
-        "og_image", "keep_seen",
-        "alert_thresholds", "free_daily_limit", "claude_max_images",
+        "og_image", "multi_images", "max_images", "keep_seen",
+        "alert_thresholds", "free_daily_limit",
     }
     parts = (command.args or "").split(maxsplit=1)
     if len(parts) < 2 or parts[0] not in editable:
@@ -502,6 +504,10 @@ async def cmd_set(message: Message, command: CommandObject, st: Storage) -> None
     if key == "on_llm_error":
         if value not in ("raw", "skip"):
             await _reply(message, "on_llm_error принимает <code>raw</code> или <code>skip</code>")
+            return
+    elif key == "max_images":
+        if not value.isdigit() or not (1 <= int(value) <= 10):
+            await _reply(message, "max_images — число от 1 до 10.")
             return
     elif key == "alert_thresholds":
         parsed = [p for p in value.replace(" ", "").split(",") if p]
@@ -939,16 +945,16 @@ async def cmd_vk(message: Message, command: CommandObject, st: Storage,
 
 CLAUDE_HELP = """<b>Режим Claude</b>
 
-Платно, вместо обычного режима. Плюс: сам качает со страницы новости
-несколько картинок и шлёт альбомом (не одну, как обычно).
+Платно, вместо обычного режима.
 
 <b>Нужно</b>: <code>CLAUDE_API_KEY=sk-ant-...</code> в <code>.env</code>,
 при желании <code>CLAUDE_MODEL</code> (по умолчанию
 <code>claude-sonnet-5</code>), затем перезапуск бота.
 
-Промпт и формат поста — общие (/template, /format). Число картинок в
-альбом: <code>/set claude_max_images 6</code>. В /usage не считается —
-свой отдельный платный счёт.
+Промпт и формат поста — общие (/template, /format). В /usage не
+считается — свой отдельный платный счёт. Несколько картинок альбомом
+вместо одной — отдельная настройка, не завязана на Claude:
+<code>/set multi_images 1</code> (см. /help).
 
 <b>Команды</b>
 /claude — статус
@@ -971,9 +977,7 @@ async def cmd_claude(message: Message, command: CommandObject, st: Storage,
             await _reply(message, "Включил, но работать пока не выйдет: "
                                   "не хватает CLAUDE_API_KEY в .env.\n\n" + CLAUDE_HELP)
             return
-        await _reply(message, f"✅ Обрабатываю через Claude "
-                              f"(<code>{_e(claude.model)}</code>), картинки — "
-                              f"альбомом со страницы новости.")
+        await _reply(message, f"✅ Обрабатываю через Claude (<code>{_e(claude.model)}</code>).")
         return
 
     if action in ("off", "выкл", "0"):
@@ -1009,8 +1013,8 @@ async def cmd_claude(message: Message, command: CommandObject, st: Storage,
         if claude is None or not claude.api_key:
             await _reply(message, "CLAUDE_API_KEY не задан.\n\n" + CLAUDE_HELP)
             return
-        await _reply(message, "Забираю ленту и прогоняю через Claude "
-                              "(качаю картинки со страницы — это дольше обычного)…")
+        images_note = " (качаю картинки со страницы — это дольше обычного)" if publisher.multi_images else ""
+        await _reply(message, f"Забираю ленту и прогоняю через Claude{images_note}…")
         result = await fetch(feed["url"])
         if result.error or not result.entries:
             await _reply(message, f"❌ {_e(result.error or 'в ленте нет записей')}")
@@ -1040,16 +1044,14 @@ async def cmd_claude(message: Message, command: CommandObject, st: Storage,
     model = claude.model if claude else "—"
     await _reply(
         message,
-        f"Режим Claude: {state}\nКлюч: {key}\nМодель: <code>{_e(model)}</code>\n"
-        f"Картинок в альбом: {st.get('claude_max_images')}\n\n" + CLAUDE_HELP,
+        f"Режим Claude: {state}\nКлюч: {key}\nМодель: <code>{_e(model)}</code>\n\n" + CLAUDE_HELP,
     )
 
 
 GEMINI_HELP = """<b>Режим Gemini</b>
 
 Вместо обычного режима, обычно бесплатно (свой тариф Google, не через
-OpenRouter). Картинка одна, как обычно — без альбома, как у Claude.
-Взаимоисключимо с Claude: включение одного гасит другой.
+OpenRouter). Взаимоисключимо с Claude: включение одного гасит другой.
 
 <b>Нужно</b>: <code>GEMINI_API_KEY=...</code> (Google AI Studio) в
 <code>.env</code>, при желании <code>GEMINI_MODEL</code> (по умолчанию
@@ -1207,8 +1209,8 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
     keys = ("interval", "max_per_cycle", "post_delay", "backfill",
             "max_age_days", "flood_guard", "on_llm_error",
             "require_russian", "disable_preview", "images", "og_image",
-            "keep_seen", "alert_thresholds", "free_daily_limit",
-            "claude_max_images")
+            "multi_images", "max_images",
+            "keep_seen", "alert_thresholds", "free_daily_limit")
     mode = "⏸ на паузе" if paused else "▶️ работает"
     if publisher.debug:
         mode = "🔧 отладка — посты в личку, /debug off чтобы публиковать"

@@ -31,6 +31,10 @@ ELLIPSIS = "…"
 MAINTENANCE_EVERY = 6 * 3600   # уборка в базе, секунды
 ALERT_EVERY = 3600             # как часто напоминать об отложенных новостях
 RU_ATTEMPTS = 2                # попыток добиться от модели русского текста
+# Сколько картинок для одной новости качать параллельно (см. _images_of_page).
+# Сайт-источник и его CDN — общие: слишком широкий веер бьёт по ним не хуже,
+# чем по нам, а выигрыш по времени после ~4 параллельных запросов уже плоский.
+IMAGE_DOWNLOAD_CONCURRENCY = 4
 
 
 def release_memory() -> None:
@@ -248,12 +252,20 @@ class Publisher:
                 and self.gemini is not None and bool(self.gemini.api_key))
 
     @property
+    def multi_images(self) -> bool:
+        """Несколько картинок со страницы новости альбомом вместо одной —
+        независимо от того, какой бэкенд обрабатывает текст (обычный,
+        Claude или Gemini). Раньше это было побочным эффектом /claude on;
+        теперь отдельный тумблер, /set multi_images 1."""
+        return self.st.get("multi_images") == "1"
+
+    @property
     def _active_llm(self) -> "LLMClient | ClaudeClient":
         # Claude и Gemini включаются командами /claude on и /gemini on, которые
         # сами гасят друг друга — но на случай, если оба флага всё же оказались
-        # взведены разом (например, ручная правка базы), Claude в приоритете:
-        # он единственный, кто меняет ещё и картинки (альбом), так что молча
-        # переключиться на Gemini было бы более заметным сюрпризом.
+        # взведены разом (например, ручная правка базы), берём Claude: он
+        # платный, и молча подменить его на бесплатный Gemini было бы более
+        # заметным сюрпризом, чем наоборот.
         if self.claude_mode and self.claude:
             return self.claude
         if self.gemini_mode and self.gemini:
@@ -563,8 +575,8 @@ class Publisher:
         post_format = self.st.get("post_format")
         text = _shorten(render(post_format, {**raw_values, "ai": ai_text}, escape=True))
 
-        if self.claude_mode:
-            return Post(text=text, images=await self._images_of_claude(entry),
+        if self.multi_images:
+            return Post(text=text, images=await self._images_of_page(entry),
                        link=entry.link)
         return Post(text=text, image=await self._image_of(entry), link=entry.link)
 
@@ -717,8 +729,9 @@ class Publisher:
                  found[:80] or "на странице её нет")
         return found
 
-    async def _images_of_claude(self, entry: Entry) -> list[tuple[bytes, str]]:
-        """Несколько картинок со страницы новости — режим Claude.
+    async def _images_of_page(self, entry: Entry) -> list[tuple[bytes, str]]:
+        """Несколько картинок со страницы новости — режим «несколько картинок»
+        (/set multi_images 1), работает при любом активном бэкенде текста.
 
         В отличие от _image_of (одна картинка, может остаться просто ссылкой),
         здесь качаем сами: несколько ссылок из разных источников надёжнее
@@ -726,20 +739,33 @@ class Publisher:
         """
         if self.st.get("images") != "1" or not entry.link:
             return []
-        limit = max(1, min(10, self.st.get_int("claude_max_images")))
+        limit = max(1, min(10, self.st.get_int("max_images")))
+        # Кандидатов берём с запасом сверх limit: часть ссылок не скачается
+        # (сайт не ответил, оказалось не картинкой, CDN отдал 403) — без
+        # запаса такие неудачи оставили бы пост с картинками меньше, чем
+        # настроено, хотя на странице их хватало с избытком.
+        pool = limit + IMAGE_DOWNLOAD_CONCURRENCY
         candidates = [entry.image] if entry.image else []
-        candidates += [u for u in await page_images(entry.link, limit=limit) if u not in candidates]
+        candidates += [u for u in await page_images(entry.link, limit=pool) if u not in candidates]
 
         out: list[tuple[bytes, str]] = []
-        for url in candidates:
+        # Качаем пачками по IMAGE_DOWNLOAD_CONCURRENCY штук параллельно, а не
+        # все сразу и не строго по одной: параллель внутри пачки ощутимо
+        # быстрее последовательной загрузки, а остановка сразу по достижении
+        # limit не тратит трафик на кандидатов, которые уже не понадобятся.
+        for i in range(0, len(candidates), IMAGE_DOWNLOAD_CONCURRENCY):
             if len(out) >= limit:
                 break
-            downloaded = await download_image(url, referer=entry.link)
-            if downloaded is None:
-                log.info("Claude: картинка не скачалась, пропускаю: %s", url[:100])
-                continue
-            out.append(downloaded)
-        return out
+            batch = candidates[i:i + IMAGE_DOWNLOAD_CONCURRENCY]
+            results = await asyncio.gather(
+                *(download_image(url, referer=entry.link) for url in batch)
+            )
+            for url, downloaded in zip(batch, results):
+                if downloaded is None:
+                    log.info("картинка не скачалась, пропускаю: %s", url[:100])
+                    continue
+                out.append(downloaded)
+        return out[:limit]
 
     async def _fallback_post(self, entry: Entry, feed: sqlite3.Row | None) -> Post:
         """Если LLM недоступна — публикуем аккуратную заготовку без обработки."""
@@ -754,8 +780,8 @@ class Publisher:
             "ai": summary,
         }
         text = _shorten(render(self.st.get("post_format"), values, escape=True))
-        if self.claude_mode:
-            return Post(text=text, images=await self._images_of_claude(entry),
+        if self.multi_images:
+            return Post(text=text, images=await self._images_of_page(entry),
                        link=entry.link)
         return Post(text=text, image=await self._image_of(entry), link=entry.link)
 

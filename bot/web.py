@@ -47,9 +47,9 @@ LOGIN_LOCKOUT = 15 * 60          # прежде чем снова можно п�
 SETTINGS_EDITABLE = (
     "interval", "max_per_cycle", "post_delay", "backfill",
     "max_age_days", "flood_guard", "keep_seen",
-    "alert_thresholds", "free_daily_limit",
+    "alert_thresholds", "free_daily_limit", "max_images",
 )
-SETTINGS_TOGGLES = ("require_russian", "disable_preview", "images", "og_image")
+SETTINGS_TOGGLES = ("require_russian", "disable_preview", "images", "og_image", "multi_images")
 
 # (заголовок группы, [(ключ, короткая подпись, единица, подсказка), ...]) —
 # человекочитаемые подписи для полей SETTINGS_EDITABLE вместо голых
@@ -72,6 +72,9 @@ GENERAL_GROUPS: list[tuple[str, list[tuple[str, str, str, str]]]] = [
         ("alert_thresholds", "Пороги предупреждений", "%", "Через запятую, например 70,90"),
         ("free_daily_limit", "Суточный лимит", "запросов", "0 — определить автоматически по модели"),
     ]),
+    ("Картинки", [
+        ("max_images", "Картинок в альбом", "1-10", "Сколько скачивать за раз при «нескольких картинках» ниже"),
+    ]),
 ]
 
 # ключ → (подпись, короткая подсказка) — для SETTINGS_TOGGLES.
@@ -80,6 +83,7 @@ TOGGLE_LABELS: dict[str, tuple[str, str]] = {
     "disable_preview": ("Без превью ссылок", "Не показывать превью ссылки в посте"),
     "images": ("Прикладывать картинку", "Картинка из новости — к посту"),
     "og_image": ("Картинка со страницы", "Если в ленте её нет — взять со страницы новости"),
+    "multi_images": ("Несколько картинок альбомом", "До 10 картинок со страницы новости вместо одной — дольше обычного, работает при любом режиме"),
 }
 
 TG_AUTH_DATE_TTL = 24 * 3600     # старше суток initData не принимаем (см. verify_telegram_init_data)
@@ -433,8 +437,6 @@ a.list-item:hover { background: var(--card-hover); }
 .ai-option-label::after { content: ""; position: absolute; inset: 0; }
 .ai-option-title { font-size: 14px; color: var(--text); display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .ai-option:has(input:checked) { border-color: var(--blue); background: var(--blue-dim); }
-.ai-option-sub { display: none; grid-column: 2; position: relative; z-index: 1; max-width: 220px; }
-.ai-option:has(input:checked) .ai-option-sub { display: block; }
 /* Переключатели («Поведение» в параметрах публикации) — подпись+подсказка
    справа от чекбокса, весь ряд кликабелен целиком. */
 .toggle-row { display: flex; align-items: flex-start; gap: 9px; margin-bottom: 12px; cursor: pointer; }
@@ -1071,21 +1073,16 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         def combine(*parts: str) -> str:
             return " · ".join(p for p in parts if p)
 
-        def ai_option(value: str, radio_id: str, title_html: str, sub_html: str, extra_html: str = "") -> str:
+        def ai_option(value: str, radio_id: str, title_html: str, sub_html: str) -> str:
             checked = "checked" if current_mode == value else ""
             sub_block = f'<div class="muted">{sub_html}</div>' if sub_html else ""
             return (f'<div class="ai-option"><input type="radio" name="mode" value="{value}" id="{radio_id}" {checked}>'
                     f'<label for="{radio_id}" class="ai-option-label"><div class="ai-option-title">{title_html}</div>'
-                    f'{sub_block}</label>{extra_html}</div>')
+                    f'{sub_block}</label></div>')
 
         normal_sub = combine(key_note(bool(pub.llm.api_key), "LLM_API_KEY"))
-        claude_sub = combine("Несколько картинок альбомом вместо одной",
-                             key_note(bool(pub.claude and pub.claude.api_key), "CLAUDE_API_KEY"))
+        claude_sub = combine(key_note(bool(pub.claude and pub.claude.api_key), "CLAUDE_API_KEY"))
         gemini_sub = combine(key_note(bool(pub.gemini and pub.gemini.api_key), "GEMINI_API_KEY"))
-        claude_images_field = f"""<div class="ai-option-sub">
-            <label>Картинок в альбом <span class="unit">(1-10)</span></label>
-            <input type="text" name="claude_max_images" value="{_e(st.get('claude_max_images'))}"
-                   onclick="event.stopPropagation()"></div>"""
 
         ai_options_html = (
             ai_option("normal", "ai-mode-normal",
@@ -1093,7 +1090,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             + ai_option("claude", "ai-mode-claude",
                        f'Claude <span class="mono">{_e(pub.claude.model if pub.claude else "—")}</span> '
                        f'<span class="pill warn">платно</span>',
-                       claude_sub, claude_images_field)
+                       claude_sub)
             + ai_option("gemini", "ai-mode-gemini",
                        f'Gemini <span class="mono">{_e(pub.gemini.model if pub.gemini else "—")}</span> '
                        f'<span class="pill on">бесплатно</span>',
@@ -1201,6 +1198,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                 if not parts or not all(p.isdigit() and 1 <= int(p) <= 100 for p in parts):
                     return await settings_get(request, f"{k}: пороги — числа 1-100 через запятую.", "err")
                 v = ",".join(str(int(p)) for p in sorted({int(p) for p in parts}))
+            elif k == "max_images":
+                if not v.isdigit() or not (1 <= int(v) <= 10):
+                    return await settings_get(request, "Картинок в альбом — число от 1 до 10.", "err")
             elif not v.isdigit():
                 return await settings_get(request, f"{k} должно быть числом.", "err")
             st.set(k, v)
@@ -1231,11 +1231,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         st: Storage = app["st"]
         form = request["form"]
         mode = str(form.get("mode", "normal"))
-        n = str(form.get("claude_max_images", "")).strip()
-        if n:
-            if not n.isdigit() or not (1 <= int(n) <= 10):
-                return await settings_get(request, "Картинок в альбом Claude — число от 1 до 10.", "err")
-            st.set("claude_max_images", n)
         st.set("claude_mode", "1" if mode == "claude" else "0")
         st.set("gemini_mode", "1" if mode == "gemini" else "0")
         pub: Publisher = app["publisher"]
