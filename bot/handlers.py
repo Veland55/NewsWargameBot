@@ -25,7 +25,7 @@ router = Router(name="admin")
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
-HELP = """<b>RSS → DeepSeek → канал</b>
+HELP = """<b>RSS → ИИ → канал</b>
 
 /panel — открыть веб-панель управления внутри Telegram (если подключена)
 
@@ -47,7 +47,7 @@ HELP = """<b>RSS → DeepSeek → канал</b>
 /usage — расход лимита ИИ за сутки
 
 <b>Шаблоны</b>
-/template — показать промпт для DeepSeek
+/template — показать промпт
 /settemplate &lt;текст&gt; — задать промпт
 /format — показать формат поста
 /setformat &lt;текст&gt; — задать формат поста
@@ -284,7 +284,7 @@ async def cmd_test(message: Message, command: CommandObject, st: Storage,
         await _reply(message, "Как использовать: <code>/test 1</code> (id смотрите в /list)")
         return
 
-    await _reply(message, "Забираю ленту и прогоняю через DeepSeek…")
+    await _reply(message, f"Забираю ленту и прогоняю через {_e(publisher.active_backend_label)}…")
     result = await fetch(feed["url"])
     if result.error or not result.entries:
         await _reply(message, f"❌ {_e(result.error or 'в ленте нет записей')}")
@@ -300,7 +300,7 @@ async def cmd_test(message: Message, command: CommandObject, st: Storage,
         elif publisher.gemini_mode:
             backend_name, model_hint = "Gemini", "Проверьте GEMINI_API_KEY / GEMINI_MODEL в .env"
         else:
-            backend_name, model_hint = "DeepSeek", "Проверьте LLM_API_KEY / LLM_MODEL / LLM_BASE_URL в .env"
+            backend_name, model_hint = publisher.llm.model, "Проверьте LLM_API_KEY / LLM_MODEL / LLM_BASE_URL в .env"
         await _reply(
             message,
             f"❌ {backend_name} вернул ошибку: <code>{_e(exc)}</code>\n\n{model_hint}",
@@ -333,10 +333,11 @@ async def cmd_test(message: Message, command: CommandObject, st: Storage,
 
 
 @router.message(Command("template"))
-async def cmd_template(message: Message, st: Storage) -> None:
+async def cmd_template(message: Message, st: Storage, publisher: Publisher) -> None:
     await _reply(
         message,
-        f"<b>Промпт для DeepSeek</b>\n<pre>{_e(st.get('template'))}</pre>\n"
+        f"<b>Промпт</b> (сейчас — {_e(publisher.active_backend_label)})\n"
+        f"<pre>{_e(st.get('template'))}</pre>\n"
         f"Изменить: <code>/settemplate текст</code>",
     )
 
@@ -710,8 +711,7 @@ async def cmd_regen(message: Message, command: CommandObject, st: Storage, bot: 
                               "<code>/regen 1 сделай короче</code> (id из /posts)")
         return
 
-    backend = "Claude" if publisher.claude_mode else "Gemini" if publisher.gemini_mode else "DeepSeek/LLM"
-    await _reply(message, f"Перегенерирую через {backend} из исходной новости…")
+    await _reply(message, f"Перегенерирую через {_e(publisher.active_backend_label)} из исходной новости…")
     try:
         text = await publisher.rebuild_post_text(row, extra)
     except LLMError as exc:
@@ -939,25 +939,22 @@ async def cmd_vk(message: Message, command: CommandObject, st: Storage,
 
 CLAUDE_HELP = """<b>Режим Claude</b>
 
-Платная обработка через Claude вместо DeepSeek/LLM_* из .env. В этом режиме
-бот сам открывает страницу новости и качает несколько картинок из статьи
-(а не одну, как обычно) — они уходят в канал альбомом.
+Платно, вместо обычного режима. Плюс: сам качает со страницы новости
+несколько картинок и шлёт альбомом (не одну, как обычно).
 
-<b>Что нужно</b>
-В <code>.env</code>: <code>CLAUDE_API_KEY=sk-ant-...</code>, при необходимости
-<code>CLAUDE_MODEL=</code> (по умолчанию <code>claude-sonnet-5</code>), затем
-перезапуск бота.
+<b>Нужно</b>: <code>CLAUDE_API_KEY=sk-ant-...</code> в <code>.env</code>,
+при желании <code>CLAUDE_MODEL</code> (по умолчанию
+<code>claude-sonnet-5</code>), затем перезапуск бота.
 
-Шаблон промпта и формат поста — те же, что и для обычного режима
-(/template, /format). Сколько картинок прикладывать (1-10, по умолчанию 6):
-<code>/set claude_max_images 6</code>. Учёт расхода лимита ИИ (/usage) на
-Claude не распространяется — это отдельный платный API.
+Промпт и формат поста — общие (/template, /format). Число картинок в
+альбом: <code>/set claude_max_images 6</code>. В /usage не считается —
+свой отдельный платный счёт.
 
 <b>Команды</b>
-/claude — это сообщение и состояние
-/claude on · /claude off — включить и выключить режим
-/claude check — проверить ключ живым запросом (ничего не публикует)
-/claude test &lt;id ленты&gt; — прогнать последнюю новость ленты через Claude, показать в личке"""
+/claude — статус
+/claude on · off — включить/выключить
+/claude check — проверить ключ
+/claude test &lt;id&gt; — прогнать новость ленты, показать в личке"""
 
 
 @router.message(Command("claude"))
@@ -1050,30 +1047,22 @@ async def cmd_claude(message: Message, command: CommandObject, st: Storage,
 
 GEMINI_HELP = """<b>Режим Gemini</b>
 
-Обработка через Gemini вместо DeepSeek/LLM_* из .env — обычно бесплатно
-(у Gemini свой бесплатный тариф, не через OpenRouter). Картинки — как в
-обычном режиме, одна из ленты/страницы новости; альбом из нескольких
-картинок, как у Claude, тут не делается.
+Вместо обычного режима, обычно бесплатно (свой тариф Google, не через
+OpenRouter). Картинка одна, как обычно — без альбома, как у Claude.
+Взаимоисключимо с Claude: включение одного гасит другой.
 
-<b>Что нужно</b>
-В <code>.env</code>: <code>GEMINI_API_KEY=...</code> (ключ — в Google AI
-Studio), при необходимости <code>GEMINI_MODEL=</code> (по умолчанию
-<code>gemini-3.6-flash</code> — если модель переименовали, впишите
-актуальное имя), затем перезапуск бота.
+<b>Нужно</b>: <code>GEMINI_API_KEY=...</code> (Google AI Studio) в
+<code>.env</code>, при желании <code>GEMINI_MODEL</code> (по умолчанию
+<code>gemini-3.6-flash</code>), затем перезапуск бота.
 
-Шаблон промпта и формат поста — те же, что и для обычного режима
-(/template, /format). Учёт расхода лимита ИИ (/usage) на Gemini не
-распространяется — это отдельный API со своими лимитами, смотрите их в
-Google AI Studio.
-
-Включён одновременно с Claude быть не может — включение одного гасит
-другой.
+Промпт и формат поста — общие (/template, /format). В /usage не
+считается — свои лимиты смотрите в Google AI Studio.
 
 <b>Команды</b>
-/gemini — это сообщение и состояние
-/gemini on · /gemini off — включить и выключить режим
-/gemini check — проверить ключ живым запросом (ничего не публикует)
-/gemini test &lt;id ленты&gt; — прогнать последнюю новость ленты через Gemini, показать в личке"""
+/gemini — статус
+/gemini on · off — включить/выключить
+/gemini check — проверить ключ
+/gemini test &lt;id&gt; — прогнать новость ленты, показать в личке"""
 
 
 @router.message(Command("gemini"))
@@ -1229,6 +1218,7 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
         message,
         f"<b>Состояние</b>\n"
         f"Публикация: {mode}\n"
+        f"Сейчас обрабатывает: <code>{_e(publisher.active_backend_label)}</code>\n"
         f"Канал: <code>{_e(publisher.channel or 'не задан')}</code>\n"
         f"VK: " + (f"сообщество <code>{_e(publisher.vk_group)}</code>"
                    if publisher.vk_on else "выключен") + "\n"

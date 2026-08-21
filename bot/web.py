@@ -339,7 +339,7 @@ async def _usage_body(pub: "Publisher") -> str:
         rows.append(("Обнуление лимита", f"через {until_reset()} (00:00 UTC), источник: {info.limit_source}"))
     if info.credit_limit is not None:
         rows.append(("Кредиты на ключе", f"{info.credit_limit:.4f}, осталось {info.credit_remaining:.4f}"))
-    return "<h2>Расход за сутки (LLM/DeepSeek, не Claude)</h2><div class='card'><table>" + "".join(
+    return "<h2>Расход за сутки (не Claude/Gemini — у них свой счёт)</h2><div class='card'><table>" + "".join(
         f"<tr><td class='muted'>{_e(k)}</td><td>{_e(v)}</td></tr>" for k, v in rows
     ) + "</table></div>"
 
@@ -502,6 +502,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         <h2>Состояние</h2>
         <div class="card">
           <div class="line">Публикация: <b>{_e(mode)}</b></div>
+          <div class="line">Сейчас обрабатывает: <span class="mono">{_e(pub.active_backend_label)}</span></div>
           <div class="line">Канал: <span class="mono">{_e(pub.channel or 'не задан')}</span></div>
           <div class="line">Лент: {active} активных из {len(feeds)}
             {f', с ошибками: {len(errors)}' if errors else ''}</div>

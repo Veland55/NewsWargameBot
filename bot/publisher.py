@@ -261,6 +261,17 @@ class Publisher:
         return self.llm
 
     @property
+    def active_backend_label(self) -> str:
+        """Имя реально активного сейчас бэкенда — для статусов и сообщений
+        вместо жёстко зашитого «DeepSeek», который бэкендом быть не обязан
+        (LLM_* в .env может указывать на любую OpenAI-совместимую модель)."""
+        if self.claude_mode and self.claude:
+            return f"Claude ({self.claude.model})"
+        if self.gemini_mode and self.gemini:
+            return f"Gemini ({self.gemini.model})"
+        return self.llm.model
+
+    @property
     def vk_group(self) -> str:
         """id сообщества из команды важнее значения из .env."""
         return self.st.get("vk_group_id") or (self.vk.group_id if self.vk else "")

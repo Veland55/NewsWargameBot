@@ -27,9 +27,12 @@ class LLMEmpty(LLMError):
     попытки обычно отрабатывает, поэтому ошибку надо повторять, а не сдаваться.
     """
 
-    def __init__(self, message: str, finish_reason: str = ""):
+    def __init__(self, message: str, finish_reason: str = "", usage: dict | None = None):
         super().__init__(message)
         self.finish_reason = finish_reason
+        # Реальный расход этой попытки (см. LLMClient._extract) — даже
+        # пустой ответ стоил запроса к API, и его надо учесть в лимите.
+        self.usage = usage
 
 
 class LLMClient:
@@ -148,13 +151,26 @@ class LLMClient:
             payload["reasoning_effort"] = self.reasoning_effort
         headers = self._auth_headers
 
+        def record(usage: dict) -> None:
+            # Вызывается на каждую попытку с кодом 200, а не только на
+            # финальный успех: каждая такая попытка — отдельный реальный
+            # запрос к API со своим расходом токенов/суточного лимита,
+            # и ретраи (обрезанный ответ, пустой ответ) не должны тихо
+            # выпадать из учёта — иначе счётчик разъедется с тем, что
+            # провайдер посчитал у себя, и предупреждения о лимите будут
+            # опаздывать.
+            if self.on_usage:
+                try:
+                    self.on_usage(usage)
+                except Exception:
+                    log.exception("сбой в учёте расхода")
+
         last_error = "неизвестная ошибка"
         # Обрезанный, но непустой ответ (finish_reason=length) раньше считался
         # успехом и уходил в канал на полуслове, без хештегов в конце —
         # держим его тут как запасной вариант, а сами всё равно пробуем
         # дотянуть до чистого finish_reason=stop с большим лимитом.
         truncated_text: str | None = None
-        truncated_usage: dict | None = None
         for attempt in range(1, self.retries + 2):
             try:
                 session = await self._get_session()
@@ -170,16 +186,14 @@ class LLMClient:
                             # повторы, — и новость уходила необработанной.
                             last_error = str(exc)
                             finish = exc.finish_reason
+                            if exc.usage:
+                                record(exc.usage)
                         else:
+                            record(usage)
                             if finish != "length":
-                                if self.on_usage:
-                                    try:
-                                        self.on_usage(usage)
-                                    except Exception:
-                                        log.exception("сбой в учёте расхода")
                                 return text
                             last_error = f"ответ обрезан на {len(text)} символах (finish_reason=length)"
-                            truncated_text, truncated_usage = text, usage
+                            truncated_text = text
                         if finish == "length":
                             # Бюджет вышел до того, как модель дописала
                             # ответ (или не начала вовсе) — на повтор даём
@@ -208,13 +222,9 @@ class LLMClient:
 
         if truncated_text is not None:
             # Так и не дотянули до чистого finish_reason=stop — публикуем
-            # обрезанный черновик, это лучше, чем совсем ничего.
+            # обрезанный черновик, это лучше, чем совсем ничего. Расход
+            # уже учтён через record() в цикле выше, второй раз не пишем.
             log.warning("отдаю обрезанный ответ после всех попыток: %s", last_error)
-            if self.on_usage and truncated_usage:
-                try:
-                    self.on_usage(truncated_usage)
-                except Exception:
-                    log.exception("сбой в учёте расхода")
             return truncated_text
         raise LLMError(last_error)
 
@@ -242,16 +252,6 @@ class LLMClient:
 
         text = (content or "").strip()
         finish = str(choice.get("finish_reason") or "")
-        if not text:
-            # Рассуждающие модели кладут ход мыслей отдельно; в пост он не
-            # годится, но по нему видно, на что ушёл бюджет.
-            thinking = (message.get("reasoning")
-                        or message.get("reasoning_content") or "")
-            detail = f", finish_reason={finish}" if finish else ""
-            if thinking:
-                detail += f", рассуждений на {len(thinking)} символов"
-            raise LLMEmpty(f"модель вернула пустой ответ{detail}", finish)
-
         raw = data.get("usage") or {}
         usage = {
             "tokens_in": int(raw.get("prompt_tokens") or 0),
@@ -259,4 +259,16 @@ class LLMClient:
             # OpenRouter кладёт сюда стоимость запроса в кредитах
             "cost": float(raw.get("cost") or 0.0),
         }
+        if not text:
+            # Рассуждающие модели кладут ход мыслей отдельно; в пост он не
+            # годится, но по нему видно, на что ушёл бюджет. Сам запрос при
+            # этом всё равно реален и стоил токенов/лимита — usage передаём
+            # с исключением, чтобы вызывающий код его не потерял.
+            thinking = (message.get("reasoning")
+                        or message.get("reasoning_content") or "")
+            detail = f", finish_reason={finish}" if finish else ""
+            if thinking:
+                detail += f", рассуждений на {len(thinking)} символов"
+            raise LLMEmpty(f"модель вернула пустой ответ{detail}", finish, usage)
+
         return text, finish, usage
