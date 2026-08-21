@@ -17,7 +17,8 @@ from .llm import LLMError
 from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, _ext_for,
                         html_problem, tg_len)
 from .quota import until_reset
-from .rss import Entry, discover_sitemap, fetch, fetch_article_entry, fetch_sitemap
+from .rss import (Entry, discover_sitemap, fetch, fetch_article_entry,
+                  fetch_sitemap, resolve_article_path)
 from .vk import VKError, to_plain
 
 log = logging.getLogger(__name__)
@@ -241,7 +242,9 @@ async def cmd_addsite(message: Message, st: Storage, publisher: Publisher) -> No
             message,
             "Как использовать: <code>/addsite https://example.com/ [/articles/]</code>\n"
             "Второй аргумент необязателен — часть адреса, которая есть только у "
-            "статей (если в sitemap сайта вперемешку и новости, и другие страницы).",
+            "статей (если в sitemap сайта вперемешку и новости, и другие страницы). "
+            "Если вставить в первый аргумент адрес конкретного раздела — попробую "
+            "определить фильтр по нему сам; не получится — попрошу ввести отдельно.",
         )
         return
 
@@ -256,6 +259,11 @@ async def cmd_addsite(message: Message, st: Storage, publisher: Publisher) -> No
     if sitemap_url is None:
         await _reply(message, "❌ Не нашли sitemap.xml — ни в robots.txt, ни по "
                               "стандартному адресу. Для этого сайта такой способ не подойдёт.")
+        return
+
+    article_path, path_error = await resolve_article_path(sitemap_url, url, article_path)
+    if path_error:
+        await _reply(message, f"❌ {_e(path_error)}")
         return
 
     result = await fetch_sitemap(sitemap_url, article_path)

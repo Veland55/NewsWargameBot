@@ -23,7 +23,7 @@ import logging
 import secrets
 import time
 from typing import Awaitable, Callable
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlsplit
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -35,7 +35,7 @@ from .llm import LLMError
 from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, html_problem,
                         tg_len)
 from .quota import until_reset
-from .rss import Entry, discover_sitemap, fetch, fetch_sitemap
+from .rss import Entry, discover_sitemap, fetch, fetch_sitemap, resolve_article_path
 
 log = logging.getLogger(__name__)
 
@@ -940,7 +940,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                 <button class="primary" type="submit">Добавить</button>
               </div>
               <div class="field-hint" style="margin-top:4px;">Нужна, если в sitemap сайта вперемешку и
-                новости, и другие страницы (товары, категории) — без неё заберём всё подряд.</div>
+                новости, и другие страницы (товары, категории) — без неё заберём всё подряд. Если
+                вставили в «Адрес сайта» ссылку на конкретный раздел — попробуем определить фильтр
+                по нему сами; не получится — попросим ввести отдельно.</div>
             </form>
           </div>
         </details>
@@ -978,6 +980,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                 request,
                 "Не нашли sitemap.xml — ни в robots.txt, ни по стандартному адресу. "
                 "Для этого сайта такой способ не подойдёт.", "err")
+        article_path, path_error = await resolve_article_path(sitemap_url, url, article_path)
+        if path_error:
+            return await feeds_get(request, path_error, "err")
         result = await fetch_sitemap(sitemap_url, article_path)
         if result.error:
             return await feeds_get(request, f"sitemap.xml недоступен: {result.error}", "err")

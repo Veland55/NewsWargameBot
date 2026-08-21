@@ -706,6 +706,43 @@ async def fetch_sitemap(sitemap_url: str, article_path: str = "",
     return FetchResult(entries=entries, modified=resp_headers.get("Last-Modified"))
 
 
+async def resolve_article_path(sitemap_url: str, site_url: str,
+                                article_path: str) -> tuple[str, str | None]:
+    """Если article_path не задан явно — многие при добавлении сайта вставляют
+    в «Адрес сайта» ссылку на конкретный раздел (например .../news/), ожидая,
+    что именно он и станет фильтром. discover_sitemap отбрасывает путь и
+    смотрит только домен — без этой проверки такой раздел молча терялся бы,
+    и в источник попадали вообще все страницы сайта.
+
+    Пробуем путь из site_url как кандидат в article_path: если под ним
+    нашлись СВОИ статьи (не только сама страница раздела — у неё тоже есть
+    запись в sitemap, но это не новость) — берём его. Если нет — путь ничего
+    не фильтрует (структура адресов сайта не привязана к разделам), и лучше
+    явно сказать об этом, чем молча подключить сайт без фильтра.
+
+    Возвращает (article_path, ошибка). Ошибка — только когда КАНДИДАТ
+    оказался бесполезным; сам article_path при этом остаётся как был (пустым).
+    """
+    if article_path:
+        return article_path, None
+    candidate = urlsplit(site_url).path
+    if not candidate or candidate == "/":
+        return "", None
+
+    probe = await fetch_sitemap(sitemap_url, candidate)
+    if probe.error:
+        return "", None  # sitemap и так недоступен — об этом скажет основной fetch_sitemap
+    own_page = site_url.rstrip("/")
+    real = [e for e in probe.entries if e.link.rstrip("/") != own_page]
+    if real:
+        return candidate, None
+    return "", (f"адрес «{site_url}» сам по себе не годится в фильтр — под ним не нашлось "
+                f"статей, только страница раздела. У этого сайта категория, похоже, не "
+                f"отражена в адресе статьи. Впишите адрес сайта целиком (например "
+                f"https://{urlsplit(site_url).netloc}/) и, если нужно, отдельно укажите "
+                f"часть адреса статей во втором поле.")
+
+
 async def fetch_article_entry(url: str, published_ts: float, published: str) -> Entry | None:
     """Заголовок, описание и картинка со страницы статьи — источник без RSS
     (sitemap) даёт только адрес и дату правки, остальное только на странице
