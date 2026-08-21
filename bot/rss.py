@@ -13,7 +13,7 @@ from html.parser import HTMLParser
 
 import aiohttp
 import feedparser
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 USER_AGENT = "rss-deepseek-bot/1.0 (+https://github.com/)"
 FETCH_TIMEOUT = 20
@@ -343,23 +343,121 @@ async def page_image(url: str) -> str | None:
 ARTICLE_LIMIT = 1024 * 1024
 MAX_ARTICLE_IMAGES = 6
 
+# «Тело» страницы кроме самой статьи содержит меню сайта, виджет «похожие
+# статьи», аватар автора и т.п. — без фильтрации в пост уходят чужие
+# картинки, никак не связанные с новостью. Три независимых сигнала:
+#
+# 1. LANDMARK_TAGS — <header>/<nav>/<footer>/<aside> размечают чужеродные
+#    для статьи блоки семантически, это самый надёжный сигнал.
+# 2. Картинка внутри ссылки на ДРУГУЮ страницу (не картинку-первоисточник
+#    для лайтбокса и не саму статью) — почти всегда карточка «читать
+#    также», а не иллюстрация текущей новости.
+# 3. CHROME_CONTEXT_HINTS — точечные подстраховки под конкретные названия
+#    классов виджетов, которых не бывает у landmark-тегов и ссылок.
+LANDMARK_TAGS = ("header", "nav", "footer", "aside")
+CHROME_URL_HINTS = ("/wp-content/themes/", "gravatar.com", "/wp-includes/")
+CHROME_CONTEXT_HINTS = (
+    "breaking-news", "breaking-thumb", "entry-preview", "post-preview",
+    "article-card", "blog__post", "related-post", "related_post",
+    "you-might-also-like", "you-may-also-like", "recommended-post",
+    "trending", "popular-post", "widget", "sidebar", "mega-menu",
+    "comment-respond", "author-bio", "author-box", "newsletter",
+    "social-share", "share-buttons",
+)
+_CONTEXT_WINDOW = 500
 
-def _body_images(body: str, base_url: str) -> list[str]:
-    """Картинки из <img> тела страницы, в порядке появления, без дублей."""
+_TOKEN_RE = re.compile(
+    r"<a\b[^>]*?\bhref\s*=\s*[\"']([^\"']*)[\"'][^>]*>"
+    r"|</a\s*>"
+    r"|<(header|nav|footer|aside)\b"
+    r"|</(header|nav|footer|aside)\s*>"
+    r"|<img\b[^>]*?\bsrc\s*=\s*[\"']([^\"']+)[\"']",
+    re.I,
+)
+# CDN часто отдают одно и то же фото в нескольких размерах (обычный
+# WordPress-суффикс -1024x627 перед расширением) — без нормализации такие
+# варианты дублируются в посте как будто это разные картинки.
+_RESIZE_SUFFIX_RE = re.compile(r"-\d{2,5}x\d{2,5}(?=\.\w+$)")
+# /2026/08/ в пути — почти всегда папка загрузки CMS по дате публикации:
+# у статей из виджета «похожие материалы» дата (и потому папка) почти
+# всегда другая, у картинок текущей статьи — та же.
+_DATE_FOLDER_RE = re.compile(r"/(\d{4}/\d{1,2})/")
+
+
+def image_dedup_key(url: str) -> str:
+    """Ключ для сравнения «на самом деле одна и та же картинка»."""
+    path = url.split("?", 1)[0].split("#", 1)[0]
+    path = re.sub(r"^https?://", "", path, flags=re.I)
+    path = _RESIZE_SUFFIX_RE.sub("", path)
+    return path.lower()
+
+
+def _date_folder(url: str) -> str | None:
+    m = _DATE_FOLDER_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _same_page(href_abs: str, article_url: str) -> bool:
+    a, b = urlsplit(href_abs), urlsplit(article_url)
+    return a.path.rstrip("/") == b.path.rstrip("/")
+
+
+def _body_images(page: str, article_url: str, primary_folder: str | None) -> list[str]:
+    """Картинки из <img> тела страницы, в порядке появления, без дублей и
+    без чужеродных (см. комментарий перед LANDMARK_TAGS выше)."""
     seen: set[str] = set()
     out: list[str] = []
-    for match in _IMG_RE.finditer(body):
-        raw = html.unescape(match.group(1).strip())
-        if not raw:
+    anchor_stack: list[str] = []
+    landmark_depth = 0
+    for m in _TOKEN_RE.finditer(page):
+        if m.group(1) is not None:            # <a href=...>
+            anchor_stack.append(m.group(1))
             continue
-        url = urljoin(base_url, raw)
-        if url in seen:
+        if m.group(0).startswith("</a"):       # </a>
+            if anchor_stack:
+                anchor_stack.pop()
+            continue
+        if m.group(2) is not None:             # <header|nav|footer|aside>
+            landmark_depth += 1
+            continue
+        if m.group(3) is not None:             # закрывающий тег
+            landmark_depth = max(0, landmark_depth - 1)
+            continue
+        if landmark_depth > 0:
+            continue
+
+        raw = html.unescape(m.group(4).strip())
+        # JS-шаблон вида {{ data.image.url }}, не отрендерился на сервере.
+        if not raw or "{" in raw or "}" in raw:
+            continue
+        url = urljoin(article_url, raw)
+
+        if anchor_stack:
+            href_abs = urljoin(article_url, anchor_stack[-1])
+            href_path = href_abs.split("#")[0]
+            # Ссылка на полноразмерную версию той же картинки (лайтбокс) —
+            # не признак карточки «читать также», это своя иллюстрация.
+            if (href_path and not _is_image(href_path)
+                    and not _same_page(href_abs, article_url)):
+                continue
+
+        if any(hint in url.lower() for hint in TRACKER_HINTS):
+            continue
+        if any(hint in url.lower() for hint in CHROME_URL_HINTS):
             continue
         if not (_is_image(url) or url.lower().startswith(("http://", "https://"))):
             continue
-        if any(hint in url.lower() for hint in TRACKER_HINTS):
+        if primary_folder and _date_folder(url) not in (None, primary_folder):
             continue
-        seen.add(url)
+
+        context = page[max(0, m.start() - _CONTEXT_WINDOW):m.start()].lower()
+        if any(hint in context for hint in CHROME_CONTEXT_HINTS):
+            continue
+
+        key = image_dedup_key(url)
+        if key in seen:
+            continue
+        seen.add(key)
         out.append(url)
     return out
 
@@ -397,22 +495,30 @@ async def page_images(url: str, limit: int = MAX_ARTICLE_IMAGES) -> list[str]:
     metas = _meta_images(head)
     ordered: list[str] = []
     seen: set[str] = set()
+    primary_folder: str | None = None
     for key in META_KEYS:
         if key not in metas:
             continue
         candidate = urljoin(url, html.unescape(metas[key].strip()))
-        if candidate in seen or any(h in candidate.lower() for h in TRACKER_HINTS):
+        if any(h in candidate.lower() for h in TRACKER_HINTS):
             continue
-        if _is_image(candidate) or candidate.lower().startswith(("http://", "https://")):
-            seen.add(candidate)
-            ordered.append(candidate)
+        if not (_is_image(candidate) or candidate.lower().startswith(("http://", "https://"))):
+            continue
+        dedup_key = image_dedup_key(candidate)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        ordered.append(candidate)
+        if primary_folder is None:
+            primary_folder = _date_folder(candidate)
 
-    for candidate in _body_images(page, url):
+    for candidate in _body_images(page, url, primary_folder):
         if len(ordered) >= limit:
             break
-        if candidate in seen:
+        dedup_key = image_dedup_key(candidate)
+        if dedup_key in seen:
             continue
-        seen.add(candidate)
+        seen.add(dedup_key)
         ordered.append(candidate)
 
     return ordered[:limit]

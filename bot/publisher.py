@@ -20,7 +20,8 @@ from .claude import ClaudeClient
 from .db import Storage, entry_key
 from .llm import LLMClient, LLMError
 from .quota import Quota
-from .rss import Entry, download_image, fetch, page_image, page_images, strip_html
+from .rss import (Entry, download_image, fetch, image_dedup_key, page_image,
+                  page_images, strip_html)
 from .vk import VKClient, VKError, to_plain
 
 log = logging.getLogger(__name__)
@@ -624,8 +625,8 @@ class Publisher:
         text = _shorten(render(post_format, {**raw_values, "ai": ai_text}, escape=True))
 
         if self.multi_images:
-            return Post(text=text, images=await self._images_of_page(entry),
-                       link=entry.link)
+            image_url, images = await self._images_of_page(entry)
+            return Post(text=text, image=image_url, images=images, link=entry.link)
         return Post(text=text, image=await self._image_of(entry), link=entry.link)
 
     async def rebuild_post_text(self, row: sqlite3.Row, extra: str = "") -> str:
@@ -878,16 +879,19 @@ class Publisher:
                  found[:80] or "на странице её нет")
         return found
 
-    async def _images_of_page(self, entry: Entry) -> list[tuple[bytes, str]]:
+    async def _images_of_page(self, entry: Entry) -> tuple[str, list[tuple[bytes, str]]]:
         """Несколько картинок со страницы новости — режим «несколько картинок»
         (/set multi_images 1), работает при любом активном бэкенде текста.
 
         В отличие от _image_of (одна картинка, может остаться просто ссылкой),
         здесь качаем сами: несколько ссылок из разных источников надёжнее
-        отправлять байтами, чем адресами за нестабильными CDN.
+        отправлять байтами, чем адресами за нестабильными CDN. Возвращает
+        ещё и адрес первой картинки отдельной строкой — VK грузит фото по
+        ссылке, а не байтами (см. VKClient.post), и без этого в режиме
+        нескольких картинок публикация в VK оставалась совсем без фото.
         """
         if self.st.get("images") != "1" or not entry.link:
-            return []
+            return "", []
         limit = max(1, min(10, self.st.get_int("max_images")))
         # Кандидатов берём с запасом сверх limit: часть ссылок не скачается
         # (сайт не ответил, оказалось не картинкой, CDN отдал 403) — без
@@ -895,9 +899,16 @@ class Publisher:
         # настроено, хотя на странице их хватало с избытком.
         pool = limit + IMAGE_DOWNLOAD_CONCURRENCY
         candidates = [entry.image] if entry.image else []
-        candidates += [u for u in await page_images(entry.link, limit=pool) if u not in candidates]
+        seen_keys = {image_dedup_key(u) for u in candidates}
+        for u in await page_images(entry.link, limit=pool):
+            key = image_dedup_key(u)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            candidates.append(u)
 
         out: list[tuple[bytes, str]] = []
+        first_url = ""
         # Качаем пачками по IMAGE_DOWNLOAD_CONCURRENCY штук параллельно, а не
         # все сразу и не строго по одной: параллель внутри пачки ощутимо
         # быстрее последовательной загрузки, а остановка сразу по достижении
@@ -914,7 +925,9 @@ class Publisher:
                     log.info("картинка не скачалась, пропускаю: %s", url[:100])
                     continue
                 out.append(downloaded)
-        return out[:limit]
+                if not first_url:
+                    first_url = url
+        return first_url, out[:limit]
 
     async def _fallback_post(self, entry: Entry, feed: sqlite3.Row | None) -> Post:
         """Если LLM недоступна — публикуем аккуратную заготовку без обработки."""
@@ -930,8 +943,8 @@ class Publisher:
         }
         text = _shorten(render(self.st.get("post_format"), values, escape=True))
         if self.multi_images:
-            return Post(text=text, images=await self._images_of_page(entry),
-                       link=entry.link)
+            image_url, images = await self._images_of_page(entry)
+            return Post(text=text, image=image_url, images=images, link=entry.link)
         return Post(text=text, image=await self._image_of(entry), link=entry.link)
 
     async def send_vk(self, post: Post) -> bool:
