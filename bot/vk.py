@@ -34,6 +34,7 @@ API_URL = "https://api.vk.com/method/"
 API_VERSION = "5.131"
 VK_TEXT_LIMIT = 16000
 MAX_IMAGE_BYTES = 20 * 1024 * 1024   # ограничение VK на фото — 50 МБ, берём с запасом
+MAX_PHOTOS_PER_POST = 10             # столько вложений VK принимает в одной записи
 
 # Ошибки, которые лечатся повтором: 6 — слишком часто, 1 — временный сбой,
 # 10 — внутренняя ошибка сервера VK.
@@ -202,25 +203,43 @@ class VKClient:
             return str(groups[0].get("name") or "")
         return ""
 
-    async def post(self, text: str, image: str = "", link: str = "") -> int | None:
+    async def post(self, text: str, image: str = "", link: str = "",
+                   images: list[tuple[bytes, str]] | None = None) -> int | None:
         """Публикует запись на стену. Возвращает id записи.
 
-        `link` — адрес новости: он идёт вложением, когда настоящее фото
-        загрузить нечем. VK сам вытянет из страницы картинку и заголовок,
-        так что запись не остаётся голым текстом.
+        `images` — уже скачанные байты нескольких картинок (режим «несколько
+        картинок» ленты, см. Publisher._images_of_page): грузим их все,
+        запись выходит с галереей, как и в Telegram-альбоме. Без него —
+        `image`, одна картинка по ссылке (как раньше). `link` — адрес
+        новости: он идёт вложением, когда настоящее фото загрузить нечем.
+        VK сам вытянет из страницы картинку и заголовок, так что запись не
+        остаётся голым текстом.
         """
         if not self.configured:
             raise VKError("VK не настроен: нужны VK_TOKEN и VK_GROUP_ID")
 
-        attachment = ""
-        if image and self.user_token:
+        attachments: list[str] = []
+        if images and self.user_token:
+            for i, (data, _ctype) in enumerate(images[:MAX_PHOTOS_PER_POST], start=1):
+                try:
+                    attachments.append(await self._upload_photo_bytes(data))
+                except (VKError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                    # Одна неудачная картинка — не повод терять остальные и
+                    # тем более всю новость.
+                    log.warning("VK: картинка %s из %s не загрузилась (%s) — пропускаю",
+                                i, len(images), exc)
+        elif image and self.user_token:
             try:
-                attachment = await self._upload_photo(image, referer=link) or ""
+                att = await self._upload_photo(image, referer=link)
+                if att:
+                    attachments.append(att)
             except (VKError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
                 # Картинка — не повод терять новость. Адрес пишем в журнал:
                 # без него потом не понять, на какой именно картинке сорвалось.
                 log.warning("VK: картинку загрузить не удалось (%s) — "
                             "пробую вложить ссылку; картинка: %s", exc, image[:150])
+
+        attachment = ",".join(attachments)
         if not attachment and link:
             attachment = link
 
@@ -323,8 +342,15 @@ class VKClient:
         """
         if not self.user_token:
             raise VKError("нет VK_USER_TOKEN")
-        data, ctype = await self._download(url, referer)
+        data, _ctype = await self._download(url, referer)
+        return await self._upload_photo_bytes(data)
 
+    async def _upload_photo_bytes(self, data: bytes) -> str:
+        """Кладёт на стену уже скачанные байты — не заново качает картинку,
+        если она уже была скачана для другого адресата (Telegram-альбом,
+        см. Publisher._images_of_page)."""
+        if not self.user_token:
+            raise VKError("нет VK_USER_TOKEN")
         kind = sniff(data)
         if kind is None:
             raise VKError(f"это не картинка: первые байты {data[:8].hex()}")

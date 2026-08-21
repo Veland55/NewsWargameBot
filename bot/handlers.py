@@ -1006,7 +1006,8 @@ async def cmd_vk(message: Message, command: CommandObject, st: Storage,
             return
         vk.group_id = publisher.vk_group
         try:
-            post_id = await vk.post(to_plain(post.text), post.image, post.link)
+            post_id = await vk.post(to_plain(post.text), post.image, post.link,
+                                    images=post.images)
         except VKError as exc:
             await _reply(message, f"❌ VK не принял пост: <code>{_e(exc)}</code>")
             return

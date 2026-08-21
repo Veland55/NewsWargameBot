@@ -953,13 +953,16 @@ class Publisher:
         """Дублирует пост в сообщество VK. Ошибку только логируем.
 
         VK — второй адресат, а не главный: если он отвалился, публикация в
-        Telegram уже состоялась и новость помечена прочитанной.
+        Telegram уже состоялась и новость помечена прочитанной. Картинки
+        альбома (post.images) переиспользуем как есть — уже скачаны для
+        Telegram, повторно с CDN источника их не тянем.
         """
         if not self.vk_on:
             return False
         self.vk.group_id = self.vk_group
         try:
-            post_id = await self.vk.post(to_plain(post.text), post.image, post.link)
+            post_id = await self.vk.post(to_plain(post.text), post.image, post.link,
+                                         images=post.images)
         except VKError as exc:
             log.error("VK: пост не опубликован — %s", exc)
             return False
