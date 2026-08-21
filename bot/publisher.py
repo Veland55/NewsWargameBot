@@ -9,7 +9,6 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
 
 from aiogram import Bot
 from aiogram.exceptions import (TelegramAPIError, TelegramBadRequest,
@@ -24,7 +23,7 @@ from .quota import Quota
 from .rss import (Entry, FetchResult, download_image, fetch,
                   fetch_article_entry, image_dedup_key, page_image,
                   page_images, strip_html)
-from .search import SearchClient
+from .search import SearchClient, domain_of, site_query
 from .vk import VKClient, VKError, to_plain
 
 log = logging.getLogger(__name__)
@@ -250,10 +249,6 @@ class Publisher:
         self._postponed: list[tuple[str, str]] = []
         self._postponed_flood: list[tuple[int, int]] = []
         self._postponed_dupes: list[tuple[int, str, int, float]] = []
-        # Взводится в _complete(), когда Gemini отказал по 429 и бот сам
-        # переключился на основной LLM — админов оповещаем один раз за
-        # проход, а не на каждую новость.
-        self._gemini_quota_hit = False
         # Первую уборку делаем не сразу после старта, а через MAINTENANCE_EVERY.
         self._last_maintenance = time.time()
         # Взводится, когда Telegram отказал по причине, которую повтором не
@@ -381,7 +376,6 @@ class Publisher:
         self._postponed = []
         self._postponed_flood = []
         self._postponed_dupes = []
-        self._gemini_quota_hit = False
         if self.st.get("paused") == "1":
             log.info("публикация на паузе — пропускаем проход")
             return stats
@@ -413,8 +407,6 @@ class Publisher:
             await self._report_flood()
         if self._postponed_dupes:
             await self._report_dupes()
-        if self._gemini_quota_hit:
-            await self._report_gemini_quota()
         if stats["published"] and self.quota:
             await self.quota.check_and_alert()
         return stats
@@ -470,9 +462,25 @@ class Publisher:
     async def _report_gemini_quota(self) -> None:
         """Сообщить, что Gemini исчерпал квоту и бот сам переключился на
         основной LLM — иначе выглядит так, будто /gemini off нажал кто-то
-        другой, и админ не поймёт, откуда взялась смена модели."""
+        другой, и админ не поймёт, откуда взялась смена модели.
+
+        Вызывается прямо из _complete() в момент обнаружения — не только
+        из run_once(), но и из ручных команд (/test, /gemini test, /regen
+        и т.п.), которые дёргают build_post в обход обычного цикла и раньше
+        оставляли админа без объяснения. Раз gemini_mode гасится сразу же,
+        второй раз само по себе не сработает — троттлинг только на случай
+        редкой гонки (параллельный ручной тест во время автопрохода).
+        """
         if not self.admin_ids:
             return
+        now = int(time.time())
+        try:
+            last = int(self.st.get("gemini_quota_alert_at") or 0)
+        except ValueError:
+            last = 0
+        if now - last < ALERT_EVERY:
+            return
+        self.st.set("gemini_quota_alert_at", now)
         text = (
             f"⚠️ У Gemini кончилась квота (HTTP 429) — бот автоматически "
             f"переключился на основной LLM ({html.escape(self.llm.model)}), "
@@ -592,7 +600,11 @@ class Publisher:
             log.info("лента #%s: первый опрос, пропущено %s записей", feed_id, len(skipped))
             fresh = keep
 
-        fresh = self._drop_stale(feed_id, fresh)
+        if kind != "search":
+            # Для search: published_ts синтетический (см. _fetch_search) —
+            # «старше max_age_days» тут ничего не значит, фильтр всегда
+            # молча пропускал бы всё, создавая ложное чувство защиты.
+            fresh = self._drop_stale(feed_id, fresh)
         if kind == "search":
             # flood_guard — до дочитывания страниц, не после: иначе сбитая
             # выдача поиска обернулась бы лишними запросами к сайту-
@@ -823,9 +835,8 @@ class Publisher:
         """
         if self.search is None or not self.search.configured:
             return FetchResult(entries=[], error="поиск не настроен — см. SERPER_API_KEY в .env")
-        domain = urlsplit(feed["url"]).netloc or feed["url"].strip("/")
         path = feed["article_path"]
-        query = f"site:{domain}{path}" if path else f"site:{domain}"
+        query = site_query(domain_of(feed["url"]), path)
         items, error = await self.search.search(query)
         if error:
             return FetchResult(entries=[], error=error)
@@ -866,17 +877,22 @@ class Publisher:
             out.append((key, full))
         return out
 
-    def _find_duplicate(self, entry: Entry) -> tuple[int, float] | None:
-        """Пост за последние dedup_window_days дней, больше всего похожий на
-        entry по заголовку и summary разом — или None, если ничего не
-        дотягивает до dedup_threshold. Оба сигнала должны пройти DEDUP_MIN_SIGNAL
-        по отдельности, иначе общие слова вроде «анонсировала» жёстко
-        завышали бы схожесть у пары никак не связанных новостей.
+    def _find_duplicate(self, entry: Entry, candidates: list[sqlite3.Row]
+                        ) -> tuple[int, float] | None:
+        """Из уже опубликованных за окно дедупа постов — тот, что больше
+        всего похож на entry по заголовку и summary разом, или None, если
+        ничего не дотягивает до dedup_threshold. Оба сигнала должны пройти
+        DEDUP_MIN_SIGNAL по отдельности, иначе общие слова вроде
+        «анонсировала» жёстко завышали бы схожесть у пары никак не
+        связанных новостей.
+
+        `candidates` — результат recent_posts(), считанный один раз в
+        _drop_duplicates на всю пачку fresh, а не заново на каждую запись:
+        при первом опросе ленты (десятки записей разом) это было N
+        одинаковых SQL-запросов вместо одного.
         """
-        days = max(1, self.st.get_int("dedup_window_days"))
-        since = int(time.time() - days * 86400)
         best: tuple[int, float] | None = None
-        for row in self.st.recent_posts(since):
+        for row in candidates:
             title_sim = _dedup_similarity(entry.title, row["title"])
             summary_sim = _dedup_similarity(entry.summary, row["summary"])
             if title_sim < DEDUP_MIN_SIGNAL or summary_sim < DEDUP_MIN_SIGNAL:
@@ -903,9 +919,12 @@ class Publisher:
         if self.st.get("dedup_enabled") != "1" or not fresh:
             return fresh
         feed_id = feed["id"]
+        days = max(1, self.st.get_int("dedup_window_days"))
+        since = int(time.time() - days * 86400)
+        candidates = self.st.recent_posts(since)
         keep: list[tuple[str, Entry]] = []
         for key, entry in fresh:
-            match = self._find_duplicate(entry)
+            match = self._find_duplicate(entry, candidates)
             if match is None:
                 keep.append((key, entry))
                 continue
@@ -951,9 +970,9 @@ class Publisher:
             if llm is not self.gemini:
                 raise
             self.st.set("gemini_mode", "0")
-            self._gemini_quota_hit = True
             log.warning("Gemini: квота исчерпана (HTTP 429) — переключаюсь "
                         "на основной LLM (%s) автоматически", self.llm.model)
+            await self._report_gemini_quota()
             return await self.llm.complete(prompt)
 
     async def _ask_model(self, prompt: str) -> str:

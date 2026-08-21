@@ -88,6 +88,14 @@ class Config:
         if not db_path.is_absolute():
             db_path = ROOT / db_path
 
+        raw_port = os.getenv("WEB_PANEL_PORT", "8090").strip()
+        try:
+            web_panel_port = int(raw_port) if raw_port else 8090
+        except ValueError:
+            raise SystemExit(
+                f"WEB_PANEL_PORT={raw_port!r} должен быть числом, например WEB_PANEL_PORT=8090"
+            )
+
         return cls(
             bot_token=token,
             channel_id=channel,
@@ -107,7 +115,7 @@ class Config:
             ).rstrip("/"),
             serper_api_key=os.getenv("SERPER_API_KEY", "").strip(),
             web_panel_password=os.getenv("WEB_PANEL_PASSWORD", "").strip(),
-            web_panel_port=int(os.getenv("WEB_PANEL_PORT", "8090") or 8090),
+            web_panel_port=web_panel_port,
             web_panel_public_url=os.getenv("WEB_PANEL_PUBLIC_URL", "").strip().rstrip("/"),
             db_path=db_path,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),

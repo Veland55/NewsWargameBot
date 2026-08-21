@@ -443,7 +443,10 @@ def _body_images(page: str, article_url: str, primary_folder: str | None) -> lis
             continue
         url = urljoin(article_url, raw)
 
-        if anchor_stack:
+        if anchor_stack and not anchor_stack[-1].strip().lower().startswith("javascript:"):
+            # javascript: — открывает лайтбокс через обработчик клика, а не
+            # переход на другую страницу; urljoin() иначе резолвил бы такой
+            # href как отдельную «чужую» страницу и ронял свою же картинку.
             href_abs = urljoin(article_url, anchor_stack[-1])
             href_path = href_abs.split("#")[0]
             # Ссылка на полноразмерную версию той же картинки (лайтбокс) —
@@ -527,6 +530,24 @@ async def page_images(url: str, limit: int = MAX_ARTICLE_IMAGES) -> list[str]:
         if primary_folder is None:
             primary_folder = _date_folder(candidate)
 
+    # <link rel="image_src"> — тот же источник обложки, что и в page_image(),
+    # но там отдельная (более дешёвая, только <head>) функция для режима
+    # «одна картинка»; здесь читаем всю страницу и без этой проверки сайты,
+    # где обложка объявлена только через <link>, без og:image/twitter:image,
+    # в режиме «несколько картинок» её бы не находили вовсе.
+    if link := _LINK_IMG_RE.search(head):
+        if href := _HREF_RE.search(link.group(0)):
+            raw = href.group(2) or href.group(3) or href.group(4) or ""
+            candidate = urljoin(url, html.unescape(raw.strip()))
+            if (not any(h in candidate.lower() for h in TRACKER_HINTS)
+                    and (_is_image(candidate) or candidate.lower().startswith(("http://", "https://")))):
+                dedup_key = image_dedup_key(candidate)
+                if dedup_key not in meta_seen:
+                    meta_seen.add(dedup_key)
+                    meta_ordered.append(candidate)
+                    if primary_folder is None:
+                        primary_folder = _date_folder(candidate)
+
     # primary_folder нужен _body_images ещё до решения, чьи картинки в итоге
     # пойдут в пост — он отсекает чужие статьи из виджета «похожие материалы».
     body_ordered: list[str] = []
@@ -604,13 +625,12 @@ async def fetch(url: str, etag: str | None = None, modified: str | None = None) 
 # уже найденной статьи — отдельные страницы статей у таких сайтов, в
 # отличие от их списков, как правило кэшируются нормально и открываются
 # свежими.
-ARTICLE_FETCH_LIMIT = 1024 * 1024
 ARTICLE_FETCH_TIMEOUT = 20
 _TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 
 
-async def _fetch_text(url: str, headers: dict | None = None) -> tuple[int, dict, str] | None:
-    """(статус, заголовки ответа, тело) или None — сеть подвела."""
+async def _fetch_text(url: str, headers: dict | None = None) -> tuple[int, str] | None:
+    """(статус, тело) или None — сеть подвела."""
     try:
         async with _http().get(url, headers=headers,
                                timeout=aiohttp.ClientTimeout(total=ARTICLE_FETCH_TIMEOUT)) as resp:
@@ -618,7 +638,7 @@ async def _fetch_text(url: str, headers: dict | None = None) -> tuple[int, dict,
             buf = bytearray()
             async for chunk in resp.content.iter_chunked(64 * 1024):
                 buf += chunk
-                if len(buf) >= ARTICLE_FETCH_LIMIT:
+                if len(buf) >= ARTICLE_LIMIT:
                     break
     except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeDecodeError):
         return None

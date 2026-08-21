@@ -21,6 +21,7 @@ import html as html_mod
 import json
 import logging
 import secrets
+import sqlite3
 import time
 from typing import Awaitable, Callable
 from urllib.parse import parse_qsl, urlsplit
@@ -36,6 +37,7 @@ from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, html_problem,
                         tg_len)
 from .quota import until_reset
 from .rss import Entry, fetch
+from .search import site_query
 
 log = logging.getLogger(__name__)
 
@@ -828,9 +830,11 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         dupes = st.dedup_candidates(50)
         if not dupes:
             return ""
+        matched_ids = st.existing_post_ids(
+            [r["matched_post_id"] for r in dupes if r["matched_post_id"]])
         items = ""
         for r in dupes:
-            matched = st.post(r["matched_post_id"]) if r["matched_post_id"] else None
+            matched = r["matched_post_id"] in matched_ids
             matched_html = (f'<a href="/posts/{r["matched_post_id"]}">пост #{r["matched_post_id"]}</a>'
                             if matched else f'пост #{r["matched_post_id"]} (уже удалён)')
             thumb = (f'<img src="{_safe_href(r["image"])}" alt="" '
@@ -983,7 +987,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         domain = urlsplit(url).netloc
         if not domain:
             return await feeds_get(request, "Не разобрал домен в этой ссылке.", "err")
-        query = f"site:{domain}{article_path}" if article_path else f"site:{domain}"
+        query = site_query(domain, article_path)
         items, error = await publisher.search.search(query)
         if error:
             return await feeds_get(request, f"Поиск не ответил: {error}", "err")

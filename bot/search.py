@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -25,6 +26,21 @@ log = logging.getLogger(__name__)
 
 API_URL = "https://google.serper.dev/search"
 TIMEOUT = 15
+
+
+def domain_of(url: str) -> str:
+    """Домен ленты для поискового запроса. Фолбэк на голый url на случай
+    экзотического значения без схемы — сама лента уже когда-то прошла
+    валидацию при добавлении (см. cmd_addsite/feeds_add_search), так что
+    пустая строка тут практически не встречается."""
+    return urlsplit(url).netloc or url.strip("/")
+
+
+def site_query(domain: str, article_path: str) -> str:
+    """Запрос вида `site:домен[путь]` — общий для добавления источника
+    (/addsite, веб-панель) и последующих опросов (Publisher._fetch_search,
+    _last_entry для /test и др.), чтобы не разъезжались в четырёх местах."""
+    return f"site:{domain}{article_path}" if article_path else f"site:{domain}"
 
 
 class SearchClient:

@@ -164,7 +164,6 @@ DEFAULTS: dict[str, str] = {
 # Лимиты бесплатных моделей OpenRouter (значения из их документации).
 FREE_RPD_NO_CREDITS = 50     # если кредитов куплено меньше порога
 FREE_RPD_WITH_CREDITS = 1000  # если куплено 10+ кредитов
-FREE_RPM = 20
 
 
 def entry_key(*parts: str) -> str:
@@ -481,6 +480,19 @@ class Storage:
             return self._conn.execute(
                 "SELECT * FROM posts WHERE id = ?", (post_id,)
             ).fetchone()
+
+    def existing_post_ids(self, post_ids: list[int]) -> set[int]:
+        """Какие из этих id ещё есть в posts — один запрос вместо по одному
+        на каждую проверку (см. web._dupes_section_html: там нужно только
+        «жив ли пост», не сама строка)."""
+        if not post_ids:
+            return set()
+        with self._lock:
+            placeholders = ",".join("?" * len(post_ids))
+            rows = self._conn.execute(
+                f"SELECT id FROM posts WHERE id IN ({placeholders})", post_ids
+            ).fetchall()
+        return {r["id"] for r in rows}
 
     def post_extra_ids(self, post_id: int) -> list[int]:
         """message_id второй и следующих картинок альбома, по порядку.

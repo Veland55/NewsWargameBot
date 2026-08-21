@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import logging
+import sqlite3
 import time
 from urllib.parse import urlsplit
 
@@ -19,6 +20,7 @@ from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, _ext_for,
                         html_problem, tg_len)
 from .quota import until_reset
 from .rss import Entry, fetch, fetch_article_entry
+from .search import domain_of, site_query
 from .vk import VKError, to_plain
 
 log = logging.getLogger(__name__)
@@ -271,7 +273,7 @@ async def cmd_addsite(message: Message, st: Storage, publisher: Publisher) -> No
         return
 
     await _reply(message, "Проверяю поиск…")
-    query = f"site:{domain}{article_path}" if article_path else f"site:{domain}"
+    query = site_query(domain, article_path)
     items, error = await publisher.search.search(query)
     if error:
         await _reply(message, f"❌ Поиск не ответил: <code>{_e(error)}</code>")
@@ -1302,14 +1304,36 @@ async def cmd_gemini(message: Message, command: CommandObject, st: Storage,
         try:
             post = await publisher.build_post(entry, feed)
         except LLMError as exc:
-            await _reply(message, f"❌ Gemini вернул ошибку: <code>{_e(exc)}</code>")
+            # gemini_mode="0" тут может значить не «тест сломал», а что
+            # _complete() сам погасил его — квота кончилась прямо во время
+            # теста. Откатывать обратно в этом случае нельзя: реальное
+            # состояние (квота исчерпана) важнее того, что было до теста.
+            fell_back = st.get("gemini_mode") == "0"
+            if not fell_back:
+                st.set("gemini_mode", was_on)
+            note = ("\n\n⚠️ Похоже, дело в исчерпанной квоте — бот уже "
+                    "переключился на основной LLM." if fell_back else "")
+            await _reply(message, f"❌ Gemini вернул ошибку: <code>{_e(exc)}</code>{note}")
             return
-        finally:
+
+        # Та же логика: если квота кончилась прямо во время теста,
+        # _complete() уже выключил gemini_mode и отдал текст с основной
+        # модели — откатывать это назад на was_on значило бы врать себе,
+        # что Gemini всё ещё работает.
+        fell_back = st.get("gemini_mode") == "0"
+        if not fell_back:
             st.set("gemini_mode", was_on)
 
         picture = f"картинок: {len(post.images)}" if post.images else "без картинок"
-        await _reply(message, f"⬇️ Предпросмотр через Gemini ({picture}, "
-                              f"<b>не</b> опубликовано)")
+        if fell_back:
+            await _reply(message, "⚠️ У Gemini кончилась квота прямо во время "
+                                  f"теста — текст ниже от основной модели "
+                                  f"(<code>{_e(publisher.llm.model)}</code>), "
+                                  f"режим Gemini автоматически выключен. "
+                                  f"Включить снова — <code>/gemini on</code>, "
+                                  f"когда квота восстановится.")
+        await _reply(message, f"⬇️ Предпросмотр{'' if fell_back else ' через Gemini'} "
+                              f"({picture}, <b>не</b> опубликовано)")
         if not await _preview_post(message, post):
             await message.answer(post.text, parse_mode="HTML",
                                  link_preview_options=NO_PREVIEW)
@@ -1457,9 +1481,8 @@ async def _last_entry(feed: sqlite3.Row, publisher: Publisher) -> tuple[Entry | 
     if feed["kind"] == "search":
         if publisher.search is None or not publisher.search.configured:
             return None, "поиск не настроен — см. SERPER_API_KEY в .env"
-        domain = urlsplit(feed["url"]).netloc or feed["url"].strip("/")
         path = feed["article_path"]
-        query = f"site:{domain}{path}" if path else f"site:{domain}"
+        query = site_query(domain_of(feed["url"]), path)
         items, error = await publisher.search.search(query)
         if error:
             return None, error

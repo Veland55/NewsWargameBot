@@ -12,7 +12,7 @@ import logging
 
 import aiohttp
 
-from .llm import LLMEmpty, LLMError
+from .llm import LLMEmpty, LLMError, LLMQuotaExceeded
 
 log = logging.getLogger(__name__)
 
@@ -70,7 +70,9 @@ class ClaudeClient:
             payload["system"] = system
 
         last_error = "неизвестная ошибка"
+        last_status: int | None = None
         for attempt in range(1, self.retries + 2):
+            last_status = None
             try:
                 session = await self._get_session()
                 async with session.post(
@@ -84,6 +86,7 @@ class ClaudeClient:
                             last_error = str(exc)
                     else:
                         last_error = f"HTTP {resp.status}: {body[:300]}"
+                        last_status = resp.status
                         # 429 и 5xx стоит повторить, остальные 4xx — нет.
                         if resp.status < 500 and resp.status != 429:
                             break
@@ -98,6 +101,8 @@ class ClaudeClient:
                             attempt, last_error, delay)
                 await asyncio.sleep(delay)
 
+        if last_status == 429:
+            raise LLMQuotaExceeded(last_error)
         raise LLMError(last_error)
 
     @staticmethod
