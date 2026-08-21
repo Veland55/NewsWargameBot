@@ -19,6 +19,14 @@ class LLMError(RuntimeError):
     pass
 
 
+class LLMQuotaExceeded(LLMError):
+    """Финальная попытка упала с HTTP 429 — не разовый сбой, а исчерпанный
+    лимit (у Gemini — суточная бесплатная квота). Отдельный тип нужен, чтобы
+    вызывающий код (Publisher) мог отличить это от прочих отказов и
+    переключиться на другой бэкенд, а не просто отложить новость до
+    следующего прохода."""
+
+
 class LLMEmpty(LLMError):
     """Ответ пришёл, но текста в нём нет.
 
@@ -166,12 +174,14 @@ class LLMClient:
                     log.exception("сбой в учёте расхода")
 
         last_error = "неизвестная ошибка"
+        last_status: int | None = None
         # Обрезанный, но непустой ответ (finish_reason=length) раньше считался
         # успехом и уходил в канал на полуслове, без хештегов в конце —
         # держим его тут как запасной вариант, а сами всё равно пробуем
         # дотянуть до чистого finish_reason=stop с большим лимитом.
         truncated_text: str | None = None
         for attempt in range(1, self.retries + 2):
+            last_status = None
             try:
                 session = await self._get_session()
                 async with session.post(
@@ -204,6 +214,7 @@ class LLMClient:
                                            f"{payload['max_tokens']} токенов")
                     else:
                         last_error = f"HTTP {resp.status}: {body[:300]}"
+                        last_status = resp.status
                         # 4xx (кроме 429) повторять смысла нет. Проверка
                         # относится только к отказам HTTP: пустой ответ
                         # приходит с кодом 200 и повторяться должен.
@@ -226,6 +237,8 @@ class LLMClient:
             # уже учтён через record() в цикле выше, второй раз не пишем.
             log.warning("отдаю обрезанный ответ после всех попыток: %s", last_error)
             return truncated_text
+        if last_status == 429:
+            raise LLMQuotaExceeded(last_error)
         raise LLMError(last_error)
 
     @staticmethod

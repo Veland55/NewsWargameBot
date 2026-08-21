@@ -19,7 +19,7 @@ from aiogram.types import (BufferedInputFile, InputMediaPhoto,
 
 from .claude import ClaudeClient
 from .db import Storage, entry_key
-from .llm import LLMClient, LLMError
+from .llm import LLMClient, LLMError, LLMQuotaExceeded
 from .quota import Quota
 from .rss import (Entry, FetchResult, download_image, fetch,
                   fetch_article_entry, image_dedup_key, page_image,
@@ -250,6 +250,10 @@ class Publisher:
         self._postponed: list[tuple[str, str]] = []
         self._postponed_flood: list[tuple[int, int]] = []
         self._postponed_dupes: list[tuple[int, str, int, float]] = []
+        # Взводится в _complete(), когда Gemini отказал по 429 и бот сам
+        # переключился на основной LLM — админов оповещаем один раз за
+        # проход, а не на каждую новость.
+        self._gemini_quota_hit = False
         # Первую уборку делаем не сразу после старта, а через MAINTENANCE_EVERY.
         self._last_maintenance = time.time()
         # Взводится, когда Telegram отказал по причине, которую повтором не
@@ -377,6 +381,7 @@ class Publisher:
         self._postponed = []
         self._postponed_flood = []
         self._postponed_dupes = []
+        self._gemini_quota_hit = False
         if self.st.get("paused") == "1":
             log.info("публикация на паузе — пропускаем проход")
             return stats
@@ -408,6 +413,8 @@ class Publisher:
             await self._report_flood()
         if self._postponed_dupes:
             await self._report_dupes()
+        if self._gemini_quota_hit:
+            await self._report_gemini_quota()
         if stats["published"] and self.quota:
             await self.quota.check_and_alert()
         return stats
@@ -459,6 +466,28 @@ class Publisher:
                                             parse_mode="HTML")
             except TelegramAPIError as exc:
                 log.warning("не удалось предупредить админа %s о дублях: %s", admin_id, exc)
+
+    async def _report_gemini_quota(self) -> None:
+        """Сообщить, что Gemini исчерпал квоту и бот сам переключился на
+        основной LLM — иначе выглядит так, будто /gemini off нажал кто-то
+        другой, и админ не поймёт, откуда взялась смена модели."""
+        if not self.admin_ids:
+            return
+        text = (
+            f"⚠️ У Gemini кончилась квота (HTTP 429) — бот автоматически "
+            f"переключился на основной LLM ({html.escape(self.llm.model)}), "
+            f"режим Gemini выключен (<code>/gemini off</code>).\n\n"
+            f"Публикация продолжается без остановки. Когда квота обновится "
+            f"(обычно на следующие сутки) — включить Gemini обратно можно "
+            f"командой <code>/gemini on</code>."
+        )
+        for admin_id in sorted(self.admin_ids):
+            try:
+                await self.bot.send_message(chat_id=admin_id, text=text,
+                                            parse_mode="HTML")
+            except TelegramAPIError as exc:
+                log.warning("не удалось предупредить админа %s о квоте Gemini: %s",
+                            admin_id, exc)
 
     async def _report_postponed(self) -> None:
         """Сообщить админам, что новости отложены из-за модели.
@@ -909,6 +938,24 @@ class Publisher:
         await self.send_vk(post)
         return None
 
+    async def _complete(self, prompt: str) -> str:
+        """Один запрос через активный бэкенд — с автопереключением на
+        основной LLM, если у Gemini кончилась квота (HTTP 429). Без этого
+        каждая новость откладывалась бы до ручного /gemini off: квота
+        освобождается только на следующие сутки, а посты вставали в очередь
+        прямо сейчас."""
+        llm = self._active_llm
+        try:
+            return await llm.complete(prompt)
+        except LLMQuotaExceeded:
+            if llm is not self.gemini:
+                raise
+            self.st.set("gemini_mode", "0")
+            self._gemini_quota_hit = True
+            log.warning("Gemini: квота исчерпана (HTTP 429) — переключаюсь "
+                        "на основной LLM (%s) автоматически", self.llm.model)
+            return await self.llm.complete(prompt)
+
     async def _ask_model(self, prompt: str) -> str:
         """Ответ модели, пригодный к публикации.
 
@@ -917,14 +964,13 @@ class Publisher:
         поэтому даём ей второй заход с прямым указанием, и лишь потом
         признаём отказ.
         """
-        llm = self._active_llm
         if self.st.get("require_russian") != "1":
-            return await llm.complete(prompt)
+            return await self._complete(prompt)
 
         nudge = ("\n\nВажно: ответ должен быть на русском языке. "
                  "Не копируй исходный текст.")
         for attempt in range(1, RU_ATTEMPTS + 1):
-            text = await llm.complete(prompt if attempt == 1 else prompt + nudge)
+            text = await self._complete(prompt if attempt == 1 else prompt + nudge)
             if looks_russian(text):
                 return text
             log.warning("модель ответила не по-русски (попытка %s из %s): %r",
