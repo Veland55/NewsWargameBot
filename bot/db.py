@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS feeds (
     multi_images  INTEGER NOT NULL DEFAULT 0,  -- несколько картинок альбомом вместо одной
     kind          TEXT NOT NULL DEFAULT 'rss', -- 'rss' или 'sitemap' (сайт без RSS)
     article_path  TEXT NOT NULL DEFAULT '',    -- для sitemap: часть пути, которая есть только у статей
+    listing_url   TEXT NOT NULL DEFAULT '',    -- для sitemap: страница со списком новостей (подстраховка)
     added_at      INTEGER NOT NULL
 );
 
@@ -201,7 +202,8 @@ class Storage:
             "feeds": [("pending", "INTEGER NOT NULL DEFAULT 0"),
                       ("multi_images", "INTEGER NOT NULL DEFAULT 0"),
                       ("kind", "TEXT NOT NULL DEFAULT 'rss'"),
-                      ("article_path", "TEXT NOT NULL DEFAULT ''")],
+                      ("article_path", "TEXT NOT NULL DEFAULT ''"),
+                      ("listing_url", "TEXT NOT NULL DEFAULT ''")],
             "posts": [("extra_message_ids", "TEXT NOT NULL DEFAULT ''")],
         }
         for table, columns in added.items():
@@ -273,19 +275,21 @@ class Storage:
 
     # --- ленты -----------------------------------------------------------
     def add_feed(self, url: str, title: str = "", kind: str = "rss",
-                article_path: str = "") -> int | None:
+                article_path: str = "", listing_url: str = "") -> int | None:
         """Возвращает id новой ленты или None, если такая уже есть.
 
         kind='sitemap' — источник без RSS: url тогда хранит адрес самого
         sitemap.xml (см. bot.rss.discover_sitemap), article_path — часть
-        пути, которая есть только у статей (см. bot.rss.fetch_sitemap).
+        пути, которая есть только у статей, listing_url — необязательная
+        страница со списком новостей, подстраховка сверх sitemap.xml
+        (см. bot.rss.fetch_sitemap / fetch_listing_articles).
         """
         with self._lock:
             try:
                 cur = self._conn.execute(
-                    "INSERT INTO feeds (url, title, kind, article_path, added_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (url, title, kind, article_path, int(time.time())),
+                    "INSERT INTO feeds (url, title, kind, article_path, listing_url, added_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (url, title, kind, article_path, listing_url, int(time.time())),
                 )
                 self._conn.commit()
                 return int(cur.lastrowid)

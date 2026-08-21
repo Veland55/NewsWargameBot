@@ -40,6 +40,8 @@ HELP = """<b>RSS → ИИ → канал</b>
 <b>Сайты без RSS-ленты</b>
 /addsite &lt;url&gt; [часть адреса статей] — добавить сайт, новости через sitemap.xml
 (без браузера и без JS; удобнее через веб-панель, раздел «Ленты» → «Сайты без RSS»).
+/setlisting &lt;id&gt; &lt;url&gt; — страница со списком новостей сайта, подстраховка сверх
+sitemap.xml на случай его задержки (работает не для всех сайтов).
 Управление такое же, как у обычных лент — /list, /pause, /del и т.д.
 
 <b>Опубликованные посты</b>
@@ -292,6 +294,42 @@ async def cmd_addsite(message: Message, st: Storage, publisher: Publisher) -> No
     publisher.wake()
 
 
+@router.message(Command("setlisting"))
+async def cmd_setlisting(message: Message, command: CommandObject, st: Storage) -> None:
+    """Страница со списком новостей сайта — подстраховка сверх sitemap.xml
+    для ленты без RSS (см. bot/rss.py, fetch_listing_articles): у sitemap
+    бывает задержка с новыми статьями, страница списка нередко обновляется
+    быстрее. Работает не для всех сайтов (зависит от того, как устроена
+    страница) — если эффекта нет, просто ничего не меняется."""
+    feed_id, url = _split_id_and_text(command.args)
+    feed = st.feed(feed_id) if feed_id is not None else None
+    if feed is None:
+        await _reply(
+            message,
+            "Как использовать: <code>/setlisting 15 https://example.com/news/</code> "
+            "(id смотрите в /list)\n"
+            "Убрать: <code>/setlisting 15 off</code>",
+        )
+        return
+    if feed["kind"] != "sitemap":
+        await _reply(message, "Это не сайт без RSS — у обычных лент своих новостей не бывает.")
+        return
+    if not url:
+        current = feed["listing_url"] or "не задана"
+        await _reply(message, f"Страница со списком новостей для #{feed_id}: <code>{_e(current)}</code>")
+        return
+    if url.lower() in ("off", "выкл", "0", "-"):
+        st.update_feed(feed_id, listing_url="")
+        await _reply(message, f"✅ Убрал страницу списка новостей у #{feed_id} — sitemap.xml как был "
+                              f"единственным источником, так и остаётся.")
+        return
+    if not url.startswith(("http://", "https://")):
+        await _reply(message, "Нужна ссылка, начинающаяся на http:// или https://")
+        return
+    st.update_feed(feed_id, listing_url=url)
+    await _reply(message, f"✅ Сохранил. Проверить: <code>/test {feed_id}</code>")
+
+
 def _feed_list_lines(f: sqlite3.Row, st: Storage) -> list[str]:
     mark = "✅" if f["enabled"] else "⏸"
     checked = (
@@ -311,6 +349,8 @@ def _feed_list_lines(f: sqlite3.Row, st: Storage) -> list[str]:
         lines.append(f"   🖼 несколько картинок — <code>/feedimages {f['id']}</code>")
     if f["kind"] == "sitemap" and f["article_path"]:
         lines.append(f"   🗺 статьи: <code>{_e(f['article_path'])}</code>")
+    if f["kind"] == "sitemap" and f["listing_url"]:
+        lines.append(f"   📰 + страница новостей — <code>/setlisting {f['id']}</code>")
     return lines
 
 
@@ -1446,7 +1486,7 @@ async def _last_entry(feed: sqlite3.Row) -> tuple[Entry | None, str | None]:
     Возвращает (запись, None) или (None, текст ошибки).
     """
     if feed["kind"] == "sitemap":
-        result = await fetch_sitemap(feed["url"], feed["article_path"])
+        result = await fetch_sitemap(feed["url"], feed["article_path"], listing_url=feed["listing_url"])
         if result.error:
             return None, result.error
         if not result.entries:

@@ -864,11 +864,13 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         multi = ' <span class="pill neutral">неск. картинок</span>' if f["multi_images"] else ""
         path_hint = (f' <span class="pill neutral">{_e(f["article_path"])}</span>'
                     if f["kind"] == "sitemap" and f["article_path"] else "")
+        listing_hint = (' <span class="pill neutral">+ страница новостей</span>'
+                        if f["kind"] == "sitemap" and f["listing_url"] else "")
         return f"""<div class="list-item">
           <div class="list-item-info">
             <div class="list-item-title">
               <b>#{f['id']}</b> {_e(f['title'] or '(без названия)')}
-              <span class="pill {'on' if f['enabled'] else 'neutral'}">{'вкл' if f['enabled'] else 'пауза'}</span>{own_prompt}{multi}{path_hint}
+              <span class="pill {'on' if f['enabled'] else 'neutral'}">{'вкл' if f['enabled'] else 'пауза'}</span>{own_prompt}{multi}{path_hint}{listing_hint}
             </div>
             <div class="muted mono ellipsis">{_e(f['url'])}</div>
             <div class="muted">проверена: {checked} · в архиве: {st.seen_count(f['id'])}</div>
@@ -935,14 +937,22 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                 <div style="flex:1;"><label>Название (необязательно)</label><input type="text" name="title"></div>
               </div>
               <div class="row" style="align-items:flex-end; margin-top:8px;">
-                <div style="flex:2;"><label>Часть адреса статей (необязательно)</label>
+                <div style="flex:1;"><label>Часть адреса статей (необязательно)</label>
                   <input type="text" name="article_path" placeholder="/articles/"></div>
-                <button class="primary" type="submit">Добавить</button>
               </div>
               <div class="field-hint" style="margin-top:4px;">Нужна, если в sitemap сайта вперемешку и
                 новости, и другие страницы (товары, категории) — без неё заберём всё подряд. Если
                 вставили в «Адрес сайта» ссылку на конкретный раздел — попробуем определить фильтр
                 по нему сами; не получится — попросим ввести отдельно.</div>
+              <div class="row" style="align-items:flex-end; margin-top:8px;">
+                <div style="flex:2;"><label>Страница со списком новостей (необязательно)</label>
+                  <input type="text" name="listing_url" placeholder="https://example.com/news/"></div>
+                <button class="primary" type="submit">Добавить</button>
+              </div>
+              <div class="field-hint" style="margin-top:4px;">Подстраховка сверх sitemap.xml — если
+                у sitemap сайта бывает задержка с новыми статьями, страница списка новостей нередко
+                обновляется быстрее. Работает не для всех сайтов — если формат окажется неподходящим,
+                просто не даст эффекта, ничего не сломает.</div>
             </form>
           </div>
         </details>
@@ -972,6 +982,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         url = str(form.get("url", "")).strip()
         title = str(form.get("title", "")).strip()
         article_path = str(form.get("article_path", "")).strip()
+        listing_url = str(form.get("listing_url", "")).strip()
         if not url.startswith(("http://", "https://")):
             return await feeds_get(request, "Нужна ссылка, начинающаяся на http:// или https://", "err")
         sitemap_url = await discover_sitemap(url)
@@ -983,7 +994,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         article_path, path_error = await resolve_article_path(sitemap_url, url, article_path)
         if path_error:
             return await feeds_get(request, path_error, "err")
-        result = await fetch_sitemap(sitemap_url, article_path)
+        result = await fetch_sitemap(sitemap_url, article_path, listing_url=listing_url)
         if result.error:
             return await feeds_get(request, f"sitemap.xml недоступен: {result.error}", "err")
         if not result.entries:
@@ -991,7 +1002,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                 request,
                 "sitemap.xml прочитался, но подходящих записей не нашлось — "
                 "проверьте «часть адреса статей», если она заполнена.", "err")
-        feed_id = app["st"].add_feed(sitemap_url, title, kind="sitemap", article_path=article_path)
+        feed_id = app["st"].add_feed(sitemap_url, title, kind="sitemap", article_path=article_path,
+                                     listing_url=listing_url)
         if feed_id is None:
             return await feeds_get(request, "Такой sitemap уже добавлен.", "err")
         app["publisher"].wake()

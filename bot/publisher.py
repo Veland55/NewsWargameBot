@@ -510,6 +510,7 @@ class Publisher:
             result = await fetch_sitemap(
                 feed["url"], feed["article_path"],
                 None if skip_cache else feed["modified"],
+                listing_url=feed["listing_url"],
             )
         else:
             result = await fetch(
