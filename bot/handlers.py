@@ -66,6 +66,8 @@ HELP = """<b>RSS → ИИ → канал</b>
 
 Несколько картинок альбомом вместо одной (до 10, работает при любом режиме — обычном, Claude, Gemini): <code>/multiimages on</code>, сколько штук — <code>/set max_images 6</code>. Вернуть как раньше — <code>/multiimages off</code>
 
+Новость, похожая на уже опубликованную с другой ленты, сама в канал не уходит — ждёт разбора: <code>/duplicates</code> (посмотреть картинки, опубликовать или удалить — удобнее в веб-панели, «Дубли»). Выключить: <code>/set dedup_enabled 0</code>
+
 <b>Настройки</b>
 /status — состояние бота
 /model · /setmodel &lt;название&gt; — модель LLM
@@ -492,6 +494,7 @@ async def cmd_set(message: Message, command: CommandObject, st: Storage) -> None
         "on_llm_error", "require_russian", "disable_preview", "images",
         "og_image", "multi_images", "max_images", "keep_seen",
         "alert_thresholds", "free_daily_limit",
+        "dedup_enabled", "dedup_window_days", "dedup_threshold",
     }
     parts = (command.args or "").split(maxsplit=1)
     if len(parts) < 2 or parts[0] not in editable:
@@ -510,6 +513,10 @@ async def cmd_set(message: Message, command: CommandObject, st: Storage) -> None
     elif key == "max_images":
         if not value.isdigit() or not (1 <= int(value) <= 10):
             await _reply(message, "max_images — число от 1 до 10.")
+            return
+    elif key == "dedup_threshold":
+        if not value.isdigit() or not (1 <= int(value) <= 100):
+            await _reply(message, "dedup_threshold — число от 1 до 100 (% схожести).")
             return
     elif key == "alert_thresholds":
         parsed = [p for p in value.replace(" ", "").split(",") if p]
@@ -1268,6 +1275,23 @@ async def cmd_usage(message: Message, st: Storage, publisher: Publisher) -> None
     await _reply(message, "\n".join(lines))
 
 
+@router.message(Command("duplicates"))
+async def cmd_duplicates(message: Message, st: Storage) -> None:
+    """Список читать можно и тут, а смотреть картинки, публиковать или
+    удалять — удобнее в веб-панели («Дубли»), там же вся карточка."""
+    rows = st.dedup_candidates(10)
+    if not rows:
+        await _reply(message, "Дублей на разбор нет.")
+        return
+    lines = [f"<b>Похожие на дубли</b> ({st.count_dedup_candidates()})", ""]
+    for r in rows:
+        lines.append(f"· {_e(r['title'][:80])}\n"
+                     f"  {_e(r['source'] or 'без ленты')} · похоже на пост #{r['matched_post_id']} "
+                     f"({r['score']:.0%})")
+    lines.append("\nПосмотреть картинки, опубликовать или удалить — в веб-панели, «Дубли».")
+    await _reply(message, "\n".join(lines))
+
+
 @router.message(Command("status"))
 async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> None:
     feeds = st.feeds()
@@ -1279,7 +1303,9 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
             "max_age_days", "flood_guard", "on_llm_error",
             "require_russian", "disable_preview", "images", "og_image",
             "multi_images", "max_images",
-            "keep_seen", "alert_thresholds", "free_daily_limit")
+            "keep_seen", "alert_thresholds", "free_daily_limit",
+            "dedup_enabled", "dedup_window_days", "dedup_threshold")
+    dupes = st.count_dedup_candidates()
     mode = "⏸ на паузе" if paused else "▶️ работает"
     if publisher.debug:
         mode = "🔧 отладка — посты в личку, /debug off чтобы публиковать"
@@ -1299,7 +1325,8 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
                        if publisher.gemini_mode else "выключен") + "\n"
         f"Ленты: {active} активных из {len(feeds)}"
         + (f", с ошибками: {len(errors)}" if errors else "") + "\n"
-        f"Модель: <code>{_e(llm.model)}</code>\n"
+        + (f"Дублей на разбор: {dupes} — /duplicates или веб-панель\n" if dupes else "")
+        + f"Модель: <code>{_e(llm.model)}</code>\n"
         f"Endpoint: <code>{_e(llm.endpoint)}</code>\n"
         f"Ключ LLM: {'задан' if llm.api_key else '❌ не задан'}\n\n"
         + "\n".join(f"· <code>{k}</code> = {_e(st.get(k))}" for k in keys),

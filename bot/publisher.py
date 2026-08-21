@@ -35,6 +35,25 @@ RU_ATTEMPTS = 2                # попыток добиться от модел
 # Сайт-источник и его CDN — общие: слишком широкий веер бьёт по ним не хуже,
 # чем по нам, а выигрыш по времени после ~4 параллельных запросов уже плоский.
 IMAGE_DOWNLOAD_CONCURRENCY = 4
+# Схожесть дублей (см. _find_duplicate) — заголовок и summary должны совпасть
+# хотя бы настолько каждый по отдельности, иначе на общих словах вроде
+# «анонсировала», «представила» дублями считалось бы что попало.
+DEDUP_MIN_SIGNAL = 0.25
+_DEDUP_WORD_RE = re.compile(r"[а-яёa-z0-9]+", re.I)
+
+
+def _dedup_words(text: str) -> set[str]:
+    return set(_DEDUP_WORD_RE.findall(text.lower()))
+
+
+def _dedup_similarity(a: str, b: str) -> float:
+    """Доля общих слов от объединения (индекс Жаккара) — не идеально точно,
+    зато не тянет новых зависимостей и ловит «то же событие, другими
+    словами» гораздо лучше точного совпадения ссылки/guid."""
+    wa, wb = _dedup_words(a), _dedup_words(b)
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / len(wa | wb)
 
 
 def release_memory() -> None:
@@ -225,6 +244,7 @@ class Publisher:
         self._vk_posted = 0
         self._postponed: list[tuple[str, str]] = []
         self._postponed_flood: list[tuple[int, int]] = []
+        self._postponed_dupes: list[tuple[int, str, int, float]] = []
         # Первую уборку делаем не сразу после старта, а через MAINTENANCE_EVERY.
         self._last_maintenance = time.time()
         # Взводится, когда Telegram отказал по причине, которую повтором не
@@ -350,6 +370,7 @@ class Publisher:
         self._vk_posted = 0
         self._postponed = []
         self._postponed_flood = []
+        self._postponed_dupes = []
         if self.st.get("paused") == "1":
             log.info("публикация на паузе — пропускаем проход")
             return stats
@@ -379,6 +400,8 @@ class Publisher:
             await self._report_postponed()
         if self._postponed_flood:
             await self._report_flood()
+        if self._postponed_dupes:
+            await self._report_dupes()
         if stats["published"] and self.quota:
             await self.quota.check_and_alert()
         return stats
@@ -407,6 +430,29 @@ class Publisher:
                                             parse_mode="HTML")
             except TelegramAPIError as exc:
                 log.warning("не удалось предупредить админа %s: %s", admin_id, exc)
+
+    async def _report_dupes(self) -> None:
+        """Сообщить админам про новости, отложенные как похожие на уже
+        опубликованные — они не в канале, а в очереди на ручной разбор
+        (веб-панель, «Дубли»), на случай если совпадение ложное."""
+        if not self.admin_ids:
+            return
+        lines = [f"🔁 Похоже на дубли: {len(self._postponed_dupes)} — не "
+                 f"опубликовано, ждёт разбора в веб-панели («Дубли»).", ""]
+        for feed_id, title, matched_post_id, score in self._postponed_dupes[:5]:
+            feed = self.st.feed(feed_id)
+            feed_title = (feed["title"] if feed else "") or f"лента #{feed_id}"
+            lines.append(f"· {html.escape(feed_title[:30])}: {html.escape(title[:60])} "
+                         f"— похоже на пост #{matched_post_id} ({score:.0%})")
+        lines += ["", "Совпадение ложное — новость просто интересная, а не "
+                  "дубль? Откройте «Дубли» в веб-панели и опубликуйте вручную."]
+        text = "\n".join(lines)
+        for admin_id in sorted(self.admin_ids):
+            try:
+                await self.bot.send_message(chat_id=admin_id, text=text,
+                                            parse_mode="HTML")
+            except TelegramAPIError as exc:
+                log.warning("не удалось предупредить админа %s о дублях: %s", admin_id, exc)
 
     async def _report_postponed(self) -> None:
         """Сообщить админам, что новости отложены из-за модели.
@@ -505,6 +551,7 @@ class Publisher:
             fresh = keep
 
         fresh = self._drop_stale(feed_id, fresh)
+        fresh = self._drop_duplicates(feed, fresh)
         if not first_poll:
             fresh = self._guard_flood(feed_id, fresh)
 
@@ -708,6 +755,78 @@ class Publisher:
                     "прочитанными", feed_id, len(fresh), len(keep))
         self._postponed_flood.append((feed_id, len(dropped)))
         return keep
+
+    def _find_duplicate(self, entry: Entry) -> tuple[int, float] | None:
+        """Пост за последние dedup_window_days дней, больше всего похожий на
+        entry по заголовку и summary разом — или None, если ничего не
+        дотягивает до dedup_threshold. Оба сигнала должны пройти DEDUP_MIN_SIGNAL
+        по отдельности, иначе общие слова вроде «анонсировала» жёстко
+        завышали бы схожесть у пары никак не связанных новостей.
+        """
+        days = max(1, self.st.get_int("dedup_window_days"))
+        since = int(time.time() - days * 86400)
+        best: tuple[int, float] | None = None
+        for row in self.st.recent_posts(since):
+            title_sim = _dedup_similarity(entry.title, row["title"])
+            summary_sim = _dedup_similarity(entry.summary, row["summary"])
+            if title_sim < DEDUP_MIN_SIGNAL or summary_sim < DEDUP_MIN_SIGNAL:
+                continue
+            score = (title_sim + summary_sim) / 2
+            if best is None or score > best[1]:
+                best = (row["id"], score)
+        threshold = max(1, min(100, self.st.get_int("dedup_threshold"))) / 100
+        if best is not None and best[1] >= threshold:
+            return best
+        return None
+
+    def _drop_duplicates(self, feed: sqlite3.Row, fresh: list[tuple[str, Entry]]
+                         ) -> list[tuple[str, Entry]]:
+        """Отсеивает записи, похожие на уже опубликованный пост — с другой
+        ленты или под другим guid этой же.
+
+        Разные источники часто пишут об одном и том же анонсе своими
+        словами, а точное совпадение ссылки/guid (is_seen) такое не ловит.
+        Найденный дубль не публикуется сам — уходит в очередь на ручной
+        разбор (веб-панель, «Дубли»): можно опубликовать, если совпадение
+        ложное, или удалить, если дубль настоящий.
+        """
+        if self.st.get("dedup_enabled") != "1" or not fresh:
+            return fresh
+        feed_id = feed["id"]
+        keep: list[tuple[str, Entry]] = []
+        for key, entry in fresh:
+            match = self._find_duplicate(entry)
+            if match is None:
+                keep.append((key, entry))
+                continue
+            post_id, score = match
+            self.st.mark_seen(feed_id, key)
+            self.st.add_dedup_candidate(
+                feed_id=feed_id, title=entry.title, summary=entry.summary,
+                link=entry.link, source=feed["title"] or "", published=entry.published,
+                image=entry.image, matched_post_id=post_id, score=score,
+            )
+            self._postponed_dupes.append((feed_id, entry.title, post_id, score))
+        if len(keep) < len(fresh):
+            log.info("лента #%s: похоже на дубль — %s записей отправлено на "
+                     "ручной разбор", feed_id, len(fresh) - len(keep))
+        return keep
+
+    async def publish_now(self, entry: Entry, feed: sqlite3.Row | None) -> str | None:
+        """Публикует запись немедленно, в обход обычного цикла — для дублей,
+        которые админ решил опубликовать вручную (веб-панель, «Дубли»).
+        Возвращает None при успехе, иначе текст ошибки.
+        """
+        try:
+            post = await self.build_post(entry, feed)
+        except LLMError as exc:
+            return f"Модель вернула ошибку: {exc}"
+        sent = await self._send(post.text, image=post.image, images=post.images)
+        if not sent:
+            return "Не удалось опубликовать — канал недоступен или не задан."
+        self._record_post(feed["id"] if feed else None, entry, feed, post, sent)
+        await self.send_vk(post)
+        return None
 
     async def _ask_model(self, prompt: str) -> str:
         """Ответ модели, пригодный к публикации.

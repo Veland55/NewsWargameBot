@@ -80,6 +80,25 @@ CREATE TABLE IF NOT EXISTS posts (
     edited_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_posts_posted ON posts (posted_at DESC);
+
+-- Новости, похожие на уже опубликованный пост (с другой ленты или под
+-- другим guid этой же) — не публикуются сами, ждут ручного разбора в
+-- веб-панели («Дубли»): посмотреть и опубликовать, если совпадение ложное,
+-- или удалить, если дубль настоящий. См. Publisher._drop_duplicates.
+CREATE TABLE IF NOT EXISTS dedup_candidates (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    feed_id         INTEGER,
+    title           TEXT NOT NULL DEFAULT '',
+    summary         TEXT NOT NULL DEFAULT '',
+    link            TEXT NOT NULL DEFAULT '',
+    source          TEXT NOT NULL DEFAULT '',
+    published       TEXT NOT NULL DEFAULT '',
+    image           TEXT NOT NULL DEFAULT '',
+    matched_post_id INTEGER,        -- пост, с которым засчитано совпадение (может быть уже удалён)
+    score           REAL NOT NULL DEFAULT 0,   -- итоговая схожесть 0-1, для прозрачности в интерфейсе
+    detected_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dedup_detected ON dedup_candidates (detected_at DESC);
 """
 
 DEFAULT_TEMPLATE = """\
@@ -134,6 +153,9 @@ DEFAULTS: dict[str, str] = {
     "debug": "0",              # отладка: посты уходят в личку админам, а не в канал
     "alert_thresholds": "70,90",  # при каком % расхода лимита предупреждать
     "free_daily_limit": "0",   # суточный лимит запросов; 0 = определить автоматически
+    "dedup_enabled": "1",      # не публиковать новость, похожую на уже опубликованную с другой ленты
+    "dedup_window_days": "3",  # за сколько последних дней сравнивать посты
+    "dedup_threshold": "55",   # % схожести (заголовок+summary), после которого считаем дублем
 }
 
 # Лимиты бесплатных моделей OpenRouter (значения из их документации).
@@ -462,6 +484,59 @@ class Storage:
             )
             self._conn.commit()
 
+    def recent_posts(self, since_ts: int) -> list[sqlite3.Row]:
+        """title/summary опубликованных постов за последние since_ts секунд —
+        база для сравнения на схожесть с новыми записями (см. dedup)."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT id, title, summary FROM posts WHERE posted_at >= ?", (since_ts,)
+            ).fetchall()
+
+    # --- дубли между лентами (/duplicates в веб-панели) --------------------
+    def add_dedup_candidate(self, *, feed_id: int | None, title: str, summary: str,
+                            link: str, source: str, published: str, image: str,
+                            matched_post_id: int | None, score: float) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO dedup_candidates (feed_id, title, summary, link, source, "
+                "published, image, matched_post_id, score, detected_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (feed_id, title, summary, link, source, published, image,
+                 matched_post_id, score, int(time.time())),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def dedup_candidates(self, limit: int = 50) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM dedup_candidates ORDER BY detected_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+
+    def dedup_candidate(self, candidate_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM dedup_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+
+    def delete_dedup_candidate(self, candidate_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM dedup_candidates WHERE id = ?", (candidate_id,))
+            self._conn.commit()
+
+    def count_dedup_candidates(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS n FROM dedup_candidates").fetchone()
+            return int(row["n"]) if row else 0
+
+    def prune_dedup_candidates(self, keep_days: int = 30) -> None:
+        """Дубли, которые никто не разобрал месяц, уже неактуальны — чистим,
+        чтобы очередь не росла вечно, если админ туда не заглядывает."""
+        cutoff = int(time.time() - keep_days * 86400)
+        with self._lock:
+            self._conn.execute("DELETE FROM dedup_candidates WHERE detected_at < ?", (cutoff,))
+            self._conn.commit()
+
     def drop_alerts_except(self, day: str) -> None:
         """Чистим отметки об отправленных предупреждениях за прошлые дни."""
         with self._lock:
@@ -484,6 +559,7 @@ class Storage:
         self.prune_usage(keep_usage_days)
         self.prune_page_images()
         self.prune_posts()
+        self.prune_dedup_candidates()
         with self._lock:
             # TRUNCATE возвращает файл WAL к нулю, а не просто помечает
             # содержимое переиспользуемым.
