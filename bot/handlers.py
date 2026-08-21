@@ -39,9 +39,9 @@ HELP = """<b>RSS → ИИ → канал</b>
 
 <b>Сайты без RSS-ленты</b>
 /addsite &lt;url&gt; [часть адреса статей] — добавить сайт, новые статьи находятся
-через веб-поиск, а не разбором ленты (нужны GOOGLE_SEARCH_API_KEY и
-GOOGLE_SEARCH_CSE_ID в .env — см. SETUP.md). Удобнее через веб-панель,
-раздел «Ленты» → «Сайты без RSS». Управление такое же, как у обычных
+через веб-поиск, а не разбором ленты (нужен SERPER_API_KEY в .env — см.
+SETUP.md). Удобнее через веб-панель, раздел «Ленты» → «Сайты без RSS».
+Управление такое же, как у обычных
 лент — /list, /pause, /del и т.д.
 
 <b>Опубликованные посты</b>
@@ -238,15 +238,14 @@ async def cmd_addsite(message: Message, st: Storage, publisher: Publisher) -> No
     """Сайт без RSS — новые статьи находятся через веб-поиск (см. bot/search.py),
     не разбором ленты: у многих сайтов свои средства узнать «что нового»
     (sitemap.xml, страница списка новостей) отдают устаревший из-за кэша
-    CDN снимок, поиск от этого не зависит. Нужны GOOGLE_SEARCH_API_KEY и
-    GOOGLE_SEARCH_CSE_ID в .env — см. SETUP.md, раздел «Сайты без RSS».
+    CDN снимок, поиск от этого не зависит. Нужен SERPER_API_KEY в .env —
+    см. SETUP.md, раздел «Сайты без RSS».
     """
     if publisher.search is None or not publisher.search.configured:
         await _reply(
             message,
-            "❌ Поиск не настроен — нужны <code>GOOGLE_SEARCH_API_KEY</code> и "
-            "<code>GOOGLE_SEARCH_CSE_ID</code> в .env. Как получить — SETUP.md, "
-            "раздел «Сайты без RSS».",
+            "❌ Поиск не настроен — нужен <code>SERPER_API_KEY</code> в .env. "
+            "Как получить — SETUP.md, раздел «Сайты без RSS».",
         )
         return
 
@@ -273,7 +272,7 @@ async def cmd_addsite(message: Message, st: Storage, publisher: Publisher) -> No
 
     await _reply(message, "Проверяю поиск…")
     query = f"site:{domain}{article_path}" if article_path else f"site:{domain}"
-    items, error = await publisher.search.search(query, date_restrict="w1")
+    items, error = await publisher.search.search(query)
     if error:
         await _reply(message, f"❌ Поиск не ответил: <code>{_e(error)}</code>")
         return
@@ -1457,11 +1456,11 @@ async def _last_entry(feed: sqlite3.Row, publisher: Publisher) -> tuple[Entry | 
     """
     if feed["kind"] == "search":
         if publisher.search is None or not publisher.search.configured:
-            return None, "поиск не настроен — см. GOOGLE_SEARCH_API_KEY в .env"
+            return None, "поиск не настроен — см. SERPER_API_KEY в .env"
         domain = urlsplit(feed["url"]).netloc or feed["url"].strip("/")
         path = feed["article_path"]
         query = f"site:{domain}{path}" if path else f"site:{domain}"
-        items, error = await publisher.search.search(query, date_restrict="w1")
+        items, error = await publisher.search.search(query)
         if error:
             return None, error
         items = [it for it in items if not path or path in (it.get("link") or "")]

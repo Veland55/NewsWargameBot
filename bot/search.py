@@ -7,10 +7,12 @@ warhammer-community.com sitemap.xml оказался закэширован на
 заголовки Next.js это не обходят — а поисковик индексирует те же страницы
 куда быстрее).
 
-Поиск использует Google Programmable Search Engine (Custom Search JSON
-API) — единственный практичный способ узнавать о новых страницах сайта
-независимо от того, насколько устарел кэш самого сайта. Нужен ключ API и
-id поисковой системы, см. SETUP.md.
+Поиск через Serper.dev (google.serper.dev) — обёртка над выдачей Google,
+проще в настройке, чем официальный Google Custom Search JSON API: тот
+закрыт для новых клиентов (не появляется в списке API Google Cloud даже
+после включения) и вовсе отключается 1 января 2027. У Serper — обычная
+регистрация по email, один ключ API, 2500 бесплатных запросов без карты,
+дальше ~$1 за 1000 запросов. Нужен ключ API, см. SETUP.md.
 """
 from __future__ import annotations
 
@@ -21,24 +23,19 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
-API_URL = "https://www.googleapis.com/customsearch/v1"
+API_URL = "https://google.serper.dev/search"
 TIMEOUT = 15
 
 
-class SearchError(RuntimeError):
-    pass
-
-
 class SearchClient:
-    def __init__(self, api_key: str = "", cse_id: str = "", *, timeout: int = TIMEOUT):
+    def __init__(self, api_key: str = "", *, timeout: int = TIMEOUT):
         self.api_key = (api_key or "").strip()
-        self.cse_id = (cse_id or "").strip()
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._session: aiohttp.ClientSession | None = None
 
     @property
     def configured(self) -> bool:
-        return bool(self.api_key and self.cse_id)
+        return bool(self.api_key)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -49,42 +46,38 @@ class SearchClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def search(self, query: str, date_restrict: str = "w1",
+    async def search(self, query: str, date_restrict: str = "qdr:w",
                      num: int = 10) -> tuple[list[dict], str | None]:
         """(результаты, ошибка). Результат — {title, link, snippet}, в том
         порядке, в котором их вернул поиск (примерно по релевантности —
         для запроса вида site:домен/путь без других слов это на практике
         означает «недавно проиндексированное и популярное» сперва).
 
-        date_restrict — окно свежести на стороне Google: 'd3' (3 дня),
-        'w1' (неделя) и т.п. Не даёт точную дату публикации (это не всегда
-        умеет и сам Google для произвольного сайта), только предфильтрует
-        совсем старое, чтобы не тратить на него запросы к странице статьи.
+        date_restrict — фильтр свежести на стороне поиска (параметр `tbs`
+        у Serper): 'qdr:d' — сутки, 'qdr:w' — неделя, 'qdr:m' — месяц. Не
+        даёт точную дату публикации, только предфильтрует совсем старое,
+        чтобы не тратить запросы к странице статьи на заведомо старое.
         """
         if not self.configured:
-            return [], "поиск не настроен: нет ключа API или id поисковой системы"
-        params = {
-            "key": self.api_key,
-            "cx": self.cse_id,
-            "q": query,
-            "num": str(max(1, min(10, num))),
-        }
+            return [], "поиск не настроен: нет ключа API (SERPER_API_KEY)"
+        body = {"q": query, "num": max(1, min(10, num))}
         if date_restrict:
-            params["dateRestrict"] = date_restrict
+            body["tbs"] = date_restrict
+        headers = {"X-API-KEY": self.api_key, "Content-Type": "application/json"}
         try:
             session = await self._get_session()
-            async with session.get(API_URL, params=params) as resp:
+            async with session.post(API_URL, json=body, headers=headers) as resp:
                 try:
                     data = await resp.json()
                 except (aiohttp.ContentTypeError, ValueError):
                     data = {}
                 if resp.status != 200:
-                    msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status}"
-                    return [], msg
+                    msg = data.get("message") or data.get("error") or f"HTTP {resp.status}"
+                    return [], str(msg)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             return [], f"{type(exc).__name__}: {exc}"
 
-        items = data.get("items") or []
+        items = data.get("organic") or []
         out = [
             {"title": it.get("title", "") or "", "link": it.get("link", "") or "",
              "snippet": it.get("snippet", "") or ""}

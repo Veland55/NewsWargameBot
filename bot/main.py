@@ -74,7 +74,7 @@ async def run() -> None:
     # Сайты без RSS (см. bot/search.py) находят новые статьи через веб-поиск,
     # не разбором ленты — своим средствам сайта узнать «что нового» доверять
     # нельзя, кэш CDN нередко отдаёт устаревший снимок.
-    search = SearchClient(cfg.google_search_api_key, cfg.google_search_cse_id)
+    search = SearchClient(cfg.serper_api_key)
     publisher = Publisher(bot, storage, llm, cfg.channel_id,
                           admin_ids=cfg.admin_ids, quota=quota, vk=vk, claude=claude,
                           gemini=gemini, search=search)
@@ -115,8 +115,8 @@ async def run() -> None:
         log.warning("режим Gemini включён командой, но GEMINI_API_KEY не задан — "
                     "работает обычный LLM")
     if not search.configured and any(f["kind"] == "search" for f in storage.feeds()):
-        log.warning("есть сайты без RSS (/addsite), но GOOGLE_SEARCH_API_KEY/"
-                    "GOOGLE_SEARCH_CSE_ID не заданы — они не будут опрашиваться")
+        log.warning("есть сайты без RSS (/addsite), но SERPER_API_KEY не задан — "
+                    "они не будут опрашиваться")
     if not publisher.channel:
         log.warning("канал не задан — укажите CHANNEL_ID в .env или /setchannel")
     if publisher.debug:

@@ -793,11 +793,11 @@ class Publisher:
         сам по себе, без опоры на эти даты.
         """
         if self.search is None or not self.search.configured:
-            return FetchResult(entries=[], error="поиск не настроен — см. GOOGLE_SEARCH_API_KEY в .env")
+            return FetchResult(entries=[], error="поиск не настроен — см. SERPER_API_KEY в .env")
         domain = urlsplit(feed["url"]).netloc or feed["url"].strip("/")
         path = feed["article_path"]
         query = f"site:{domain}{path}" if path else f"site:{domain}"
-        items, error = await self.search.search(query, date_restrict="w1")
+        items, error = await self.search.search(query)
         if error:
             return FetchResult(entries=[], error=error)
 

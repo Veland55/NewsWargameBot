@@ -978,13 +978,13 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if publisher.search is None or not publisher.search.configured:
             return await feeds_get(
                 request,
-                "Поиск не настроен — нужны GOOGLE_SEARCH_API_KEY и GOOGLE_SEARCH_CSE_ID "
-                "в .env. Как получить — SETUP.md, раздел «Сайты без RSS».", "err")
+                "Поиск не настроен — нужен SERPER_API_KEY в .env. Как получить — "
+                "SETUP.md, раздел «Сайты без RSS».", "err")
         domain = urlsplit(url).netloc
         if not domain:
             return await feeds_get(request, "Не разобрал домен в этой ссылке.", "err")
         query = f"site:{domain}{article_path}" if article_path else f"site:{domain}"
-        items, error = await publisher.search.search(query, date_restrict="w1")
+        items, error = await publisher.search.search(query)
         if error:
             return await feeds_get(request, f"Поиск не ответил: {error}", "err")
         if not items:
