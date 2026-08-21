@@ -41,6 +41,7 @@ HELP = """<b>RSS → ИИ → канал</b>
 /edit &lt;id&gt; — показать пост и что с ним можно сделать
 /setpost &lt;id&gt; &lt;текст&gt; — заменить текст поста вручную
 /regen &lt;id&gt; [пожелание] — перегенерировать текст через ИИ из исходной новости
+/delimage &lt;id&gt; &lt;номер&gt; — убрать одну картинку из альбома (если их больше 1)
 
 <b>Отладка</b>
 /debug on · /debug off — посты приходят в личку вместо канала
@@ -63,7 +64,7 @@ HELP = """<b>RSS → ИИ → канал</b>
 
 Картинка из новости прикладывается сама, отдельного плейсхолдера не нужно: до 1024 символов — фото с подписью, длиннее — превью над текстом. Если картинки нет в самой ленте, бот берёт её со страницы новости (og:image). Выключить: <code>/set images 0</code>, только дочитывание со страницы — <code>/set og_image 0</code>
 
-Несколько картинок альбомом вместо одной (до 10, работает при любом режиме — обычном, Claude, Gemini): <code>/set multi_images 1</code>, сколько штук — <code>/set max_images 6</code>
+Несколько картинок альбомом вместо одной (до 10, работает при любом режиме — обычном, Claude, Gemini): <code>/multiimages on</code>, сколько штук — <code>/set max_images 6</code>. Вернуть как раньше — <code>/multiimages off</code>
 
 <b>Настройки</b>
 /status — состояние бота
@@ -71,6 +72,7 @@ HELP = """<b>RSS → ИИ → канал</b>
 /interval &lt;мин&gt; — периодичность проверки
 /set &lt;ключ&gt; &lt;значение&gt; — прочие параметры (см. /status)
 /setchannel &lt;@канал|id&gt; — куда публиковать
+/multiimages — одна картинка или несколько альбомом (см. выше)
 /vk — дублирование постов в сообщество VK
 /claude — обработка через платный Claude
 /gemini — обработка через Gemini (обычно бесплатно), взаимоисключимо с Claude
@@ -658,11 +660,18 @@ async def cmd_edit(message: Message, command: CommandObject, st: Storage) -> Non
         return
     edited = (f"\nОтредактирован: {time.strftime('%d.%m %H:%M', time.localtime(row['edited_at']))}"
              if row["edited_at"] else "")
+    images_hint = ""
+    extra = st.post_extra_ids(post_id) if row["kind"] == "album" else []
+    if extra:
+        nums = ", ".join(str(n) for n in range(2, len(extra) + 2))
+        images_hint = (f"\nКартинок в альбоме: {len(extra) + 1} (№1 — с текстом поста, "
+                       f"не удаляется). Удалить одну из остальных (№{nums}): "
+                       f"<code>/delimage {row['id']} 2</code>\n")
     await _reply(
         message,
         f"<b>Пост #{row['id']}</b> [{_post_kind_label(row['kind'])}]\n"
         f"Опубликован: {time.strftime('%d.%m %H:%M', time.localtime(row['posted_at']))}"
-        f"{edited}\n"
+        f"{edited}{images_hint}\n"
         f"Источник: {_e(row['title'])}\n"
         f"<a href=\"{_e(row['link'])}\">ссылка на новость</a>\n\n"
         f"<b>Текущий текст в канале:</b>\n<pre>{_e(row['text'])}</pre>\n\n"
@@ -670,6 +679,33 @@ async def cmd_edit(message: Message, command: CommandObject, st: Storage) -> Non
         f"Перегенерировать через ИИ из исходной новости: <code>/regen {row['id']}</code> "
         f"(можно добавить пожелание: <code>/regen {row['id']} короче и без хештегов</code>)",
     )
+
+
+@router.message(Command("delimage"))
+async def cmd_delimage(message: Message, command: CommandObject, st: Storage,
+                       publisher: Publisher) -> None:
+    parts = (command.args or "").split()
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        await _reply(message, "Как использовать: <code>/delimage 42 3</code> — "
+                              "пост #42, картинка №3 (номера — из <code>/edit 42</code>)")
+        return
+    post_id, n = int(parts[0]), int(parts[1])
+    row = st.post(post_id)
+    if row is None:
+        await _reply(message, "Пост не найден.")
+        return
+    extra = st.post_extra_ids(post_id)
+    if row["kind"] != "album" or not extra:
+        await _reply(message, "В этом посте нет дополнительных картинок для удаления.")
+        return
+    if n < 2 or n - 2 >= len(extra):
+        await _reply(message, f"Такой картинки нет — доступны номера 2-{len(extra) + 1}.")
+        return
+    error = await publisher.delete_post_image(post_id, extra[n - 2])
+    if error:
+        await _reply(message, f"❌ {error}")
+        return
+    await _reply(message, f"✅ Картинка №{n} удалена из поста #{post_id}.")
 
 
 def _split_id_and_text(args: str | None) -> tuple[int | None, str]:
@@ -727,7 +763,7 @@ async def cmd_regen(message: Message, command: CommandObject, st: Storage, bot: 
 
     if not await _apply_post_edit(message, bot, st, row, text):
         return
-    await _reply(message, f"✅ Пост #{row['id']} обновлён через {backend}.\n\n"
+    await _reply(message, f"✅ Пост #{row['id']} обновлён через {_e(publisher.active_backend_label)}.\n\n"
                           f"<b>Новый текст:</b>\n<pre>{_e(text)}</pre>")
 
 
@@ -787,6 +823,40 @@ async def cmd_debug(message: Message, command: CommandObject, st: Storage,
     await _reply(message, f"Режим отладки {state}.\n"
                           f"Как использовать: <code>/debug on</code> · "
                           f"<code>/debug off</code>")
+
+
+@router.message(Command("multiimages"))
+async def cmd_multiimages(message: Message, command: CommandObject, st: Storage,
+                          publisher: Publisher) -> None:
+    """Переключатель «одна картинка, как раньше» / «несколько картинок
+    альбомом» — работает при любом режиме обработки текста, не только
+    Claude. Сам тумблер — publisher.multi_images / st.get('multi_images')."""
+    arg = (command.args or "").strip().lower()
+    if arg in ("on", "вкл", "1"):
+        st.set("multi_images", "1")
+        await _reply(
+            message,
+            f"🖼 <b>Несколько картинок включено.</b>\n\n"
+            f"Вместо одной бот качает со страницы новости до "
+            f"{_e(st.get('max_images'))} картинок и публикует альбомом — "
+            f"при любом режиме (обычном, Claude, Gemini). Дольше обычного.\n\n"
+            f"Сколько картинок: <code>/set max_images N</code> (1-10)\n"
+            f"Вернуть одну картинку, как раньше: <code>/multiimages off</code>",
+        )
+        return
+    if arg in ("off", "выкл", "0"):
+        st.set("multi_images", "0")
+        await _reply(message, "✅ Вернул одну картинку на пост, как раньше. "
+                              "Включить снова — <code>/multiimages on</code>")
+        return
+    state = "включено 🖼" if publisher.multi_images else "выключено (одна картинка, как раньше)"
+    await _reply(
+        message,
+        f"Несколько картинок в посте: {state}\n"
+        f"Штук за раз: <code>{_e(st.get('max_images'))}</code>\n\n"
+        f"<code>/multiimages on</code> · <code>/multiimages off</code> — переключить\n"
+        f"<code>/set max_images N</code> — сколько картинок (1-10)",
+    )
 
 
 VK_HELP = """<b>Публикация в VK</b>
@@ -953,8 +1023,7 @@ CLAUDE_HELP = """<b>Режим Claude</b>
 
 Промпт и формат поста — общие (/template, /format). В /usage не
 считается — свой отдельный платный счёт. Несколько картинок альбомом
-вместо одной — отдельная настройка, не завязана на Claude:
-<code>/set multi_images 1</code> (см. /help).
+вместо одной — отдельная настройка, не завязана на Claude: /multiimages
 
 <b>Команды</b>
 /claude — статус

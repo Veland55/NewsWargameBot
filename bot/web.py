@@ -1280,6 +1280,30 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         edited = (f", отредактирован {time.strftime('%d.%m %H:%M', time.localtime(row['edited_at']))}"
                  if row["edited_at"] else "")
         limit = TG_CAPTION_LIMIT if row["kind"] in ("photo", "album") else TG_LIMIT
+
+        images_card = ""
+        if row["kind"] == "album":
+            extra = st.post_extra_ids(post_id)
+            if extra:
+                rows_html = '<div class="list-item"><div class="list-item-info">' \
+                    '<div class="list-item-title">Картинка №1</div>' \
+                    '<div class="muted">С текстом поста — не удаляется</div></div></div>'
+                for i, msg_id in enumerate(extra, start=2):
+                    rows_html += f"""<div class="list-item">
+                      <div class="list-item-info"><div class="list-item-title">Картинка №{i}</div></div>
+                      <div class="list-item-actions">
+                        <form class="inline" method="post" action="/posts/{post_id}/image/{msg_id}/delete"
+                              onsubmit="return confirm('Удалить картинку №{i} из поста?')">{csrf_field(request)}
+                          <button class="icon" type="submit" title="Удалить картинку">✕</button></form>
+                      </div>
+                    </div>"""
+                images_card = f"""
+                <div class="card">
+                  <div class="muted" style="margin-bottom:8px;">Картинок в альбоме: {len(extra) + 1}</div>
+                  <div class="list">{rows_html}</div>
+                </div>
+                """
+
         body = f"""
         <div><a href="/posts" class="back-link">‹ Все посты</a></div>
         <h2 class="page-heading after-back">Пост #{row['id']} <span class="muted" style="font-weight:400;">({_kind_label(row['kind'])})</span></h2>
@@ -1294,7 +1318,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
               ({'подпись к фото' if row['kind'] in ('photo','album') else 'текстовое сообщение'})</div>
             <div class="card-actions"><button class="primary" type="submit">Сохранить в канал</button></div>
           </form>
-          <hr class="sep">
+        </div>
+        {images_card}
+        <div class="card">
           <form method="post" action="/posts/{row['id']}/regen">{csrf_field(request)}
             <label>Перегенерировать через ИИ из исходной новости</label>
             <p class="field-hint" style="margin:0 0 8px;">Пожелание необязательно. Не сохраняет сразу — покажет
@@ -1346,6 +1372,15 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             return await post_detail(request, flash=f"Модель вернула ошибку: {exc}", flash_kind="err")
         return await post_detail(request, draft=text, flash="Черновик готов — не забудьте сохранить.")
 
+    async def post_delete_image(request: web.Request) -> web.Response:
+        pub: Publisher = app["publisher"]
+        post_id = int(request.match_info["id"])
+        message_id = int(request.match_info["msg_id"])
+        error = await pub.delete_post_image(post_id, message_id)
+        if error:
+            return await post_detail(request, flash=error, flash_kind="err")
+        return await post_detail(request, flash="Картинка удалена.")
+
     async def _apply_edit(bot_: Bot, row, text: str) -> str | None:
         try:
             if row["kind"] in ("photo", "album"):
@@ -1393,6 +1428,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_get("/posts/{id}", post_detail)
     app.router.add_post("/posts/{id}/save", post_save)
     app.router.add_post("/posts/{id}/regen", post_regen)
+    app.router.add_post("/posts/{id}/image/{msg_id}/delete", post_delete_image)
 
     return app
 

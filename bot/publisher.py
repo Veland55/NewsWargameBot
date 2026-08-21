@@ -196,8 +196,9 @@ def render(template: str, values: dict[str, str], escape: bool) -> str:
 class Post:
     text: str
     image: str = ""
-    # Несколько картинок (режим Claude) — уже скачанные байты, не ссылки:
-    # Telegram лучше принимает файл, чем адрес за нестабильным CDN источника.
+    # Несколько картинок (/set multi_images 1) — уже скачанные байты, не
+    # ссылки: Telegram лучше принимает файл, чем адрес за нестабильным CDN
+    # источника.
     images: list[tuple[bytes, str]] = field(default_factory=list)
     link: str = ""      # адрес новости — вложение для VK, если фото нечем грузить
 
@@ -606,6 +607,31 @@ class Publisher:
         limit = TG_CAPTION_LIMIT if row["kind"] in ("photo", "album") else TG_LIMIT
         return _shorten(render(post_format, {**raw_values, "ai": ai_text}, escape=True), limit)
 
+    async def delete_post_image(self, post_id: int, message_id: int) -> str | None:
+        """Удаляет одну картинку из уже опубликованного альбома (>1 картинки).
+
+        Первая картинка (с подписью-текстом поста) так не удаляется — без
+        неё пост потерял бы текст, а перенести подпись на другую картинку
+        Telegram не даёт. Убрать можно только вторую и далее.
+
+        Возвращает None при успехе, иначе текст ошибки для показа админу.
+        """
+        row = self.st.post(post_id)
+        if row is None:
+            return "Пост не найден."
+        if message_id not in self.st.post_extra_ids(post_id):
+            return "Такой картинки в этом посте нет — возможно, уже удалена."
+        try:
+            await self.bot.delete_message(chat_id=row["chat_id"], message_id=message_id)
+        except TelegramBadRequest as exc:
+            if "message to delete not found" not in str(exc).lower():
+                return f"Telegram отказал: {exc}"
+            # Сообщение и так уже не существует (удалили вручную) — у себя всё равно чистим.
+        except TelegramAPIError as exc:
+            return f"Ошибка Telegram: {exc}"
+        self.st.remove_post_extra_id(post_id, message_id)
+        return None
+
     def _record_post(self, feed_id: int, entry: Entry, feed: sqlite3.Row | None,
                      post: Post, sent: "Message | list[Message]") -> None:
         """Запоминает опубликованный пост — чтобы его можно было найти и
@@ -629,6 +655,10 @@ class Publisher:
             source=(feed["title"] if feed and feed["title"] else "") or "RSS",
             published=entry.published,
             text=post.text,
+            # Остальные картинки альбома — только их message_id, у подписи
+            # (в тексте поста) есть лишь первая; хранится для точечного
+            # удаления отдельной картинки (/delimage, веб-панель).
+            extra_message_ids=",".join(str(m.message_id) for m in messages[1:]),
         )
 
     def _drop_stale(self, feed_id: int, fresh: list[tuple[str, Entry]]

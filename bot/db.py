@@ -72,6 +72,10 @@ CREATE TABLE IF NOT EXISTS posts (
     source     TEXT NOT NULL DEFAULT '',
     published  TEXT NOT NULL DEFAULT '',
     text       TEXT NOT NULL DEFAULT '',   -- текущий текст поста, каким он сейчас в канале
+    -- message_id второй и следующих картинок альбома (первая — message_id
+    -- выше, у неё подпись), через запятую. Только у kind='album'; позволяет
+    -- удалить отдельную картинку из уже опубликованного альбома.
+    extra_message_ids TEXT NOT NULL DEFAULT '',
     posted_at  INTEGER NOT NULL,
     edited_at  INTEGER
 );
@@ -170,6 +174,7 @@ class Storage:
         """
         added: dict[str, list[tuple[str, str]]] = {
             "feeds": [("pending", "INTEGER NOT NULL DEFAULT 0")],
+            "posts": [("extra_message_ids", "TEXT NOT NULL DEFAULT ''")],
         }
         for table, columns in added.items():
             have = {
@@ -382,14 +387,14 @@ class Storage:
     # --- опубликованные посты (/posts, /edit, /setpost, /regen) -----------
     def add_post(self, *, feed_id: int | None, chat_id: str, message_id: int,
                 kind: str, title: str, summary: str, link: str, source: str,
-                published: str, text: str) -> int:
+                published: str, text: str, extra_message_ids: str = "") -> int:
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO posts (feed_id, chat_id, message_id, kind, title, "
-                "summary, link, source, published, text, posted_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "summary, link, source, published, text, extra_message_ids, posted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (feed_id, chat_id, message_id, kind, title, summary, link,
-                 source, published, text, int(time.time())),
+                 source, published, text, extra_message_ids, int(time.time())),
             )
             self._conn.commit()
             return int(cur.lastrowid)
@@ -405,6 +410,40 @@ class Storage:
             return self._conn.execute(
                 "SELECT * FROM posts WHERE id = ?", (post_id,)
             ).fetchone()
+
+    def post_extra_ids(self, post_id: int) -> list[int]:
+        """message_id второй и следующих картинок альбома, по порядку.
+        Пустой список — не альбом или в нём осталась только первая картинка."""
+        row = self.post(post_id)
+        if row is None or not row["extra_message_ids"]:
+            return []
+        return [int(x) for x in row["extra_message_ids"].split(",") if x]
+
+    def remove_post_extra_id(self, post_id: int, message_id: int) -> bool:
+        """Убирает одну картинку из списка альбома после её удаления в Telegram.
+
+        Если картинок в альбоме после этого не осталось, пост становится
+        обычным «фото» — первая картинка со своей подписью никуда не делась,
+        разницы в редактировании между 'photo' и 'album' всё равно нет.
+        Возвращает True, если id действительно был в списке.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT extra_message_ids, kind FROM posts WHERE id = ?", (post_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            ids = [int(x) for x in (row["extra_message_ids"] or "").split(",") if x]
+            if message_id not in ids:
+                return False
+            ids.remove(message_id)
+            new_kind = "photo" if not ids and row["kind"] == "album" else row["kind"]
+            self._conn.execute(
+                "UPDATE posts SET extra_message_ids = ?, kind = ?, edited_at = ? WHERE id = ?",
+                (",".join(str(i) for i in ids), new_kind, int(time.time()), post_id),
+            )
+            self._conn.commit()
+            return True
 
     def update_post_text(self, post_id: int, text: str) -> None:
         with self._lock:
