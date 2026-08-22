@@ -208,25 +208,38 @@ class WebAuth:
 # десктопные удобства (таблицы вместо карточек и т.п.) сверху.
 STYLE = """
 :root {
-  color-scheme: dark; --tg-top: 0px; --tg-bottom: 0px; --nav-h: 60px; --side-w: 216px;
-  --bg: #100f14; --bg-alt: #16151d; --card: #1a1922; --card-hover: #201f2a;
-  --border: #2a2836; --border-soft: #232230;
-  --text: #eceaf3; --text-dim: #9490a6; --text-faint: #8a86a0;
-  --accent: #ffb648; --accent-dim: #3a2f1c;
-  --blue: #6d8dff; --blue-dim: #22284a; --blue-hover: #7f9bff;
-  --green: #52d989; --green-dim: #142a1f; --green-text: #a4f0c0;
-  --amber: #e0a730; --amber-dim: #332510;
-  --red: #ff6b6b; --red-dim: #34191c; --red-border: #5a2a2e; --red-hover: #4a2226; --red-text: #ffb4b4;
-  --gray-dim: #24232f; --gray: #9490a6;
-  --btn-hover: #2a2938; --btn-border-hover: #3a3850;
-  --field-bg: #0c0b10; --on-blue: #0d1020;
-  --radius: 14px; --radius-sm: 9px;
+  color-scheme: dark; --tg-top: 0px; --tg-bottom: 0px; --nav-h: 60px; --side-w: 204px;
+  /* Палитра — тёмный терминал: почти-чёрный с еле заметным зелёным подтоном,
+     фосфорно-зелёный (--accent/--green) под «включено»/бренд, терминальный
+     циан (--blue, имя сохранено — на нём завязана логика акцентных кнопок/
+     фокуса/ссылок) под интерактив, янтарь/красный — предупреждение/ошибка. */
+  --bg: #070a08; --bg-alt: #0c1210; --card: #101815; --card-hover: #16201b;
+  --border: #213228; --border-soft: #19241d;
+  --text: #dcefe0; --text-dim: #8fac97; --text-faint: #69836f;
+  --accent: #4ade80; --accent-dim: #132818;
+  --blue: #42d4e0; --blue-dim: #0e262a; --blue-hover: #6fe0ea;
+  --green: #4ade80; --green-dim: #132818; --green-text: #a3f5c0;
+  --amber: #e8b13a; --amber-dim: #2f2410;
+  --red: #ff6b6b; --red-dim: #301316; --red-border: #4a2226; --red-hover: #3d181b; --red-text: #ffb4b4;
+  --gray-dim: #182019; --gray: #84998b;
+  --btn-hover: #182219; --btn-border-hover: #2c4033;
+  --field-bg: #040605; --on-blue: #03211f;
+  --radius: 8px; --radius-sm: 5px;
+  --font: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  background: var(--bg); color: var(--text); margin: 0; font-size: 15px;
-  line-height: 1.45;
+  font-family: var(--font);
+  background-color: var(--bg);
+  /* Скан-линии — статичный узор, не анимация: печатается один раз в фон,
+     ничего не двигается и не мигает, так что рендеру он ничего не стоит.
+     Видно его только там, где не легли непрозрачные карточки/шапка/меню —
+     то есть в зазорах между ними, лёгким намёком на ЭЛТ-текстуру. */
+  background-image: repeating-linear-gradient(to bottom,
+    rgba(74, 222, 128, .035) 0px, rgba(74, 222, 128, .035) 1px,
+    transparent 1px, transparent 3px);
+  color: var(--text); margin: 0; font-size: 14.5px;
+  line-height: 1.5;
   /* место под фиксированное нижнее меню на телефоне, см. .bottom-nav */
   padding-bottom: calc(var(--nav-h) + 14px + var(--tg-bottom));
 }
@@ -249,25 +262,34 @@ header {
   position: sticky; top: 0; z-index: 10;
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
 }
-header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+header h1 { font-size: 15.5px; margin: 0; font-weight: 600; letter-spacing: .2px; }
 header .page-title { display: none; }
+header .page-title::before { content: "$ "; color: var(--accent); }
 header .logout button { padding: 7px 13px; font-size: 12.5px; }
 /* Боковое меню — только на широком экране, см. .side-nav display в media-запросе. */
 .side-nav {
   display: none; flex-direction: column; width: var(--side-w); flex-shrink: 0;
   background: var(--bg-alt); border-right: 1px solid var(--border-soft);
-  padding: 18px 12px; position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  padding: 16px 10px; position: sticky; top: 0; height: 100vh; overflow-y: auto;
 }
-.side-brand { display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: 15px;
-              padding: 4px 8px 20px; }
+.side-brand { display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: 14.5px;
+              padding: 4px 8px 18px; letter-spacing: .2px; }
 .side-links { display: flex; flex-direction: column; gap: 2px; flex: 1; }
 .side-nav .nav-link {
-  display: flex; align-items: center; gap: 11px; padding: 10px 11px; border-radius: var(--radius-sm);
-  color: var(--text-dim); text-decoration: none; font-size: 13.5px; transition: background .12s, color .12s;
+  display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: var(--radius-sm);
+  color: var(--text-dim); text-decoration: none; font-size: 13px; transition: background .12s, color .12s;
 }
-.side-nav .nav-link .ic { font-size: 16px; line-height: 1; }
+.side-nav .nav-link .ic { font-size: 15px; line-height: 1; }
 .side-nav .nav-link:hover { background: var(--card-hover); color: var(--text); }
 .side-nav .nav-link.active { background: var(--accent-dim); color: var(--accent); font-weight: 600; }
+/* Мигающий курсор у активного пункта меню — единственная непрерывная
+   анимация в теме, и та только здесь: один маленький блок, период почти
+   1.5с, только на широком экране (на телефоне бокового меню нет вовсе). */
+.side-nav .nav-link.active::after {
+  content: ""; width: 6px; height: 12px; margin-left: auto; flex-shrink: 0;
+  background: var(--accent); animation: cursor-blink 1.4s steps(1, end) infinite;
+}
+@keyframes cursor-blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
 .side-logout { margin-top: 10px; }
 .side-logout button { width: 100%; justify-content: flex-start; padding-left: 11px; }
 /* Нижнее меню на телефоне — дотягивается большим пальцем при работе одной
@@ -288,50 +310,53 @@ header .logout button { padding: 7px 13px; font-size: 12.5px; }
 main { max-width: 1000px; margin: 16px auto; padding: 0 14px; }
 main.wide { max-width: 1180px; }
 /* h2 — настоящий заголовок раздела (не декоративная ярлычная строка):
-   крупнее и контрастнее обычного текста, без акцентного цвета — золотой
-   зарезервирован только под бренд/активную вкладку, иначе взгляд цепляется
-   за заголовки, а не за сами элементы управления. */
-h2 { font-size: 20px; color: var(--text); font-weight: 700; margin: 30px 0 12px; letter-spacing: -.2px; }
+   крупнее и контрастнее обычного текста, без акцентного цвета для самого
+   текста — фосфорный зелёный зарезервирован под бренд/активную вкладку,
+   иначе взгляд цепляется за заголовки, а не за сами элементы управления.
+   Префикс «$ » — единственный явный привет терминалу в типографике:
+   статичный псевдоэлемент, ничего не стоит на рендере. */
+h2 { font-size: 18.5px; color: var(--text); font-weight: 700; margin: 24px 0 10px; letter-spacing: -.1px; }
+h2::before { content: "$ "; color: var(--accent); }
 /* Якорные переходы (например дашборд → #duplicates) иначе утыкаются
    заголовком прямо под залипающую шапку — застревает, накрытый ей. */
 h2[id] { scroll-margin-top: calc(76px + var(--tg-top)); }
 h2:first-child { margin-top: 4px; }
 /* h3 — подзаголовок группы полей внутри карточки, нарочно тише и мельче h2,
    чтобы иерархия читалась с одного взгляда. */
-h3 { font-size: 11px; color: var(--text-faint); margin: 0 0 10px; font-weight: 600;
-     text-transform: uppercase; letter-spacing: .5px; padding-bottom: 6px; border-bottom: 1px solid var(--border-soft); }
-.section-hint { color: var(--text-faint); font-size: 13px; margin: -6px 0 12px; }
+h3 { font-size: 10.5px; color: var(--text-faint); margin: 0 0 8px; font-weight: 600;
+     text-transform: uppercase; letter-spacing: .5px; padding-bottom: 5px; border-bottom: 1px solid var(--border-soft); }
+.section-hint { color: var(--text-faint); font-size: 12.5px; margin: -5px 0 10px; }
 .card {
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
-  padding: 15px 16px; margin-bottom: 12px;
+  padding: 13px 14px; margin-bottom: 10px;
 }
 .card.scroll { overflow-x: auto; }
-.card + h2 { margin-top: 30px; }
-.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+.card + h2 { margin-top: 24px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
 .row > * { flex: 1 1 220px; }
 .row > button, .row > .btn { flex: 0 1 auto; }
 .row:last-child { margin-bottom: 0; }
 /* Строки полей формы (число+подпись+подсказка) — низ полей на одной линии,
    даже если у соседних подписи разной длины и переносятся по-разному. */
-.field-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 14px; }
+.field-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 12px; }
 .field-row:last-child { margin-bottom: 0; }
 .field-row > * { flex: 1 1 220px; }
 .field { min-width: 0; }
 /* Простая строка «подпись: значение» — не форма, без flex-разъезда полей */
-.line { margin-bottom: 8px; line-height: 1.6; }
+.line { margin-bottom: 6px; line-height: 1.6; }
 .line:last-child { margin-bottom: 0; }
-label { display: block; font-size: 12px; color: var(--text-dim); font-weight: 500;
-        letter-spacing: .2px; margin-bottom: 4px; min-height: 15px; }
+label { display: block; font-size: 11.5px; color: var(--text-dim); font-weight: 500;
+        letter-spacing: .2px; margin-bottom: 3px; min-height: 14px; }
 label .unit { font-weight: 400; color: var(--text-faint); }
-.field-hint { color: var(--text-faint); font-size: 11.5px; margin: 4px 0 0; }
+.field-hint { color: var(--text-faint); font-size: 11px; margin: 3px 0 0; }
 input[type=text], input[type=password], input[type=number], textarea, select {
-  background: var(--field-bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px;
-  padding: 10px 11px; font-size: 16px; width: 100%; font-family: inherit; transition: border-color .12s;
+  background: var(--field-bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+  padding: 9px 10px; font-size: 16px; width: 100%; font-family: inherit; transition: border-color .12s, box-shadow .12s;
 }
-input:focus, textarea:focus, select:focus { outline: none; border-color: var(--blue); }
+input:focus, textarea:focus, select:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue); }
 code {
-  background: var(--field-bg); border: 1px solid var(--border-soft); border-radius: 5px;
-  padding: 1px 6px; font-family: ui-monospace, "SF Mono", monospace; font-size: .9em; color: var(--blue-hover);
+  background: var(--field-bg); border: 1px solid var(--border-soft); border-radius: 4px;
+  padding: 1px 6px; font-family: var(--font); font-size: .9em; color: var(--blue-hover);
 }
 pre code { background: none; border: none; padding: 0; color: inherit; }
 /* font-size меньше 16px в полях ввода — Safari на iOS зумит страницу при фокусе */
@@ -339,24 +364,25 @@ pre code { background: none; border: none; padding: 0; color: inherit; }
    под конкретную страницу — здесь только запасной размер на случай, если он
    не отработал. На широком экране скрипт этого не делает (см. скрипт) —
    там высотой управляет только rows= в разметке плюс ручной resize. */
-textarea { min-height: 45vh; resize: vertical; font-family: ui-monospace, monospace; font-size: 14px; }
+textarea { min-height: 45vh; resize: vertical; font-family: var(--font); font-size: 13.5px; }
 button, .btn {
   background: var(--card-hover); color: var(--text); border: 1px solid var(--border);
-  border-radius: 9px; padding: 11px 16px; font-size: 14px; cursor: pointer;
+  border-radius: var(--radius-sm); padding: 11px 16px; font-size: 13.5px; cursor: pointer;
   min-height: 42px; display: inline-flex; align-items: center; justify-content: center;
   gap: 6px; text-decoration: none; transition: background .12s, border-color .12s, transform .06s;
+  font-family: inherit;
 }
 button:hover, .btn:hover { background: var(--btn-hover); border-color: var(--btn-border-hover); }
 button:active, .btn:active { transform: scale(.98); }
-button.primary { background: var(--blue); border-color: var(--blue); color: var(--on-blue); font-weight: 600; }
+button.primary { background: var(--blue); border-color: var(--blue); color: var(--on-blue); font-weight: 700; }
 button.primary:hover { background: var(--blue-hover); }
 button.danger { background: var(--red-dim); border-color: var(--red-border); color: var(--red); }
 button.danger:hover { background: var(--red-hover); }
 button.icon, .btn.icon { min-height: 38px; min-width: 38px; padding: 6px; font-size: 15px; flex: 0 0 auto; }
-.card-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+.card-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
 .link-btn {
-  background: none; border: none; color: var(--text-faint); font-size: 12.5px; padding: 6px 2px;
-  min-height: auto; text-decoration: underline; text-underline-offset: 2px;
+  background: none; border: none; color: var(--text-faint); font-size: 12px; padding: 6px 2px;
+  min-height: auto; text-decoration: underline; text-underline-offset: 2px; font-family: inherit;
 }
 .link-btn:hover { background: none; color: var(--text-dim); }
 /* Ссылка «назад» — не второстепенное действие вроде сброса поля, а обычный
@@ -364,25 +390,30 @@ button.icon, .btn.icon { min-height: 38px; min-width: 38px; padding: 6px; font-s
    отключённая/посещённая ссылка. */
 .back-link {
   display: inline-flex; align-items: center; gap: 4px; color: var(--text-dim);
-  text-decoration: none; font-size: 13px; margin-bottom: 4px;
+  text-decoration: none; font-size: 12.5px; margin-bottom: 4px;
 }
 .back-link:hover { color: var(--text); text-decoration: underline; }
 h2.page-heading.after-back { margin-top: 6px; }
-.pill { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 600; }
+/* Прямоугольные бейджи-теги вместо скруглённых «пилюль» — читаются как
+   лог-метки уровня терминала ([OK]/[WARN]), не требуя лишних символов
+   в самом тексте, который приходит из Python (менять его не нужно). */
+.pill { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 10.5px; font-weight: 700;
+        text-transform: uppercase; letter-spacing: .3px; }
 .pill.on { background: var(--green-dim); color: var(--green); }
 .pill.off { background: var(--red-dim); color: var(--red); }
 .pill.warn { background: var(--amber-dim); color: var(--amber); }
 .pill.neutral { background: var(--gray-dim); color: var(--gray); }
-.flash { padding: 12px 14px; border-radius: var(--radius-sm); margin-bottom: 16px; font-size: 14px; }
-.flash.ok { background: var(--green-dim); color: var(--green-text); }
-.flash.err { background: var(--red-dim); color: var(--red-text); }
+.flash { padding: 10px 13px; border-radius: var(--radius-sm); margin-bottom: 14px; font-size: 13.5px;
+         border-left: 3px solid transparent; }
+.flash.ok { background: var(--green-dim); color: var(--green-text); border-left-color: var(--green); }
+.flash.err { background: var(--red-dim); color: var(--red-text); border-left-color: var(--red); }
 .muted { color: var(--text-dim); font-size: 12.5px; }
-.mono { font-family: ui-monospace, "SF Mono", monospace; font-size: 12.5px; overflow-wrap: anywhere; }
+.mono { font-family: var(--font); font-size: 12.5px; overflow-wrap: anywhere; }
 .mono.ellipsis { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
 pre.post { white-space: pre-wrap; word-break: break-word; background: var(--field-bg); border: 1px solid var(--border);
-           border-radius: var(--radius-sm); padding: 10px 12px; font-size: 13px; }
+           border-radius: var(--radius-sm); padding: 9px 11px; font-size: 12.5px; }
 form.inline { display: inline; }
-hr.sep { border: none; border-top: 1px solid var(--border-soft); margin: 16px 0; }
+hr.sep { border: none; border-top: 1px solid var(--border-soft); margin: 14px 0; }
 /* <details>/<summary> без родного треугольника браузера — свой шеврон,
    который разворачивается при открытии. */
 summary.disclosure {
@@ -392,52 +423,56 @@ summary.disclosure {
 summary.disclosure::-webkit-details-marker { display: none; }
 summary.disclosure::before { content: "›"; display: inline-block; transition: transform .12s; font-weight: 700; }
 details[open] > summary.disclosure::before { transform: rotate(90deg); }
-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-td, th { text-align: left; padding: 7px 6px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+td, th { text-align: left; padding: 6px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
 table.kv td:first-child { color: var(--text-dim); white-space: nowrap; padding-right: 20px; width: 1%; }
 /* Списки (ленты, посты) — карточка-контейнер один раз снаружи, строки внутри
    разделены волосяными линиями, а не вложенными собственными рамками —
    иначе получаются рамка в рамке и повторный фон-«приподнятие». */
 .list { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
 .list-item {
-  display: flex; align-items: center; gap: 10px; padding: 13px 16px;
+  display: flex; align-items: center; gap: 10px; padding: 11px 14px;
   border-bottom: 1px solid var(--border-soft); transition: background .12s;
   color: inherit; text-decoration: none;
 }
 a.list-item:hover { background: var(--card-hover); }
 .list-item:last-child { border-bottom: none; }
 .list-item-info { flex: 1 1 auto; min-width: 0; }
-.list-item-title { color: var(--text); font-size: 14px; overflow-wrap: break-word; }
+.list-item-title { color: var(--text); font-size: 13.5px; overflow-wrap: break-word; }
 .list-item-actions { display: flex; gap: 6px; flex-shrink: 0; align-items: center; }
 .list-item-chevron { color: var(--text-faint); font-size: 18px; flex-shrink: 0; }
+.dupe-thumb { width: 64px; height: 64px; border-radius: var(--radius-sm); flex-shrink: 0; }
 /* Дашборд: сетка карточек-метрик вместо списка строк «подпись: значение» —
    легче окинуть взглядом состояние бота целиком. */
-.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(170px, 100%), 1fr)); gap: 10px;
-             margin-bottom: 12px; }
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(170px, 100%), 1fr)); gap: 8px;
+             margin-bottom: 10px; }
 .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
-             padding: 13px 14px; display: flex; flex-direction: column; justify-content: space-between; min-height: 72px; }
-.stat-card .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: .3px;
-                          color: var(--text-faint); margin-bottom: 7px; }
-.stat-card .stat-value { font-size: 14.5px; color: var(--text); overflow-wrap: anywhere; }
+             padding: 11px 13px; display: flex; flex-direction: column; justify-content: space-between; min-height: 64px; }
+.stat-card .stat-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .3px;
+                          color: var(--text-faint); margin-bottom: 6px; }
+.stat-card .stat-value { font-size: 14px; color: var(--text); overflow-wrap: anywhere; }
 .hero-card {
   background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--green);
-  border-radius: var(--radius); padding: 18px; margin-bottom: 14px;
+  border-radius: var(--radius); padding: 15px 16px; margin-bottom: 12px;
   display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
 }
 .hero-card.paused { border-left-color: var(--amber); }
 .hero-card.debug { border-left-color: var(--blue); }
-.hero-card .hero-state { font-size: 20px; font-weight: 700; display: flex; align-items: center; gap: 9px; }
-.hero-card .hero-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
+.hero-card .hero-state { font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 9px; }
+.hero-card .hero-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
 .hero-card.paused .hero-dot { background: var(--amber); }
 .hero-card.debug .hero-dot { background: var(--blue); }
-.hero-card .hero-sub { color: var(--text-dim); font-size: 12.5px; margin-top: 4px; }
+.hero-card .hero-sub { color: var(--text-dim); font-size: 12px; margin-top: 3px; }
 /* Выбор ИИ-бэкенда в настройках — три варианта в виде селектируемых строк
-   вместо трёх отдельных карточек-дублей с одинаковой формой включения. */
+   вместо трёх отдельных карточек-дублей с одинаковой формой включения.
+   .ai-options — общий контейнер (см. settings_get): на узком экране просто
+   оборачивает список, на широком превращает три строки в три колонки. */
+.ai-options { display: block; }
 .ai-option {
-  display: grid; grid-template-columns: 16px 1fr; gap: 4px 11px; align-items: start;
-  padding: 12px; border-radius: var(--radius-sm); position: relative; cursor: pointer;
-  border: 1px solid var(--border); margin-bottom: 8px; transition: border-color .12s, background .12s;
-  min-height: 56px;
+  display: grid; grid-template-columns: 16px 1fr; gap: 4px 10px; align-items: start;
+  padding: 10px 11px; border-radius: var(--radius-sm); position: relative; cursor: pointer;
+  border: 1px solid var(--border); margin-bottom: 7px; transition: border-color .12s, background .12s;
+  min-height: 50px;
 }
 .ai-option:hover { border-color: var(--btn-border-hover); background: var(--card-hover); }
 .ai-option input[type=radio] { accent-color: var(--blue); width: 16px; height: 16px; margin-top: 2px; cursor: pointer; }
@@ -445,18 +480,23 @@ a.list-item:hover { background: var(--card-hover); }
    область клика на всю карточку поверх остального содержимого. */
 .ai-option-label { min-width: 0; cursor: pointer; align-self: center; }
 .ai-option-label::after { content: ""; position: absolute; inset: 0; }
-.ai-option-title { font-size: 14px; color: var(--text); display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.ai-option-title { font-size: 13.5px; color: var(--text); display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.ai-option-title .mono { white-space: nowrap; }
 .ai-option:has(input:checked) { border-color: var(--blue); background: var(--blue-dim); }
 /* Переключатели («Поведение» в параметрах публикации) — подпись+подсказка
-   справа от чекбокса, весь ряд кликабелен целиком. */
-.toggle-row { display: flex; align-items: flex-start; gap: 9px; margin-bottom: 12px; cursor: pointer; }
+   справа от чекбокса, весь ряд кликабелен целиком. .toggle-grid — тот же
+   приём, что у .ai-options: на широком экране раскладывает переключатели
+   в две колонки вместо длинного одного столбца. */
+.toggle-grid { display: block; }
+.toggle-row { display: flex; align-items: flex-start; gap: 9px; margin-bottom: 10px; cursor: pointer; }
 .toggle-row:last-child { margin-bottom: 0; }
 .toggle-row input[type=checkbox] { margin-top: 3px; width: 16px; height: 16px; flex-shrink: 0; accent-color: var(--blue); }
-.toggle-title { color: var(--text); font-size: 13.5px; }
-/* Группы полей в «Параметры публикации» — на широком экране раскладываются
-   по колонкам, на узком идут одна под другой. */
+.toggle-title { color: var(--text); font-size: 13px; }
+/* Группы полей в «Параметры публикации» — на узком идут одна под другой;
+   на широком (см. media ниже) складываются в две газетные колонки, чтобы
+   раздел «Настройки» помещался в экран без прокрутки. */
 .field-groups { display: block; }
-.settings-group { margin-bottom: 18px; }
+.settings-group { margin-bottom: 14px; }
 .settings-group:last-child { margin-bottom: 0; }
 @media (max-width: 640px) {
   /* Инлайновые flex:2/flex:1 в формах (например «Ленты» — url шире названия)
@@ -480,18 +520,64 @@ a.list-item:hover { background: var(--card-hover); }
   .bottom-nav { display: none; }
   body { padding-bottom: 0; }
   header .logout { display: none; }
-  header { padding-left: 24px; padding-right: 24px; }
+  header { padding: 9px 20px; }
   header h1.brand-mobile { display: none; }
   header .page-title { display: block; }
   /* На узком экране это единственный заголовок страницы (в шапке — только
      бренд), поэтому там он нужен; на широком его дублирует page-title в
      шапке — второй раз просто не рендерим. */
   h2.page-heading { display: none; }
-  main { padding: 0 24px; margin: 26px auto; }
-  .card { padding: 17px 20px; }
+  main { padding: 0 20px; margin: 14px auto; }
+  .card { padding: 12px 15px; }
   .row > * { flex: 1 1 auto; }
-  .field-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 4px 28px; align-items: start; }
-  .content-grid, .settings-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px; align-items: start; }
+  /* Плотность на широком экране — вторая (после самих отступов) главная
+     мера, которой раздел «Настройки» умещается в экран без прокрутки:
+     input/textarea/select без ограничения в 16px (актуального только для
+     iOS Safari — на десктопе зума при фокусе нет), кнопки и карточки-строки
+     компактнее, чем в мобильной раскладке. */
+  input[type=text], input[type=password], input[type=number], select { font-size: 13px; padding: 7px 9px; }
+  button, .btn { min-height: 32px; padding: 7px 12px; }
+  button.icon, .btn.icon { min-height: 28px; min-width: 28px; }
+  .list-item { padding: 8px 14px; }
+  .stat-card { padding: 9px 12px; min-height: 56px; }
+  .hero-card { padding: 12px 15px; }
+  .ai-option { padding: 8px 10px; min-height: auto; margin-bottom: 0; }
+  /* Первый вариант (обычная модель, без сноски про отсутствующий ключ) —
+     во всю ширину сверху, Claude/Gemini — по половине под ним. Три равные
+     колонки в один ряд были слишком узкими: подпись с моделью и пометкой
+     «платно»/«бесплатно» переносилась на 2-3 строки и раздувала карточку. */
+  .ai-options { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+  .ai-options .ai-option:first-child { grid-column: 1 / -1; }
+  .toggle-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 24px; }
+  .toggle-row { margin-bottom: 6px; }
+  /* Каждая группа настроек (см. GENERAL_GROUPS) — на всю ширину карточки,
+     поля внутри неё в один ряд (.field-row и так flex-wrap, а на всю ширину
+     широкого экрана 3-4 поля умещаются без переноса). Раньше здесь была
+     сетка узких колонок-групп — из-за неё поля внутри каждой группы
+     наоборот складывались в высокий столбец, это было заметно выше. */
+  .field-groups { display: block; }
+  .settings-group { margin-bottom: 8px; }
+  .settings-group .field-row { margin-bottom: 0; }
+  .settings-group h3 { margin-bottom: 6px; }
+  /* Подсказка под полем — в одну строку с многоточием вместо 1-2 строк:
+     на мобильном имеет смысл читать её целиком сразу, на широком — соседние
+     поля в ряду и так на виду, а полный текст всегда доступен по наведению
+     (title=, задан в settings_get). Экономит по вертикали ощутимо, потому
+     что несколько полей в разделе «Настройки» иначе разъезжаются на 2
+     строки подсказки из-за длины текста. */
+  .settings-group .field-hint {
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: help;
+  }
+  /* Список лент/сайтов без RSS — на широком экране в две колонки (см.
+     .list-grid в feeds_get), иначе список из скольких-нибудь лент один
+     не даёт разделу поместиться на экране без прокрутки. Правая колонка —
+     с вертикальным разделителем вместо второй рамки, чтобы не задваивать
+     обводку внутри уже обведённого .list. */
+  .list.list-grid { display: grid; grid-template-columns: 1fr 1fr; }
+  .list.list-grid .list-item:nth-child(odd) { border-right: 1px solid var(--border-soft); }
+  .list.list-grid .list-item:last-child { border-right: none; }
+  .dupe-thumb { width: 44px; height: 44px; }
+  .content-grid, .settings-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 0 22px; align-items: start; }
   /* Промпт и формат — сознательно парная пара карточек рядом; тянем их до
      одной высоты, чтобы кнопки под ними не разъезжались на разных уровнях. */
   .content-grid { align-items: stretch; }
@@ -499,6 +585,19 @@ a.list-item:hover { background: var(--card-hover); }
   .content-grid .card { display: flex; flex-direction: column; flex: 1; }
   .content-grid .card form { display: flex; flex-direction: column; flex: 1; }
   .content-grid textarea { flex: 1; }
+  /* «Канал» — короткая форма (одно поле) рядом с более длинной «Обработка
+     новостей» (три варианта): без растягивания карточка с одним полем
+     заканчивается на середине высоты соседней, оставляя пустой разрыв под
+     собой — тот же приём растягивания, что у .content-grid, только кнопку
+     внутри карточки не выталкивает вверх/вниз, а прижимает к низу
+     (margin-top:auto), оставляя воздух между полем и кнопкой внутри рамки
+     карточки — так короткая форма визуально уравнивается с высокой, а не
+     висит обрубком. */
+  .settings-columns { align-items: stretch; }
+  .settings-columns > div { display: flex; flex-direction: column; }
+  .settings-columns .card { display: flex; flex-direction: column; flex: 1; }
+  .settings-columns .card form { display: flex; flex-direction: column; flex: 1; }
+  .settings-columns .card-actions { margin-top: auto; padding-top: 12px; }
   /* На телефоне textarea растягивает JS (autosizeTextareas) под весь экран —
      там это единственный удобный способ редактировать длинный текст пальцем.
      На широком экране места достаточно и без этого: высоту задаёт rows= в
@@ -866,10 +965,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             matched = r["matched_post_id"] in matched_ids
             matched_html = (f'<a href="/posts/{r["matched_post_id"]}">пост #{r["matched_post_id"]}</a>'
                             if matched else f'пост #{r["matched_post_id"]} (уже удалён)')
-            thumb = (f'<img src="{_safe_href(r["image"])}" alt="" '
-                    f'style="width:64px; height:64px; object-fit:cover; border-radius:8px; flex-shrink:0;">'
-                    if r["image"] else '<div style="width:64px; height:64px; border-radius:8px; '
-                    'background:var(--field-bg); flex-shrink:0;"></div>')
+            thumb = (f'<img class="dupe-thumb" src="{_safe_href(r["image"])}" alt="" '
+                    f'style="object-fit:cover;">'
+                    if r["image"] else '<div class="dupe-thumb" style="background:var(--field-bg);"></div>')
             when = time.strftime("%d.%m %H:%M", time.localtime(r["detected_at"]))
             items += f"""<div class="list-item">
               {thumb}
@@ -954,7 +1052,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             </form>
           </div>
         </details>
-        <div class="list" style="margin-top:10px;">{rss_list}</div>
+        <div class="list list-grid" style="margin-top:10px;">{rss_list}</div>
 
         <h2>Сайты без RSS <span class="muted" style="font-weight:400;">({len(search_rows)})</span></h2>
         <div class="section-hint">Новости с сайтов, где нет RSS-ленты — находятся через веб-поиск, а не
@@ -979,7 +1077,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             </form>
           </div>
         </details>
-        <div class="list" style="margin-top:10px;">{search_list}</div>
+        <div class="list list-grid" style="margin-top:10px;">{search_list}</div>
         """
         return web.Response(text=_layout("Ленты", body, flash, flash_kind, active="/feeds"), content_type="text/html")
 
@@ -1205,9 +1303,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         pub: Publisher = app["publisher"]
 
         def field(key: str, label: str, unit: str, hint: str) -> str:
+            # title=hint — на широком экране .field-hint обрезается в одну
+            # строку (иначе разнобой в высоте подсказок раздувает раздел
+            # «Настройки» по вертикали), полный текст всплывает по наведению.
             return (f'<div class="field"><label>{_e(label)} <span class="unit">({_e(unit)})</span></label>'
                     f'<input type="text" name="{_e(key)}" value="{_e(st.get(key))}">'
-                    f'<div class="field-hint">{_e(hint)}</div></div>')
+                    f'<div class="field-hint" title="{_e(hint)}">{_e(hint)}</div></div>')
 
         groups_html = "".join(
             f'<div class="settings-group"><h3>{_e(group)}</h3><div class="field-row">'
@@ -1276,7 +1377,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         <div class="section-hint">Активен только один вариант — выбор переключает сразу.</div>
         <div class="card">
           <form method="post" action="/settings/ai">{csrf_field(request)}
-            {ai_options_html}
+            <div class="ai-options">{ai_options_html}</div>
             <div class="card-actions"><button class="primary" type="submit">Сохранить</button></div>
           </form>
         </div>
@@ -1287,8 +1388,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         <div class="card">
           <form method="post" action="/settings/general">{csrf_field(request)}
             <div class="field-groups">{groups_html}</div>
-            <h3 style="margin-top:18px;">Поведение</h3>
-            {toggles_html}
+            <h3 style="margin-top:14px;">Поведение</h3>
+            <div class="toggle-grid">{toggles_html}</div>
             <div class="card-actions"><button class="primary" type="submit">Сохранить</button></div>
           </form>
         </div>
