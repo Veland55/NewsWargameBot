@@ -693,7 +693,8 @@ def _redirect(path: str) -> web.HTTPFound:
 
 # ======================== приложение ========================
 def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
-               admin_ids: set[int] | None = None) -> web.Application:
+               admin_ids: set[int] | None = None, secure_cookies: bool = False
+               ) -> web.Application:
     auth = WebAuth(password)
     admin_ids = admin_ids or set()
     app = web.Application()
@@ -701,6 +702,17 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app["st"] = storage
     app["publisher"] = publisher
     app["bot"] = bot
+    # SameSite=Lax (без Secure) — обычный браузер по прямому https/http-адресу.
+    # SameSite=None+Secure — когда панель открыта как Telegram Mini App
+    # (WEB_PANEL_PUBLIC_URL задан, Telegram требует https для WebApp URL):
+    # встроенный вебвью, особенно у десктопного клиента, не всегда считает
+    # переход на "/" после fetch-запроса тем же сайтом для целей SameSite=Lax
+    # — кука тогда просто не долетает до следующего запроса, авторизация не
+    # закрепляется, и /login открывается заново (в этот момент сбрасывая
+    # то, что уже успели напечатать в поле пароля — выглядит как «сбрасывается
+    # при вводе», хотя на деле это была молчаливая гонка редиректов).
+    app["cookie_kwargs"] = ({"samesite": "None", "secure": True} if secure_cookies
+                            else {"samesite": "Lax"})
 
     PUBLIC_PATHS = {"/login", "/tg-login"}
 
@@ -743,13 +755,13 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         auth.record_success(ip)
         token = auth.new_session()
         resp = _redirect("/")
-        resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="Lax")
+        resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, **app["cookie_kwargs"])
         return resp
 
     async def logout_post(request: web.Request) -> web.Response:
         auth.revoke(request.cookies.get(SESSION_COOKIE))
         resp = _redirect("/login")
-        resp.del_cookie(SESSION_COOKIE)
+        resp.del_cookie(SESSION_COOKIE, **app["cookie_kwargs"])
         return resp
 
     async def tg_login_post(request: web.Request) -> web.Response:
@@ -769,7 +781,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             return web.json_response({"ok": False, "error": "not_admin"}, status=403)
         token = auth.new_session()
         resp = web.json_response({"ok": True})
-        resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="Lax")
+        resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, **app["cookie_kwargs"])
         return resp
 
     # --- статус -------------------------------------------------------------
@@ -1645,9 +1657,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
 async def run_web_panel(storage: Storage, publisher: Publisher, bot: Bot,
                         password: str, port: int, host: str = "0.0.0.0",
-                        admin_ids: set[int] | None = None
+                        admin_ids: set[int] | None = None, secure_cookies: bool = False
                         ) -> tuple[web.AppRunner, web.TCPSite]:
-    app = create_app(storage, publisher, bot, password, admin_ids=admin_ids)
+    app = create_app(storage, publisher, bot, password, admin_ids=admin_ids,
+                     secure_cookies=secure_cookies)
     runner = web.AppRunner(app, access_log=log)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
