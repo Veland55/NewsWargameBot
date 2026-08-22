@@ -664,13 +664,24 @@ def _login_page(error: str = "") -> str:
   var tg = window.Telegram && window.Telegram.WebApp;
   if (!tg || !tg.initData) return;
   document.getElementById('tgLoginNote').style.display = 'block';
-  fetch('/tg-login', {{
-    method: 'POST', headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{initData: tg.initData}})
-  }}).then(function (r) {{
-    if (r.ok) {{ location.href = '/'; }}
+  // На десктопном клиенте Telegram fetch() к /tg-login иногда подвисает
+  // навсегда (ни then, ни catch не срабатывают) — плашка «Вхожу через
+  // Telegram…» тогда висит бесконечно, закрывая доступ к полю пароля.
+  // Таймаут — подстраховка от любого такого зависания, не только этого.
+  var settled = false;
+  function finish(ok) {{
+    if (settled) return;
+    settled = true;
+    if (ok) {{ location.href = '/'; }}
     else {{ document.getElementById('tgLoginNote').style.display = 'none'; }}
-  }}).catch(function () {{ document.getElementById('tgLoginNote').style.display = 'none'; }});
+  }}
+  setTimeout(function () {{ finish(false); }}, 6000);
+  try {{
+    fetch('/tg-login', {{
+      method: 'POST', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{initData: tg.initData}})
+    }}).then(function (r) {{ finish(r.ok); }}).catch(function () {{ finish(false); }});
+  }} catch (e) {{ finish(false); }}
 }})();
 </script>
 </body></html>"""
