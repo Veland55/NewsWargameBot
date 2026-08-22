@@ -1,6 +1,7 @@
 """Команды управления ботом (только для админов из ADMIN_IDS)."""
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import sqlite3
@@ -1489,9 +1490,18 @@ async def _last_entry(feed: sqlite3.Row, publisher: Publisher) -> tuple[Entry | 
         items = [it for it in items if not path or path in (it.get("link") or "")]
         if not items:
             return None, "поиск ничего не нашёл за последнюю неделю"
-        full = await fetch_article_entry(items[0]["link"], time.time(), "")
-        if full is None:
-            return None, "не удалось прочитать страницу статьи"
+        # items[0] — первый по релевантности поиска, не обязательно самый
+        # свежий (Serper ранжирует не строго по дате — вчерашняя, но более
+        # популярная статья вполне может обойти сегодняшнюю). Дочитываем все
+        # найденные страницы разом (это разовая ручная команда, не
+        # автоцикл — можно не жалеть чужой сайт) и берём самую свежую по
+        # настоящей дате публикации со страницы (fetch_article_entry).
+        candidates = await asyncio.gather(
+            *(fetch_article_entry(it["link"], time.time(), "") for it in items))
+        found = [c for c in candidates if c is not None]
+        if not found:
+            return None, "не удалось прочитать ни одну из найденных страниц"
+        full = max(found, key=lambda e: e.published_ts)
         return full, None
 
     result = await fetch(feed["url"])

@@ -627,6 +627,28 @@ async def fetch(url: str, etag: str | None = None, modified: str | None = None) 
 # свежими.
 ARTICLE_FETCH_TIMEOUT = 20
 _TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+# datePublished из JSON-LD Article (schema.org) — общепринятая разметка у
+# новостных сайтов, не специфична для конкретного источника. Ищем по всей
+# странице, не только в <head>: на практике этот блок нередко лежит в теле
+# страницы (проверено на warhammer-community.com).
+_JSONLD_DATE_RE = re.compile(r'"datePublished"\s*:\s*"([^"]+)"', re.I)
+
+
+def _parse_iso_date(raw: str) -> float | None:
+    """ISO 8601 (только дата или дата+время, с таймзоной или без) → unix ts,
+    либо None, если формат не разобрать. Дата без времени — предполагаем
+    полночь UTC: не идеально точно, но для сравнения «что новее» между
+    статьями одного дня разница в часы неважна."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
 async def _fetch_text(url: str, headers: dict | None = None) -> tuple[int, str] | None:
@@ -650,6 +672,13 @@ async def fetch_article_entry(url: str, published_ts: float, published: str) -> 
     даёт только адрес (см. bot/search.py), остальное только на странице
     самой новости. None — страница не прочиталась или на ней нет заголовка
     (не статья — например снятая с публикации страница).
+
+    `published_ts`/`published` — то, что передал вызывающий код (обычно
+    синтетическая метка по порядку выдачи поиска, см. Publisher._fetch_search
+    и его комментарий). Если на странице статьи нашёлся datePublished —
+    подменяем на настоящую дату: поиск ранжирует по релевантности, а не по
+    свежести, и первый результат выдачи может оказаться вчерашней, но более
+    popular статьёй, а не сегодняшней — так уже бывало на практике.
     """
     got = await _fetch_text(url, {"User-Agent": PAGE_UA})
     if got is None:
@@ -657,6 +686,11 @@ async def fetch_article_entry(url: str, published_ts: float, published: str) -> 
     status, page = got
     if status != 200:
         return None
+
+    if m := _JSONLD_DATE_RE.search(page):
+        real_ts = _parse_iso_date(m.group(1))
+        if real_ts is not None:
+            published_ts = real_ts
 
     head_end = page.lower().find("</head")
     head = page[:head_end] if head_end != -1 else page
