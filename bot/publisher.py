@@ -589,20 +589,33 @@ class Publisher:
             fresh.append((key, entry))
 
         first_poll = self.st.seen_count(feed_id) == 0
-        if first_poll and fresh:
-            # Первый опрос новой ленты: не заваливаем канал историей —
-            # помечаем архив прочитанным и берём только последние backfill записей.
+
+        def backfill_slice(fresh: list[tuple[str, Entry]]) -> list[tuple[str, Entry]]:
+            """Первый опрос новой ленты: не заваливаем канал историей —
+            помечаем архив прочитанным и берём только последние backfill
+            записей. Обязательно вызывать по УЖЕ настоящей хронологии (для
+            search — после hydrate, см. ниже), иначе «оставить последние N»
+            режет не по дате, а по тому порядку, что был в fresh на тот
+            момент — для search это раньше был порядок выдачи поиска
+            (релевантность/популярность), и раскрученная, но более старая
+            статья вытесняла объективно более новую, которая просто ниже
+            ранжируется у поисковика. Отрезанная так статья потом навсегда
+            остаётся отмеченной прочитанной и никогда не публикуется —
+            баг был не разовым сбоем, а тихой потерей конкретных новостей."""
+            if not (first_poll and fresh):
+                return fresh
             backfill = max(0, self.st.get_int("backfill"))
             keep = fresh[len(fresh) - backfill:] if backfill else []
             skipped = fresh[: len(fresh) - len(keep)]
             if skipped:
                 self.st.mark_seen(feed_id, [k for k, _ in skipped])
             log.info("лента #%s: первый опрос, пропущено %s записей", feed_id, len(skipped))
-            fresh = keep
+            return keep
 
         if kind != "search":
+            fresh = backfill_slice(fresh)
             fresh = self._drop_stale(feed_id, fresh)
-        if kind == "search":
+        else:
             # flood_guard — до дочитывания страниц, не после: иначе сбитая
             # выдача поиска обернулась бы лишними запросами к сайту-
             # источнику ради записей, которые всё равно отсеются. На этом
@@ -613,11 +626,13 @@ class Publisher:
                 fresh = self._guard_flood(feed_id, fresh)
             # После дочитывания страниц у записей появляется настоящая дата
             # публикации (fetch_article_entry достаёт datePublished со
-            # страницы статьи) — только теперь max_age_days можно применять
-            # осмысленно, раньше (по синтетическим датам) фильтр был бы
-            # пустышкой.
+            # страницы статьи) и список пересортирован по ней — только
+            # теперь backfill/max_age_days можно применять осмысленно,
+            # раньше (по синтетическому порядку выдачи) оба были бы по сути
+            # лотереей вместо «оставить настоящие последние N».
             fresh = await self._hydrate_search_entries(fresh)
             fresh = self._drop_stale(feed_id, fresh)
+            fresh = backfill_slice(fresh)
         fresh = self._drop_duplicates(feed, fresh)
         if not first_poll and kind != "search":
             fresh = self._guard_flood(feed_id, fresh)
