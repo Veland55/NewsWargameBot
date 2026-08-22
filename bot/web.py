@@ -223,17 +223,23 @@ STYLE = """
   --radius: 14px; --radius-sm: 9px;
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-html { overflow-x: hidden; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  background: var(--bg); color: var(--text); margin: 0; overflow-x: hidden; font-size: 15px;
+  background: var(--bg); color: var(--text); margin: 0; font-size: 15px;
   line-height: 1.45;
   /* место под фиксированное нижнее меню на телефоне, см. .bottom-nav */
   padding-bottom: calc(var(--nav-h) + 14px + var(--tg-bottom));
 }
 :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .shell { display: flex; min-height: 100vh; }
-.main-col { flex: 1 1 auto; min-width: 0; }
+/* overflow-x:hidden — сознательно тут, а не на html/body: если задан только
+   overflow-x, браузер обязан «повысить» overflow-y до auto (правило
+   вычисления overflow CSS-спеки), а это делает элемент новым скролл-
+   контейнером — position:sticky у .side-nav (соседний элемент, не потомок
+   .main-col) внутри такого контейнера перестаёт цепляться за реальный
+   вьюпорт и просто едет вместе со страницей. На html/body тот же
+   overflow-x:hidden ломал боковое меню именно поэтому. */
+.main-col { flex: 1 1 auto; min-width: 0; overflow-x: hidden; }
 /* Верхняя шапка — на телефоне это единственная навигационная точка (бренд +
    выход), на широком экране бренд уже есть в боковом меню и там же выход,
    поэтому шапка превращается в узкую строку с названием текущей страницы. */
