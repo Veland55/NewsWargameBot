@@ -366,7 +366,19 @@ MAX_ARTICLE_IMAGES = 6
 # 3. CHROME_CONTEXT_HINTS — точечные подстраховки под конкретные названия
 #    классов виджетов, которых не бывает у landmark-тегов и ссылок.
 LANDMARK_TAGS = ("header", "nav", "footer", "aside")
-CHROME_URL_HINTS = ("/wp-content/themes/", "gravatar.com", "/wp-includes/")
+CHROME_URL_HINTS = (
+    "/wp-content/themes/", "gravatar.com", "/wp-includes/",
+    # warhammer-community.com: карточки виджета «читать также по теме» —
+    # ссылка на них уже закрыта (</a>) к моменту <img>, анкорную проверку
+    # не проходит (см. комментарий в _body_images), только по URL и ловится.
+    "explore-more-cards",
+    # То же самое: логотипы разделов сайта (уголок каждой карточки «читать
+    # также», плюс флаг локали в шапке) — общие статичные картинки в корне
+    # assets-хоста, лежат не под /articles/, ни к одной статье не относятся.
+    "assets.warhammer-community.com/uk-flag.png",
+    "assets.warhammer-community.com/warhammer40000.png",
+    "assets.warhammer-community.com/warhammerageofsigmar.png",
+)
 CHROME_CONTEXT_HINTS = (
     "breaking-news", "breaking-thumb", "entry-preview", "post-preview",
     "article-card", "blog__post", "related-post", "related_post",
@@ -374,6 +386,10 @@ CHROME_CONTEXT_HINTS = (
     "trending", "popular-post", "widget", "sidebar", "mega-menu",
     "comment-respond", "author-bio", "author-box", "newsletter",
     "social-share", "share-buttons",
+    # warhammer-community.com: декоративный баннер раздела (Age of Sigmar /
+    # 40k / Kill Team...) в шапке статьи — тот же для всех статей раздела,
+    # не имеет отношения к конкретной новости.
+    "gamesystemshero",
 )
 _CONTEXT_WINDOW = 500
 
