@@ -23,7 +23,8 @@ from .quota import Quota
 from .rss import (Entry, FetchResult, download_image, fetch,
                   fetch_article_entry, image_dedup_key, page_image,
                   page_images, strip_html)
-from .search import SearchClient, domain_of, site_query
+from .search import (BingNewsClient, SearchClient, domain_of,
+                     merge_search_results, site_query)
 from .vk import VKClient, VKError, to_plain
 
 log = logging.getLogger(__name__)
@@ -229,7 +230,8 @@ class Publisher:
     def __init__(self, bot: Bot, storage: Storage, llm: LLMClient, default_channel: str,
                  admin_ids: set[int] | None = None, quota: "Quota | None" = None,
                  vk: "VKClient | None" = None, claude: "ClaudeClient | None" = None,
-                 gemini: "LLMClient | None" = None, search: "SearchClient | None" = None):
+                 gemini: "LLMClient | None" = None, search: "SearchClient | None" = None,
+                 bing: "BingNewsClient | None" = None):
         self.bot = bot
         self.st = storage
         self.llm = llm
@@ -240,6 +242,7 @@ class Publisher:
         self.quota = quota
         self.vk = vk
         self.search = search
+        self.bing = bing
         self._wake = asyncio.Event()
         self._running = False
         # /checknow и фоновый цикл не должны опрашивать ленты одновременно —
@@ -838,39 +841,77 @@ class Publisher:
         self._postponed_flood.append((feed_id, len(dropped)))
         return keep
 
+    async def search_articles(self, domain: str, path: str) -> tuple[list[dict], str | None]:
+        """Кандидаты в статьи с сайта без RSS — от ВСЕХ настроенных
+        источников поиска разом, слитые в один список без дублей по ссылке
+        (см. search.merge_search_results). Используют оба места, которым
+        нужен список статей сайта: автоцикл (_fetch_search ниже) и ручные
+        команды (handlers._last_entry для /test и др., cmd_addsite,
+        web.feeds_add_search) — раньше туда ходил только Serper, теперь то
+        же самое видят все точки входа, а не только автопубликация.
+
+        Serper (google.serper.dev, платный после бесплатного лимита) и Bing
+        News RSS (bing.com/news/search, бесплатный публичный RSS без ключа)
+        запрашиваются оба — они индексируют сайты независимо и с разной
+        задержкой, проверено на практике: конкретную свежую статью на
+        warhammer-community.com Serper/Google ещё не видел вообще, а Bing
+        News уже отдавал первой в выдаче с точной датой публикации. Один
+        источник может не знать сайт вовсе, ошибиться или оказаться
+        недоступен — ошибка возвращается, только если ОБА источника
+        подвели; если хотя бы один дал результат, до него дело не доходит.
+        """
+        query = site_query(domain, path)
+        errors: list[str] = []
+        results: list[list[dict]] = []
+
+        if self.search is not None and self.search.configured:
+            items, error = await self.search.search(query)
+            if error:
+                errors.append(f"Serper: {error}")
+            else:
+                results.append(items)
+
+        if self.bing is not None:
+            items, error = await self.bing.search(query)
+            if error:
+                errors.append(f"Bing: {error}")
+            else:
+                results.append(items)
+
+        if not results:
+            return [], "; ".join(errors) or "поиск не настроен"
+        return merge_search_results(*results), None
+
     async def _fetch_search(self, feed: sqlite3.Row) -> FetchResult:
         """Источник без RSS: новые статьи ищем через веб-поиск (bot/search.py)
         вместо разбора ленты — сайт может отдавать устаревший кэш на
         собственных страницах со списком новостей, поиск от этого не
         зависит (см. SETUP.md, раздел «Сайты без RSS», история вопроса).
 
-        Google/Serper не даёт точную дату публикации в самой выдаче — здесь
-        применяем только окно свежести `dateRestrict` на стороне поиска (за
-        последнюю неделю) и раздаём псевдо-даты по порядку самой выдачи
-        (первая строго новее второй и т.д.), просто чтобы список был хоть
-        как-то отсортирован до дочитывания страниц. Выдача ранжирована по
-        релевантности, а не по свежести — эти даты ненадёжны как признак
-        «что новее» (вчерашняя, но более популярная статья может обойти
+        Часть источников поиска (Bing) отдаёт настоящую дату публикации
+        прямо в выдаче — её используем как есть. У кого нет (Serper) —
+        раздаём псевдо-даты по порядку самой выдачи (первая строго новее
+        второй и т.д.), просто чтобы список был хоть как-то отсортирован до
+        дочитывания страниц. Выдача поисковика ранжирована по релевантности,
+        а не по свежести — эти псевдо-даты ненадёжны как признак «что
+        новее» (вчерашняя, но более популярная статья может обойти
         сегодняшнюю). Настоящую дату _hydrate_search_entries() достаёт со
         страницы самой статьи (fetch_article_entry, datePublished) и
         пересортировывает список по ней — псевдо-даты отсюда живут только
         до этого момента. is_seen решает вопрос повторов сам по себе, без
         опоры на даты вообще.
         """
-        if self.search is None or not self.search.configured:
-            return FetchResult(entries=[], error="поиск не настроен — см. SERPER_API_KEY в .env")
         path = feed["article_path"]
-        query = site_query(domain_of(feed["url"]), path)
-        items, error = await self.search.search(query)
+        items, error = await self.search_articles(domain_of(feed["url"]), path)
         if error:
             return FetchResult(entries=[], error=error)
 
         now = time.time()
         entries: list[Entry] = []
         seen_links: set[str] = set()
-        # Первый результат выдачи — самый релевантный (для голого site:-запроса
-        # это обычно самое новое/популярное) — а Entry везде в этом коде идут
-        # от старых к новым, поэтому разворачиваем порядок.
+        # Порядок исходной выдачи — от самого релевантного к наименее (для
+        # голого site:-запроса это обычно свежее/популярнее сперва), а Entry
+        # везде в этом коде идут от старых к новым, поэтому разворачиваем.
         for i, item in enumerate(reversed(items)):
             link = item.get("link") or ""
             if not link or (path and path not in link):
@@ -878,7 +919,9 @@ class Publisher:
             if link in seen_links:
                 continue
             seen_links.add(link)
-            ts = now - (len(items) - i)
+            ts = item.get("published_ts")
+            if ts is None:
+                ts = now - (len(items) - i)
             entries.append(Entry(key_parts=(link,), title="", link=link, summary="",
                                  published="", published_ts=ts, image=""))
         return FetchResult(entries=entries)

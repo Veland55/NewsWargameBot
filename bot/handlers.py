@@ -238,17 +238,19 @@ async def cmd_add(message: Message, st: Storage, publisher: Publisher) -> None:
 
 @router.message(Command("addsite"))
 async def cmd_addsite(message: Message, st: Storage, publisher: Publisher) -> None:
-    """Сайт без RSS — новые статьи находятся через веб-поиск (см. bot/search.py),
-    не разбором ленты: у многих сайтов свои средства узнать «что нового»
-    (sitemap.xml, страница списка новостей) отдают устаревший из-за кэша
-    CDN снимок, поиск от этого не зависит. Нужен SERPER_API_KEY в .env —
-    см. SETUP.md, раздел «Сайты без RSS».
+    """Сайт без RSS — новые статьи находятся через веб-поиск (см. bot/search.py,
+    Serper + Bing News разом), не разбором ленты: у многих сайтов свои
+    средства узнать «что нового» (sitemap.xml, страница списка новостей)
+    отдают устаревший из-за кэша CDN снимок, поиск от этого не зависит.
+    Bing News работает без ключа всегда; Serper — если задан SERPER_API_KEY
+    в .env (см. SETUP.md, раздел «Сайты без RSS») — не обязателен, но
+    расширяет охват.
     """
-    if publisher.search is None or not publisher.search.configured:
+    if publisher.bing is None and (publisher.search is None or not publisher.search.configured):
         await _reply(
             message,
-            "❌ Поиск не настроен — нужен <code>SERPER_API_KEY</code> в .env. "
-            "Как получить — SETUP.md, раздел «Сайты без RSS».",
+            "❌ Поиск недоступен ни одним из источников. Проверьте "
+            "<code>SERPER_API_KEY</code> в .env — см. SETUP.md, раздел «Сайты без RSS».",
         )
         return
 
@@ -275,7 +277,7 @@ async def cmd_addsite(message: Message, st: Storage, publisher: Publisher) -> No
 
     await _reply(message, "Проверяю поиск…")
     query = site_query(domain, article_path)
-    items, error = await publisher.search.search(query)
+    items, error = await publisher.search_articles(domain, article_path)
     if error:
         await _reply(message, f"❌ Поиск не ответил: <code>{_e(error)}</code>")
         return
@@ -1480,11 +1482,10 @@ async def _last_entry(feed: sqlite3.Row, publisher: Publisher) -> tuple[Entry | 
     Возвращает (запись, None) или (None, текст ошибки).
     """
     if feed["kind"] == "search":
-        if publisher.search is None or not publisher.search.configured:
-            return None, "поиск не настроен — см. SERPER_API_KEY в .env"
+        if publisher.bing is None and (publisher.search is None or not publisher.search.configured):
+            return None, "поиск недоступен — ни Bing, ни SERPER_API_KEY в .env"
         path = feed["article_path"]
-        query = site_query(domain_of(feed["url"]), path)
-        items, error = await publisher.search.search(query)
+        items, error = await publisher.search_articles(domain_of(feed["url"]), path)
         if error:
             return None, error
         items = [it for it in items if not path or path in (it.get("link") or "")]

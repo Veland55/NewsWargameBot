@@ -1106,16 +1106,16 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if not url.startswith(("http://", "https://")):
             return await feeds_get(request, "Нужна ссылка, начинающаяся на http:// или https://", "err")
         publisher: Publisher = app["publisher"]
-        if publisher.search is None or not publisher.search.configured:
+        if publisher.bing is None and (publisher.search is None or not publisher.search.configured):
             return await feeds_get(
                 request,
-                "Поиск не настроен — нужен SERPER_API_KEY в .env. Как получить — "
-                "SETUP.md, раздел «Сайты без RSS».", "err")
+                "Поиск недоступен ни одним из источников. Проверьте SERPER_API_KEY в .env "
+                "— см. SETUP.md, раздел «Сайты без RSS».", "err")
         domain = urlsplit(url).netloc
         if not domain:
             return await feeds_get(request, "Не разобрал домен в этой ссылке.", "err")
         query = site_query(domain, article_path)
-        items, error = await publisher.search.search(query)
+        items, error = await publisher.search_articles(domain, article_path)
         if error:
             return await feeds_get(request, f"Поиск не ответил: {error}", "err")
         if not items:

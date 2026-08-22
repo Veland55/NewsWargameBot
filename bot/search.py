@@ -17,8 +17,9 @@ warhammer-community.com sitemap.xml оказался закэширован на
 from __future__ import annotations
 
 import asyncio
+import calendar
 import logging
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import aiohttp
 
@@ -94,9 +95,153 @@ class SearchClient:
             return [], f"{type(exc).__name__}: {exc}"
 
         items = data.get("organic") or []
+        # published_ts=None — Serper не даёт даты в самой выдаче вообще;
+        # настоящую дату достаём позже со страницы статьи (см.
+        # rss.fetch_article_entry, JSON-LD datePublished). Поле здесь только
+        # для единообразия формата с BingNewsClient.search() ниже — там
+        # дата есть уже в самой выдаче.
         out = [
             {"title": it.get("title", "") or "", "link": it.get("link", "") or "",
-             "snippet": it.get("snippet", "") or ""}
+             "snippet": it.get("snippet", "") or "", "published_ts": None}
             for it in items if it.get("link")
         ]
         return out, None
+
+
+BING_NEWS_URL = "https://www.bing.com/news/search"
+BING_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+def _unwrap_bing_link(raw: str) -> str:
+    """<link> в Bing News RSS — редирект через apiclick.aspx с настоящим
+    адресом статьи в параметре url= (percent-encoded); без разворачивания
+    в базу лёг бы адрес трекера, а не статьи."""
+    query = urlsplit(raw).query
+    real = parse_qs(query).get("url", [""])[0]
+    return unquote(real) if real else raw
+
+
+def _parse_bing_rss(body: str) -> list[dict]:
+    """Разбор RSS 2.0 от Bing News — свой мини-парсер, не feedparser: тут
+    нужны только title/link/pubDate/description, а Bing иногда отдаёт
+    невалидный (не по спеке) XML в description, на котором feedparser
+    иногда спотыкается сильнее, чем терпимый к неточностям regex-разбор."""
+    import html as _html
+    import re
+
+    out: list[dict] = []
+    for m in re.finditer(r"<item>(.*?)</item>", body, re.S):
+        chunk = m.group(1)
+
+        def tag(name: str) -> str:
+            mm = re.search(rf"<{name}>(.*?)</{name}>", chunk, re.S)
+            if not mm:
+                return ""
+            text = mm.group(1).strip()
+            if text.startswith("<![CDATA[") and text.endswith("]]>"):
+                text = text[9:-3]
+            # XML экранирует спецсимволы в тексте (&amp; и т.п.) — без
+            # unescape строка вида "...&amp;url=..." не режется на
+            # query-параметры: parse_qs ищёт буквальный "&", а не "&amp;".
+            return _html.unescape(text)
+
+        link = _unwrap_bing_link(tag("link"))
+        if not link:
+            continue
+        ts: float | None = None
+        pub_date = tag("pubDate")
+        if pub_date:
+            try:
+                import email.utils
+                parsed = email.utils.parsedate_tz(pub_date)
+                if parsed is not None:
+                    ts = email.utils.mktime_tz(parsed)
+            except (TypeError, ValueError):
+                ts = None
+        out.append({
+            "title": tag("title"),
+            "link": link,
+            "snippet": tag("description"),
+            "published_ts": ts,
+        })
+    return out
+
+
+class BingNewsClient:
+    """Bing News RSS-поиск (bing.com/news/search?...&format=RSS) — тот же
+    смысл, что у SearchClient (обнаружение новых статей для сайтов без
+    RSS), но: бесплатно и без ключа (обычный публичный RSS-эндпоинт, не
+    официальный платный API), и на практике индексирует некоторые статьи
+    заметно быстрее обычной веб-выдачи Google/Serper — проверено на живом
+    случае: свежую статью на warhammer-community.com, которую Serper ещё не
+    видел вообще, Bing News уже отдавал первой в выдаче, с точной датой
+    публикации прямо в pubDate. Используется ВМЕСТЕ с SearchClient
+    (Publisher._fetch_search сливает оба источника), не вместо — Bing может
+    не индексировать какой-то конкретный сайт вовсе или сам оказаться
+    временно недоступен, а Serper для него уже настроен и оплачен.
+
+    Не документированный официально API, а страница, которую отдаёт обычный
+    браузер — расплата за бесплатность: может измениться формат ответа или
+    начать банить по User-Agent/частоте без предупреждения. Если это
+    случится, бот просто продолжит работать на одном Serper, как раньше
+    (см. обработку ошибок в _fetch_search — сбой одного источника не роняет
+    весь опрос ленты).
+    """
+
+    def __init__(self, *, timeout: int = TIMEOUT):
+        self._timeout = aiohttp.ClientTimeout(total=timeout)
+        self._session: aiohttp.ClientSession | None = None
+
+    @property
+    def configured(self) -> bool:
+        return True
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=self._timeout)
+        return self._session
+
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def search(self, query: str) -> tuple[list[dict], str | None]:
+        """(результаты, ошибка). Результат — {title, link, snippet,
+        published_ts} — published_ts берётся из pubDate самой выдачи, в
+        отличие от Serper тут не нужно ждать хидрации страницы статьи,
+        чтобы узнать настоящую дату (хидрация всё равно происходит дальше
+        по конвейеру за заголовком/картинкой, и JSON-LD со страницы, если
+        найдётся, всё равно её уточнит/переопределит — см.
+        rss.fetch_article_entry)."""
+        headers = {"User-Agent": BING_UA}
+        try:
+            session = await self._get_session()
+            async with session.get(BING_NEWS_URL, params={"q": query, "format": "RSS"},
+                                   headers=headers) as resp:
+                if resp.status != 200:
+                    return [], f"HTTP {resp.status}"
+                body = await resp.text()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            return [], f"{type(exc).__name__}: {exc}"
+
+        items = await asyncio.to_thread(_parse_bing_rss, body)
+        return items, None
+
+
+def merge_search_results(*sources: list[dict]) -> list[dict]:
+    """Сливает результаты нескольких источников поиска в один список без
+    дублей по ссылке — сначала все записи первого источника (в его
+    порядке), затем новые (по ссылке) записи следующих. Конкретный источник
+    может молчать (ошибка/пустая выдача) без вреда остальным — вызывающий
+    код передаёт уже пустой список для него."""
+    out: list[dict] = []
+    seen_links: set[str] = set()
+    for items in sources:
+        for item in items:
+            link = item.get("link") or ""
+            if not link or link in seen_links:
+                continue
+            seen_links.add(link)
+            out.append(item)
+    return out

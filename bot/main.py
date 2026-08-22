@@ -21,7 +21,7 @@ from .llm import LLMClient
 from .publisher import Publisher
 from .quota import Quota
 from .rss import FETCH_TIMEOUT, close_http
-from .search import SearchClient
+from .search import BingNewsClient, SearchClient
 from .vk import VKClient
 from .web import run_web_panel
 
@@ -73,11 +73,16 @@ async def run() -> None:
                        reasoning_effort="low", max_tokens=1600)
     # Сайты без RSS (см. bot/search.py) находят новые статьи через веб-поиск,
     # не разбором ленты — своим средствам сайта узнать «что нового» доверять
-    # нельзя, кэш CDN нередко отдаёт устаревший снимок.
+    # нельзя, кэш CDN нередко отдаёт устаревший снимок. Bing News — бесплатный
+    # публичный RSS без ключа, работает всегда; Serper — платный (после
+    # бесплатного лимита) API, нужен SERPER_API_KEY. Оба запрашиваются разом
+    # и результаты сливаются — независимая индексация с разной задержкой,
+    # каждый может найти то, что другой ещё не проиндексировал.
     search = SearchClient(cfg.serper_api_key)
+    bing = BingNewsClient()
     publisher = Publisher(bot, storage, llm, cfg.channel_id,
                           admin_ids=cfg.admin_ids, quota=quota, vk=vk, claude=claude,
-                          gemini=gemini, search=search)
+                          gemini=gemini, search=search, bing=bing)
 
     dp = Dispatcher()
     handlers.setup(handlers.router, cfg.admin_ids)
@@ -115,8 +120,8 @@ async def run() -> None:
         log.warning("режим Gemini включён командой, но GEMINI_API_KEY не задан — "
                     "работает обычный LLM")
     if not search.configured and any(f["kind"] == "search" for f in storage.feeds()):
-        log.warning("есть сайты без RSS (/addsite), но SERPER_API_KEY не задан — "
-                    "они не будут опрашиваться")
+        log.warning("есть сайты без RSS (/addsite), SERPER_API_KEY не задан — "
+                    "работают только на Bing News (без ключа, но с меньшим охватом)")
     if not publisher.channel:
         log.warning("канал не задан — укажите CHANNEL_ID в .env или /setchannel")
     if publisher.debug:
@@ -167,6 +172,7 @@ async def run() -> None:
         await claude.close()
         await gemini.close()
         await search.close()
+        await bing.close()
         await close_http()
         await bot.session.close()
         storage.close()
