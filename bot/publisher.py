@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 from aiogram import Bot
 from aiogram.exceptions import (TelegramAPIError, TelegramBadRequest,
-                                TelegramRetryAfter)
+                                TelegramNetworkError, TelegramRetryAfter)
 from aiogram.types import (BufferedInputFile, InputMediaPhoto,
                             LinkPreviewOptions, Message)
 
@@ -438,10 +438,6 @@ class Publisher:
         """
         stats = {"feeds": 0, "published": 0, "errors": 0, "vk": 0,
                  "postponed": 0, "debug": int(self.debug)}
-        self._vk_posted = 0
-        self._postponed = []
-        self._postponed_flood = []
-        self._postponed_dupes = []
         if self.st.get("paused") == "1":
             log.info("публикация на паузе — пропускаем проход")
             return stats
@@ -450,6 +446,16 @@ class Publisher:
             return stats
 
         async with self._lock:
+            # Внутри лока, а не до него: иначе второй параллельный run_once
+            # (фоновый цикл + ручной /checknow), уже стоящий в очереди на
+            # тот же лок, мог бы обнулить эти списки прямо во время того,
+            # как первый вызов их ещё заполняет — искажая его же отчёт
+            # (_report_postponed/_report_dupes/_report_flood) вплоть до нуля,
+            # хотя сама публикация под локом остаётся корректной.
+            self._vk_posted = 0
+            self._postponed = []
+            self._postponed_flood = []
+            self._postponed_dupes = []
             self._blocked = False
             for feed in self.st.feeds(only_enabled=True):
                 stats["feeds"] += 1
@@ -753,8 +759,13 @@ class Publisher:
             self.st.prune_seen(feed_id, max(50, self.st.get_int("keep_seen")))
         return published
 
-    async def build_post(self, entry: Entry, feed: sqlite3.Row | None = None) -> Post:
-        """Прогоняет запись через шаблон + LLM и собирает готовое сообщение."""
+    async def build_post(self, entry: Entry, feed: sqlite3.Row | None = None,
+                         force_backend: "LLMClient | ClaudeClient | None" = None) -> Post:
+        """Прогоняет запись через шаблон + LLM и собирает готовое сообщение.
+
+        force_backend — см. _complete: используется /claude test и /gemini
+        test, чтобы прогнать запись именно через тестируемый бэкенд, не
+        трогая общую настройку claude_mode/gemini_mode."""
         source = (feed["title"] if feed and feed["title"] else "") or "RSS"
         raw_values = {
             "title": entry.title,
@@ -766,7 +777,7 @@ class Publisher:
 
         template = (feed["template"] if feed and feed["template"] else "") or self.st.get("template")
         prompt = render(template, raw_values, escape=False)
-        ai_text = await self._ask_model(prompt)
+        ai_text = await self._ask_model(prompt, force_backend=force_backend)
 
         post_format = self.st.get("post_format")
         text = _shorten(render(post_format, {**raw_values, "ai": ai_text}, escape=True))
@@ -801,6 +812,27 @@ class Publisher:
         post_format = self.st.get("post_format")
         limit = TG_CAPTION_LIMIT if row["kind"] in ("photo", "album") else TG_LIMIT
         return _shorten(render(post_format, {**raw_values, "ai": ai_text}, escape=True), limit)
+
+    async def set_model_tested(self, name: str) -> str | None:
+        """/setmodel: переключает модель обычного LLM, только если она
+        ответила на пробный запрос — иначе откатывает и возвращает текст
+        ошибки (None при успехе).
+
+        Своп+тест+откат идут под тем же self._lock, что и run_once — иначе
+        два быстрых /setmodel (с двух устройств) или /setmodel во время
+        идущего автопрохода могут перечитать/затереть чужое временное
+        значение self.llm.model (см. историю гонки, которую это чинит):
+        один тест успевает откатить на "previous", снятое ДО того, как
+        второй его сменил, теряя чужое уже подтверждённое переключение."""
+        async with self._lock:
+            previous = self.llm.model
+            self.llm.model = name
+            try:
+                await self.llm.complete("Ответь одним словом: работает")
+            except LLMError as exc:
+                self.llm.model = previous
+                return str(exc)
+            return None
 
     async def delete_post_image(self, post_id: int, message_id: int) -> str | None:
         """Удаляет одну картинку из уже опубликованного альбома (>1 картинки).
@@ -1015,11 +1047,14 @@ class Publisher:
         out.sort(key=lambda pair: pair[1].published_ts)
         return out
 
-    def _find_duplicate(self, entry: Entry, candidates: list[sqlite3.Row]
-                        ) -> tuple[int, float] | None:
-        """Из уже опубликованных за окно дедупа постов — тот, что больше
-        всего похож на entry по заголовку и summary разом, или None, если
-        ничего не дотягивает до dedup_threshold. Оба сигнала должны пройти
+    def _find_duplicate(self, entry: Entry, candidates: "list[sqlite3.Row | dict]"
+                        ) -> tuple[int | None, float] | None:
+        """Из уже опубликованных за окно дедупа постов (и уже принятых в
+        этом же проходе, см. _drop_duplicates) — тот, что больше всего
+        похож на entry по заголовку и summary разом, или None, если ничего
+        не дотягивает до dedup_threshold. id у результата — None, если
+        совпадение нашлось с записью из этого же прохода, а не с реальным
+        постом (matched_post_id ссылаться там не на что). Оба сигнала должны пройти
         DEDUP_MIN_SIGNAL по отдельности, иначе общие слова вроде
         «анонсировала» жёстко завышали бы схожесть у пары никак не
         связанных новостей.
@@ -1041,8 +1076,8 @@ class Publisher:
         одинаковых SQL-запросов вместо одного.
         """
         threshold = max(1, min(100, self.st.get_int("dedup_threshold"))) / 100
-        best: tuple[int, float] | None = None
-        best_named: tuple[int, float] | None = None
+        best: tuple[int | None, float] | None = None
+        best_named: tuple[int | None, float] | None = None
         for row in candidates:
             title_sim = _dedup_similarity(entry.title, row["title"])
             summary_sim = _dedup_similarity(entry.summary, row["summary"])
@@ -1080,15 +1115,28 @@ class Publisher:
         feed_id = feed["id"]
         days = max(1, self.st.get_int("dedup_window_days"))
         since = int(time.time() - days * 86400)
-        candidates = self.st.recent_posts(since)
+        candidates = list(self.st.recent_posts(since))
         keep: list[tuple[str, Entry]] = []
+        # Записи, уже принятые в этом же проходе, тоже кандидаты на дубль —
+        # иначе две похожие записи, разом пришедшие с одной ленты за один
+        # опрос (например, анонс и апдейт того же события через /addsite),
+        # обе проходили бы мимо dedup: ни одна из них ещё не in posts.
+        # id=None у таких кандидатов отличает «дубль внутри пачки» (нет
+        # реального опубликованного поста, на который можно сослаться) от
+        # обычного матча по posts — см. ветку ниже.
+        kept_in_batch: list[dict] = []
         for key, entry in fresh:
-            match = self._find_duplicate(entry, candidates)
+            match = self._find_duplicate(entry, candidates + kept_in_batch)
             if match is None:
                 keep.append((key, entry))
+                kept_in_batch.append({"id": None, "title": entry.title, "summary": entry.summary})
                 continue
             post_id, score = match
             self.st.mark_seen(feed_id, key)
+            if post_id is None:
+                log.info("лента #%s: %r — похоже на дубль другой записи из этой же "
+                         "пачки, пропускаю", feed_id, entry.title[:80])
+                continue
             self.st.add_dedup_candidate(
                 feed_id=feed_id, title=entry.title, summary=entry.summary,
                 link=entry.link, source=feed["title"] or "", published=entry.published,
@@ -1116,17 +1164,29 @@ class Publisher:
         await self.send_vk(post)
         return None
 
-    async def _complete(self, prompt: str) -> str:
+    async def _complete(self, prompt: str,
+                        force_backend: "LLMClient | ClaudeClient | None" = None) -> str:
         """Один запрос через активный бэкенд — с автопереключением на
         основной LLM, если у Gemini кончилась квота (HTTP 429). Без этого
         каждая новость откладывалась бы до ручного /gemini off: квота
         освобождается только на следующие сутки, а посты вставали в очередь
-        прямо сейчас."""
-        llm = self._active_llm
+        прямо сейчас.
+
+        force_backend — для /claude test и /gemini test: конкретный клиент
+        вместо активного сейчас бэкенда, без переключения общей настройки
+        claude_mode/gemini_mode. Настройка — общее состояние, которое видит
+        и параллельный автопроход, и другой админ; временно дёргать её ради
+        одного тестового вызова означало бы, что реальные новости в этом же
+        окне уйдут через тестируемый (платный) бэкенд без ведома админа, а
+        отмена по finally могла бы затереть чужое изменение той же настройки,
+        сделанное как раз в этот момент. Раз бэкенд задан явно — это тест,
+        а не публикация, и автопереключение с Gemini тоже ни к чему: ошибку
+        нужно показать как есть, а не тихо подменить результат основной моделью."""
+        llm = force_backend or self._active_llm
         try:
             return await llm.complete(prompt)
         except LLMQuotaExceeded:
-            if llm is not self.gemini:
+            if force_backend is not None or llm is not self.gemini:
                 raise
             self.st.set("gemini_mode", "0")
             log.warning("Gemini: квота исчерпана (HTTP 429) — переключаюсь "
@@ -1134,7 +1194,8 @@ class Publisher:
             await self._report_gemini_quota()
             return await self.llm.complete(prompt)
 
-    async def _ask_model(self, prompt: str) -> str:
+    async def _ask_model(self, prompt: str,
+                         force_backend: "LLMClient | ClaudeClient | None" = None) -> str:
         """Ответ модели, пригодный к публикации.
 
         Модель иногда возвращает исходник как есть, проигнорировав просьбу
@@ -1143,12 +1204,13 @@ class Publisher:
         признаём отказ.
         """
         if self.st.get("require_russian") != "1":
-            return await self._complete(prompt)
+            return await self._complete(prompt, force_backend=force_backend)
 
         nudge = ("\n\nВажно: ответ должен быть на русском языке. "
                  "Не копируй исходный текст.")
         for attempt in range(1, RU_ATTEMPTS + 1):
-            text = await self._complete(prompt if attempt == 1 else prompt + nudge)
+            text = await self._complete(prompt if attempt == 1 else prompt + nudge,
+                                        force_backend=force_backend)
             if looks_russian(text):
                 return text
             log.warning("модель ответила не по-русски (попытка %s из %s): %r",
@@ -1222,11 +1284,15 @@ class Publisher:
             if len(out) >= limit:
                 break
             batch = candidates[i:i + IMAGE_DOWNLOAD_CONCURRENCY]
+            # return_exceptions=True: одна оборвавшаяся закачка (например,
+            # CancelledError при остановке бота) не должна валить остальные
+            # параллельные закачки этой же пачки и прерывать обработку записи.
             results = await asyncio.gather(
-                *(download_image(url, referer=entry.link) for url in batch)
+                *(download_image(url, referer=entry.link) for url in batch),
+                return_exceptions=True,
             )
             for url, downloaded in zip(batch, results):
-                if downloaded is None:
+                if downloaded is None or isinstance(downloaded, BaseException):
                     log.info("картинка не скачалась, пропускаю: %s", url[:100])
                     continue
                 out.append(downloaded)
@@ -1364,6 +1430,15 @@ class Publisher:
             except TelegramRetryAfter as exc:
                 log.warning("лимит Telegram, ждём %ss", exc.retry_after)
                 await asyncio.sleep(exc.retry_after + 1)
+            except TelegramNetworkError as exc:
+                # Таймаут/обрыв соединения — не то же самое, что отказ
+                # доступа: Telegram мог и получить сообщение, просто ответ до
+                # нас не дошёл. Не считаем канал недоступным (_blocked) и не
+                # обрываем весь проход из-за одного сетевого сбоя — пробуем
+                # ещё раз в пределах уже существующего бюджета попыток.
+                log.warning("сетевая ошибка при отправке в %s (%s), пробую ещё раз",
+                            target, exc)
+                await asyncio.sleep(2)
             except TelegramBadRequest as exc:
                 if not self._is_markup_error(exc):
                     log.error("не удалось отправить в %s: %s", target, exc)
@@ -1379,6 +1454,10 @@ class Publisher:
                 log.error("не удалось отправить в %s: %s", target, exc)
                 self._blocked = True
                 return None
+        log.error("не удалось отправить в %s — повторяющиеся сетевые ошибки; "
+                  "новость останется непрочитанной и будет обработана заново "
+                  "на следующем проходе (если предыдущая попытка на самом "
+                  "деле дошла до Telegram, возможен дубль в канале)", target)
         return None
 
     async def _send_photo(self, text: str, target: int | str,
@@ -1399,6 +1478,13 @@ class Publisher:
             except TelegramRetryAfter as exc:
                 log.warning("лимит Telegram, ждём %ss", exc.retry_after)
                 await asyncio.sleep(exc.retry_after + 1)
+            except TelegramNetworkError as exc:
+                # См. комментарий в _send — сетевой сбой не значит отказ,
+                # пробуем ещё раз, а не сразу падаем на текстовый фолбэк
+                # (который иначе рискует задвоить уже доставленное фото).
+                log.warning("сетевая ошибка при отправке фото в %s (%s), пробую ещё раз",
+                            target, exc)
+                await asyncio.sleep(2)
             except TelegramBadRequest as exc:
                 if self._is_markup_error(exc):
                     # Разметка сломана — картинка ни при чём, пусть общий путь
@@ -1437,6 +1523,13 @@ class Publisher:
             except TelegramRetryAfter as exc:
                 log.warning("лимит Telegram, ждём %ss", exc.retry_after)
                 await asyncio.sleep(exc.retry_after + 1)
+            except TelegramNetworkError as exc:
+                # См. комментарий в _send — сетевой сбой не значит отказ,
+                # пробуем ещё раз, а не сразу падаем на фолбэк (который
+                # иначе рискует задвоить уже доставленный альбом).
+                log.warning("сетевая ошибка при отправке альбома в %s (%s), пробую ещё раз",
+                            target, exc)
+                await asyncio.sleep(2)
             except TelegramBadRequest as exc:
                 if self._is_delivery_error(exc):
                     log.error("не удалось отправить в %s: %s", target, exc)

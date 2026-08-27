@@ -16,7 +16,7 @@ from aiogram.types import (BufferedInputFile, InlineKeyboardButton,
                            LinkPreviewOptions, Message, WebAppInfo)
 
 from .db import DEFAULTS, Storage
-from .llm import LLMError
+from .llm import LLMError, LLMQuotaExceeded
 from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, _ext_for,
                         html_problem, tg_len)
 from .quota import until_reset
@@ -607,21 +607,24 @@ async def cmd_set(message: Message, command: CommandObject, st: Storage) -> None
             await _reply(message, "on_llm_error принимает <code>raw</code> или <code>skip</code>")
             return
     elif key == "max_images":
-        if not value.isdigit() or not (1 <= int(value) <= 10):
+        n = _to_int(value)
+        if n is None or not (1 <= n <= 10):
             await _reply(message, "max_images — число от 1 до 10.")
             return
     elif key == "dedup_threshold":
-        if not value.isdigit() or not (1 <= int(value) <= 100):
+        n = _to_int(value)
+        if n is None or not (1 <= n <= 100):
             await _reply(message, "dedup_threshold — число от 1 до 100 (% схожести).")
             return
     elif key == "alert_thresholds":
         parsed = [p for p in value.replace(" ", "").split(",") if p]
-        if not all(p.isdigit() and 1 <= int(p) <= 100 for p in parsed) or not parsed:
+        nums = [_to_int(p) for p in parsed]
+        if not parsed or any(n is None or not (1 <= n <= 100) for n in nums):
             await _reply(message, "Пороги — числа 1–100 через запятую, например "
                                   "<code>/set alert_thresholds 70,90</code>")
             return
-        value = ",".join(str(int(p)) for p in sorted({int(p) for p in parsed}))
-    elif not value.isdigit():
+        value = ",".join(str(n) for n in sorted({n for n in nums}))
+    elif _to_int(value) is None:
         await _reply(message, f"{_e(key)} ожидает число.")
         return
 
@@ -686,14 +689,10 @@ async def cmd_setmodel(message: Message, command: CommandObject, st: Storage,
                               "<code>deepseek/deepseek-v4-flash</code>")
         return
 
-    previous = publisher.llm.model
-    publisher.llm.model = name
-    try:
-        await publisher.llm.complete("Ответь одним словом: работает")
-    except LLMError as exc:
-        publisher.llm.model = previous
-        await _reply(message, f"❌ Модель не ответила: <code>{_e(exc)}</code>\n"
-                              f"Оставил прежнюю: <code>{_e(previous)}</code>")
+    error = await publisher.set_model_tested(name)
+    if error:
+        await _reply(message, f"❌ Модель не ответила: <code>{_e(error)}</code>\n"
+                              f"Оставил прежнюю: <code>{_e(publisher.llm.model)}</code>")
         return
 
     st.set("model", name)
@@ -709,6 +708,12 @@ async def cmd_checknow(message: Message, st: Storage, publisher: Publisher) -> N
     await _reply(message, "🔧 Отладка: собираю посты в личку…" if debug
                  else "🔄 Проверяю ленты…")
     stats = await publisher.run_once(manual=True)
+    # Перечитываем режим ПОСЛЕ прохода, а не берём снятую до него переменную:
+    # если кто-то переключил /debug, пока run_once ждал сеть/ИИ, реальная
+    # маршрутизация постов уже шла по свежему значению (см. _process_feed) —
+    # итоговый текст отчёта должен ему соответствовать, а не тому, что было
+    # в начале.
+    debug = publisher.debug
     verb = "показано в личке" if debug else "опубликовано"
     tail = f", ошибок: {stats['errors']}" if stats["errors"] else ""
     if publisher.vk_on and not debug:
@@ -735,8 +740,8 @@ def _post_kind_label(kind: str) -> str:
 
 @router.message(Command("posts"))
 async def cmd_posts(message: Message, command: CommandObject, st: Storage) -> None:
-    n = _parse_id(command.args) or 10
-    n = max(1, min(30, n))
+    n = _parse_id(command.args)
+    n = 10 if n is None else max(1, min(30, n))
     rows = st.posts(n)
     if not rows:
         await _reply(message, "Опубликованных постов пока нет.")
@@ -788,11 +793,12 @@ async def cmd_edit(message: Message, command: CommandObject, st: Storage) -> Non
 async def cmd_delimage(message: Message, command: CommandObject, st: Storage,
                        publisher: Publisher) -> None:
     parts = (command.args or "").split()
-    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+    post_id = _to_int(parts[0]) if len(parts) == 2 else None
+    n = _to_int(parts[1]) if len(parts) == 2 else None
+    if post_id is None or n is None:
         await _reply(message, "Как использовать: <code>/delimage 42 3</code> — "
                               "пост #42, картинка №3 (номера — из <code>/edit 42</code>)")
         return
-    post_id, n = int(parts[0]), int(parts[1])
     row = st.post(post_id)
     if row is None:
         await _reply(message, "Пост не найден.")
@@ -935,7 +941,7 @@ async def cmd_feedimages(message: Message, command: CommandObject, st: Storage) 
     настройка: разные источники по-разному годятся для альбома (см.
     Storage.set_multi_images)."""
     parts = (command.args or "").split(maxsplit=1)
-    feed_id = int(parts[0]) if parts and parts[0].isdigit() else None
+    feed_id = _to_int(parts[0]) if parts else None
     feed = st.feed(feed_id) if feed_id is not None else None
     if feed is None:
         await _reply(message, "Как использовать: <code>/feedimages 1</code> (id ленты из /list)\n"
@@ -1136,6 +1142,11 @@ CLAUDE_HELP = """<b>Режим Claude</b>
 считается — свой отдельный платный счёт. Несколько картинок альбомом
 вместо одной — настройка отдельной ленты, не завязана на Claude: /feedimages
 
+В отличие от Gemini, при исчерпании лимита (HTTP 429) режим Claude
+автоматически НЕ выключается и на обычный LLM не переключается — платный
+бэкенд не подменяется тихо. Новости просто откладываются (см. /status)
+до <code>/claude off</code> или восстановления лимита.
+
 <b>Команды</b>
 /claude — статус
 /claude on · off — включить/выключить
@@ -1200,15 +1211,11 @@ async def cmd_claude(message: Message, command: CommandObject, st: Storage,
             await _reply(message, f"❌ {_e(error)}")
             return
 
-        was_on = st.get("claude_mode")
-        st.set("claude_mode", "1")   # build_post смотрит на это состояние
         try:
-            post = await publisher.build_post(entry, feed)
+            post = await publisher.build_post(entry, feed, force_backend=claude)
         except LLMError as exc:
             await _reply(message, f"❌ Claude вернул ошибку: <code>{_e(exc)}</code>")
             return
-        finally:
-            st.set("claude_mode", was_on)
 
         picture = f"картинок: {len(post.images)}" if post.images else "без картинок"
         await _reply(message, f"⬇️ Предпросмотр через Claude ({picture}, "
@@ -1238,6 +1245,10 @@ OpenRouter). Взаимоисключимо с Claude: включение одн
 
 Промпт и формат поста — общие (/template, /format). В /usage не
 считается — свои лимиты смотрите в Google AI Studio.
+
+При исчерпании лимита (HTTP 429) режим автоматически выключается и бот
+молча переходит на обычный LLM, чтобы новости не копились в очереди —
+в отличие от Claude, где так не делается (см. /claude).
 
 <b>Команды</b>
 /gemini — статус
@@ -1302,41 +1313,21 @@ async def cmd_gemini(message: Message, command: CommandObject, st: Storage,
             await _reply(message, f"❌ {_e(error)}")
             return
 
-        was_on = st.get("gemini_mode")
-        st.set("gemini_mode", "1")   # build_post смотрит на это состояние
         try:
-            post = await publisher.build_post(entry, feed)
+            post = await publisher.build_post(entry, feed, force_backend=gemini)
+        except LLMQuotaExceeded as exc:
+            await _reply(message, f"❌ У Gemini кончилась квота: <code>{_e(exc)}</code>\n\n"
+                                  f"Режим Gemini не трогал — если он всё ещё включён "
+                                  f"(<code>/gemini</code>), реальные новости продолжат "
+                                  f"откладываться до восстановления квоты или "
+                                  f"<code>/gemini off</code>.")
+            return
         except LLMError as exc:
-            # gemini_mode="0" тут может значить не «тест сломал», а что
-            # _complete() сам погасил его — квота кончилась прямо во время
-            # теста. Откатывать обратно в этом случае нельзя: реальное
-            # состояние (квота исчерпана) важнее того, что было до теста.
-            fell_back = st.get("gemini_mode") == "0"
-            if not fell_back:
-                st.set("gemini_mode", was_on)
-            note = ("\n\n⚠️ Похоже, дело в исчерпанной квоте — бот уже "
-                    "переключился на основной LLM." if fell_back else "")
-            await _reply(message, f"❌ Gemini вернул ошибку: <code>{_e(exc)}</code>{note}")
+            await _reply(message, f"❌ Gemini вернул ошибку: <code>{_e(exc)}</code>")
             return
 
-        # Та же логика: если квота кончилась прямо во время теста,
-        # _complete() уже выключил gemini_mode и отдал текст с основной
-        # модели — откатывать это назад на was_on значило бы врать себе,
-        # что Gemini всё ещё работает.
-        fell_back = st.get("gemini_mode") == "0"
-        if not fell_back:
-            st.set("gemini_mode", was_on)
-
         picture = f"картинок: {len(post.images)}" if post.images else "без картинок"
-        if fell_back:
-            await _reply(message, "⚠️ У Gemini кончилась квота прямо во время "
-                                  f"теста — текст ниже от основной модели "
-                                  f"(<code>{_e(publisher.llm.model)}</code>), "
-                                  f"режим Gemini автоматически выключен. "
-                                  f"Включить снова — <code>/gemini on</code>, "
-                                  f"когда квота восстановится.")
-        await _reply(message, f"⬇️ Предпросмотр{'' if fell_back else ' через Gemini'} "
-                              f"({picture}, <b>не</b> опубликовано)")
+        await _reply(message, f"⬇️ Предпросмотр через Gemini ({picture}, <b>не</b> опубликовано)")
         if not await _preview_post(message, post):
             await message.answer(post.text, parse_mode="HTML",
                                  link_preview_options=NO_PREVIEW)
@@ -1473,6 +1464,20 @@ def _parse_id(args: str | None) -> int | None:
     try:
         return int((args or "").split()[0])
     except (ValueError, IndexError):
+        return None
+
+
+def _to_int(value: str) -> int | None:
+    """int(value), или None вместо падения.
+
+    Не полагаемся на str.isdigit() как предварительную проверку — она верна
+    для юникодных цифр (надстрочные ²³¹, полноширинные и т.п.), для которых
+    int() всё равно бросает ValueError, и не ограничивает длину строки
+    (int() сам откажется на очень длинной цифровой строке, начиная с
+    Python 3.11 — sys.int_max_str_digits)."""
+    try:
+        return int(value)
+    except ValueError:
         return None
 
 

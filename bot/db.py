@@ -318,6 +318,23 @@ class Storage:
             )
             self._conn.commit()
 
+    def set_if_absent(self, key: str, value: Any) -> bool:
+        """Пишет, только если ключа ещё нет — атомарно, в одном SQL-запросе.
+
+        Нужно там, где get()+set() в разных строках кода рискует гонкой между
+        двумя параллельными вызовами (см. Quota.check_and_alert): оба могли
+        бы прочитать "ключа нет" до того, как любой успеет его записать.
+        Возвращает True, только если запись реально произошла (вызывающий —
+        первый и единственный, кто должен продолжить действие под этим флагом).
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                (key, str(value)),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
     # --- ленты -----------------------------------------------------------
     @staticmethod
     def normalize_feed_url(url: str) -> str:

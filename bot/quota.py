@@ -35,7 +35,9 @@ def utc_day() -> str:
 
 def until_reset() -> str:
     now = datetime.now(timezone.utc)
-    left = 24 * 60 - (now.hour * 60 + now.minute)
+    # % 1440, а не голое вычитание: ровно в 00:00 вычитание даёт 1440 («24 ч
+    # 0 мин»), хотя сброс уже наступил — до следующего осталось 0, а не сутки.
+    left = (24 * 60 - (now.hour * 60 + now.minute)) % 1440
     return f"{left // 60} ч {left % 60} мин"
 
 
@@ -212,10 +214,15 @@ class Quota:
             # backend в ключе — иначе предупреждение по одному бэкенду молча
             # гасило бы такое же по другому в тот же день (общий флаг на день).
             flag = f"alerted:{info.day}:{backend}:{kind}:{top}"
-            if self.st.get(flag) == "1":
+            # Атомарный claim, а не get()+set(): при двух почти одновременных
+            # check_and_alert (фоновый цикл + ручной /checknow) оба могли бы
+            # прочитать "ещё не предупреждали" до того, как любой это
+            # запишет, и оба прислали бы одинаковое предупреждение.
+            if not self.st.set_if_absent(flag, "1"):
                 continue
             for lower in crossed:
-                self.st.set(f"alerted:{info.day}:{backend}:{kind}:{lower}", "1")
+                if lower != top:
+                    self.st.set(f"alerted:{info.day}:{backend}:{kind}:{lower}", "1")
             await self._notify(self._alert_text(kind, top, pct, info))
 
     @staticmethod

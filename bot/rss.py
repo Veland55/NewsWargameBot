@@ -6,7 +6,6 @@ import calendar
 import html
 import logging
 import re
-import urllib.error
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -17,6 +16,7 @@ from urllib.parse import urljoin, urlsplit
 
 USER_AGENT = "rss-deepseek-bot/1.0 (+https://github.com/)"
 FETCH_TIMEOUT = 20
+FEED_LIMIT = 20 * 1024 * 1024  # лента вычитывается в память целиком — не даём ей быть безграничной
 
 # Дочитывание картинки со страницы новости — для лент, где её нет в самой
 # записи. Сайты кладут og:image в <head>, поэтому дальше него не читаем.
@@ -191,23 +191,17 @@ def _image(entry) -> str:
     return ""
 
 
-def _parse_sync(url: str, etag: str | None, modified: str | None) -> FetchResult:
+def _parse_sync(data: bytes) -> FetchResult:
+    """Разбор уже скачанных байт — чистый CPU (без сети), можно без опаски
+    уносить в тред: в отличие от feedparser.parse(url), здесь нет
+    блокирующего DNS/сокета, который не отменяется по таймауту извне."""
     try:
-        parsed = feedparser.parse(
-            url, etag=etag or None, modified=modified or None, agent=USER_AGENT
-        )
-    except Exception as exc:  # сеть/парсер — не роняем цикл
-        return FetchResult(entries=[], error=f"{type(exc).__name__}: {exc}")
+        parsed = feedparser.parse(data)
+    except Exception as exc:
+        return FetchResult(entries=[], error=f"не удалось разобрать ленту: {exc}")
 
-    status = parsed.get("status")
-    if status == 304:
-        return FetchResult(entries=[], not_modified=True)
-    if status and status >= 400:
-        return FetchResult(entries=[], error=f"HTTP {status}")
     if parsed.get("bozo") and not parsed.entries:
         exc = parsed.get("bozo_exception")
-        if isinstance(exc, (urllib.error.URLError, OSError)):
-            return FetchResult(entries=[], error=f"лента недоступна: {exc}")
         return FetchResult(entries=[], error=f"не удалось разобрать ленту: {exc}")
 
     entries: list[Entry] = []
@@ -239,8 +233,6 @@ def _parse_sync(url: str, etag: str | None, modified: str | None) -> FetchResult
     return FetchResult(
         entries=entries,
         feed_title=strip_html(parsed.feed.get("title", "")) if parsed.get("feed") else "",
-        etag=parsed.get("etag"),
-        modified=parsed.get("modified"),
     )
 
 
@@ -690,13 +682,53 @@ async def download_image(url: str, referer: str = "") -> tuple[bytes, str] | Non
 
 
 async def fetch(url: str, etag: str | None = None, modified: str | None = None) -> FetchResult:
-    """feedparser блокирующий — уносим в тред."""
+    """Лента качается через aiohttp (весь сетевой ввод-вывод остаётся в
+    event loop, под настоящим ClientTimeout), а в тред уносится только сам
+    разбор уже скачанных байт — короткая чисто-CPU операция.
+
+    Раньше feedparser.parse(url) сам ходил в сеть через urllib внутри
+    asyncio.to_thread(...), а socket.setdefaulttimeout() не действует на
+    getaddrinfo(): при зависшем DNS поток пула повисал навсегда, и
+    asyncio.wait_for(...) снаружи это не лечило — таймаут срабатывал
+    только со стороны event loop, а сам поток так и оставался занят.
+    Common default executor у него всего 2 воркера и его же использует
+    aiohttp для резолвинга DNS всех остальных запросов бота — зависание
+    двух таких лент останавливало весь процесс целиком.
+    """
+    headers = {"User-Agent": USER_AGENT}
+    if etag:
+        headers["If-None-Match"] = etag
+    if modified:
+        headers["If-Modified-Since"] = modified
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(_parse_sync, url, etag, modified), timeout=FETCH_TIMEOUT + 10
-        )
+        async with _http().get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT),
+        ) as resp:
+            if resp.status == 304:
+                return FetchResult(entries=[], not_modified=True)
+            if resp.status >= 400:
+                return FetchResult(entries=[], error=f"HTTP {resp.status}")
+            chunks = []
+            size = 0
+            async for chunk in resp.content.iter_chunked(65536):
+                size += len(chunk)
+                if size > FEED_LIMIT:
+                    return FetchResult(entries=[], error=f"лента больше {FEED_LIMIT // (1024*1024)} МБ")
+                chunks.append(chunk)
+            data = b"".join(chunks)
+            new_etag = resp.headers.get("ETag")
+            new_modified = resp.headers.get("Last-Modified")
     except asyncio.TimeoutError:
         return FetchResult(entries=[], error="таймаут загрузки ленты")
+    except aiohttp.ClientError as exc:
+        return FetchResult(entries=[], error=f"лента недоступна: {exc}")
+
+    result = await asyncio.to_thread(_parse_sync, data)
+    if result.error:
+        return result
+    result.etag = new_etag
+    result.modified = new_modified
+    return result
 
 
 # ─── Источники без RSS: обнаружение через веб-поиск ────────────────────────

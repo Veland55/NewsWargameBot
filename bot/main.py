@@ -3,9 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import socket
 import sys
-from concurrent.futures import ThreadPoolExecutor
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -20,7 +18,7 @@ from .db import Storage
 from .llm import LLMClient
 from .publisher import Publisher
 from .quota import Quota
-from .rss import FETCH_TIMEOUT, close_http
+from .rss import close_http
 from .search import BingNewsClient, SearchClient
 from .vk import VKClient
 from .web import run_web_panel
@@ -37,15 +35,15 @@ async def run() -> None:
     )
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
-    # feedparser качает ленты через urllib в отдельном треде — таймаут задаём глобально.
-    socket.setdefaulttimeout(FETCH_TIMEOUT)
-
-    # Ленты разбираются строго по одной, поэтому и поток нужен один. По
-    # умолчанию asyncio завёл бы их до 32 — каждый со своей ареной malloc,
-    # то есть с лишними мегабайтами, которые процесс уже не отдаст.
-    asyncio.get_running_loop().set_default_executor(
-        ThreadPoolExecutor(max_workers=2, thread_name_prefix="feed")
-    )
+    # Раньше здесь default executor урезался до 2 воркеров под фидпарсер —
+    # но aiohttp резолвит DNS для ВСЕХ запросов бота (RSS, LLM, VK, поиск,
+    # сам Telegram Bot API) через тот же default executor (нет aiodns).
+    # Двух воркеров хватало впритык для последовательного разбора лент, но
+    # при зависшем DNS одной ленты оба потока замораживались навсегда
+    # (getaddrinfo не подчиняется никакому asyncio-таймауту) — и весь
+    # остальной сетевой код бота вставал в очередь без единого свободного
+    # потока. Оставляем asyncio-дефолт (min(32, cpu_count()+4)) вместо
+    # искусственного сужения.
 
     storage = Storage(cfg.db_path)
     storage.prune_usage()

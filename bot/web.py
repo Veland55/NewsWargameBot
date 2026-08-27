@@ -314,7 +314,14 @@ header .logout button { padding: 7px 13px; font-size: 12.5px; }
 }
 .bottom-nav .nav-link .ic { font-size: 21px; line-height: 1; }
 .bottom-nav .nav-link .lbl { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
-.bottom-nav .nav-link.active { color: var(--accent); }
+/* Активная вкладка не должна опираться только на цвет (WCAG 1.4.1) —
+   на телефоне это единственный ориентир «где я», второй признак — точка. */
+.bottom-nav .nav-link.active { color: var(--accent); font-weight: 600; }
+.side-nav .nav-dot { display: none; }
+.bottom-nav .nav-dot {
+  width: 4px; height: 4px; border-radius: 50%; margin-top: 2px; visibility: hidden;
+}
+.bottom-nav .nav-link.active .nav-dot { visibility: visible; background: var(--accent); }
 main { max-width: 1000px; margin: 16px auto; padding: 0 14px; }
 main.wide { max-width: 1180px; }
 /* h2 — настоящий заголовок раздела (не декоративная ярлычная строка):
@@ -623,6 +630,20 @@ a.list-item:hover { background: var(--card-hover); }
 # Telegram в полноэкранном режиме (см. STYLE выше).
 TG_INIT_SCRIPT = """<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script>
+// Разрушающие действия (удаление ленты/картинки/дубля) подтверждаются перед
+// отправкой формы. Внутри Telegram Mini App нативный window.confirm() у
+// части клиентов (особенно десктопного) не поддерживается синхронно, как
+// того требует onsubmit="return confirm(...)" — используем showConfirm()
+// моста, когда он есть, и обычный confirm() только вне Telegram.
+function tgConfirmSubmit(form, message) {
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg && tg.showConfirm) {
+    tg.showConfirm(message, function (ok) { if (ok) form.submit(); });
+  } else if (window.confirm(message)) {
+    form.submit();
+  }
+  return false;
+}
 (function () {
   function cssPx(name, fallback) {
     var v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(name));
@@ -728,7 +749,8 @@ def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok", acti
 
     nav_html = "".join(
         f'<a href="{path}" class="nav-link{" active" if path == active else ""}">'
-        f'<span class="ic">{icon}</span><span class="lbl">{label}</span></a>'
+        f'<span class="ic">{icon}</span><span class="lbl">{label}</span>'
+        f'<span class="nav-dot" aria-hidden="true"></span></a>'
         for path, icon, label in NAV_ITEMS
     )
     main_class = " wide" if wide else ""
@@ -773,7 +795,7 @@ def _login_page(error: str = "") -> str:
   <div class="card">
     <form method="post" action="/login">
       <label for="login-password">Пароль</label>
-      <input type="password" id="login-password" name="password" autofocus required>
+      <input type="password" id="login-password" name="password" required>
       <div style="margin-top:12px;"><button class="primary" type="submit" style="width:100%;">Войти</button></div>
     </form>
   </div>
@@ -781,7 +803,13 @@ def _login_page(error: str = "") -> str:
 <script>
 (function () {{
   var tg = window.Telegram && window.Telegram.WebApp;
-  if (!tg || !tg.initData) return;
+  if (!tg || !tg.initData) {{
+    // Вне Telegram авто-входа не будет — фокус на пароль как раньше,
+    // просто не через статичный autofocus (который иначе открывал бы
+    // клавиатуру и внутри Telegram, где поле обычно не нужно вовсе).
+    document.getElementById('login-password').focus();
+    return;
+  }}
   document.getElementById('tgLoginNote').style.display = 'block';
   // На десктопном клиенте Telegram fetch() к /tg-login иногда подвисает
   // навсегда (ни then, ни catch не срабатывают) — плашка «Вхожу через
@@ -821,6 +849,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app["st"] = storage
     app["publisher"] = publisher
     app["bot"] = bot
+    # Черновики после перегенерации поста через ИИ — держим в памяти между
+    # POST /regen и последующим GET, а не отдаём их прямо в ответе на POST
+    # (см. post_regen/post_detail): иначе обновление страницы/pull-to-refresh
+    # в Telegram Mini App переотправляет тот же POST и повторно тратит деньги
+    # на ИИ-перегенерацию, которую админ не запрашивал.
+    app["regen_drafts"] = {}
     # SameSite=Lax (без Secure) — обычный браузер по прямому https/http-адресу.
     # SameSite=None+Secure — когда панель открыта как Telegram Mini App
     # (WEB_PANEL_PUBLIC_URL задан, Telegram требует https для WebApp URL):
@@ -904,7 +938,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if secure_cookies:
             fwd = request.headers.get("X-Forwarded-For")
             if fwd:
-                return fwd.split(",")[0].strip()
+                # nginx's $proxy_add_x_forwarded_for APPENDS the real client
+                # IP after whatever the client already sent in this header,
+                # so the last hop is the only part nginx itself guarantees —
+                # taking the first would let a client fake any IP and dodge
+                # the lockout below.
+                return fwd.split(",")[-1].strip()
         return request.remote or "?"
 
     async def login_post(request: web.Request) -> web.Response:
@@ -957,10 +996,13 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         active = sum(1 for f in feeds if f["enabled"])
         errors = [f for f in feeds if f["last_error"]]
         paused = st.get("paused") == "1"
-        hero_class, state_text = ("paused", "На паузе")
-        if pub.debug:
+        if pub.debug and paused:
+            hero_class, state_text = "debug", "Отладка · на паузе"
+        elif pub.debug:
             hero_class, state_text = "debug", "Отладка — посты в личку"
-        elif not paused:
+        elif paused:
+            hero_class, state_text = "paused", "На паузе"
+        else:
             hero_class, state_text = "", "Работает"
         feeds_value = f"{active} / {len(feeds)}"
         if errors:
@@ -980,6 +1022,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             f'<div class="stat-value">{v}</div></div>' for k, v in stats
         )
         body = f"""
+        <h2 class="page-heading">Статус</h2>
         <div class="hero-card {hero_class}">
           <div>
             <div class="hero-state"><span class="hero-dot"></span>{_e(state_text)}</div>
@@ -1040,7 +1083,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                 <div class="muted">{_e(r['source'] or 'без ленты')} · найдено {when} · похоже на {matched_html}</div>
               </div>
               <div class="list-item-actions">
-                <a class="btn icon" href="/duplicates/{r['id']}" title="Подробнее">›</a>
+                <a class="btn icon" href="/duplicates/{r['id']}" title="Подробнее" aria-label="Подробнее">›</a>
               </div>
             </div>"""
         return f"""
@@ -1059,6 +1102,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         multi = ' <span class="pill neutral">неск. картинок</span>' if f["multi_images"] else ""
         path_hint = (f' <span class="pill neutral">{_e(f["article_path"])}</span>'
                     if f["kind"] == "search" and f["article_path"] else "")
+        multi_label = "Одна картинка, как раньше" if f["multi_images"] else "Публиковать несколько картинок альбомом"
+        toggle_label = "Поставить на паузу" if f["enabled"] else "Включить"
         return f"""<div class="list-item">
           <div class="list-item-info">
             <div class="list-item-title">
@@ -1070,14 +1115,14 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             {err}
           </div>
           <div class="list-item-actions">
-            <a class="btn icon" href="/feeds/{f['id']}/template" title="Свой промпт">🤖</a>
+            <a class="btn icon" href="/feeds/{f['id']}/template" title="Свой промпт" aria-label="Свой промпт">🤖</a>
             <form class="inline" method="post" action="/feeds/{f['id']}/multiimages">{csrf_field(request)}
-              <button class="icon" type="submit" title="{'Одна картинка, как раньше' if f['multi_images'] else 'Публиковать несколько картинок альбомом'}">🖼</button></form>
+              <button class="icon" type="submit" title="{multi_label}" aria-label="{multi_label}">🖼</button></form>
             <form class="inline" method="post" action="/feeds/{f['id']}/toggle">{csrf_field(request)}
-              <button class="icon" type="submit" title="{'Поставить на паузу' if f['enabled'] else 'Включить'}">{'⏸' if f['enabled'] else '▶️'}</button></form>
+              <button class="icon" type="submit" title="{toggle_label}" aria-label="{toggle_label}">{'⏸' if f['enabled'] else '▶️'}</button></form>
             <form class="inline" method="post" action="/feeds/{f['id']}/delete"
-                  onsubmit="return confirm('Удалить #{f['id']}?')">{csrf_field(request)}
-              <button class="icon" type="submit" title="Удалить">✕</button></form>
+                  onsubmit="return tgConfirmSubmit(this, 'Удалить #{f['id']}?')">{csrf_field(request)}
+              <button class="icon" type="submit" title="Удалить" aria-label="Удалить">✕</button></form>
           </div>
         </div>"""
 
@@ -1210,7 +1255,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     async def feeds_delete(request: web.Request) -> web.Response:
         feed_id = int(request.match_info["id"])
         app["st"].delete_feed(feed_id)
-        return _redirect("/feeds")
+        return await feeds_get(request, flash="Лента удалена.")
 
     async def feeds_toggle(request: web.Request) -> web.Response:
         feed_id = int(request.match_info["id"])
@@ -1310,6 +1355,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         template_text = template_draft if template_draft is not None else st.get("template")
         format_text = format_draft if format_draft is not None else st.get("post_format")
         body = f"""
+        <h2 class="page-heading">Контент</h2>
         <div class="content-grid">
         <div>
         <h2>Промпт для ИИ</h2>
@@ -1441,6 +1487,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         debug_state = "включена" if pub.debug else "выключена"
 
         body = f"""
+        <h2 class="page-heading">Настройки</h2>
         <div class="settings-columns">
         <div>
         <h2>Канал</h2>
@@ -1638,6 +1685,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         row = st.post(post_id)
         if row is None:
             raise web.HTTPNotFound(text="Пост не найден")
+        if draft is None:
+            pending = app["regen_drafts"].get(post_id)
+            if pending is not None:
+                draft, flash, flash_kind = pending, "Черновик готов — не забудьте сохранить.", "ok"
         text = draft if draft is not None else row["text"]
         draft_note = ('<p class="muted">⚠️ Это черновик после перегенерации — ещё не сохранён в канале. '
                       'Проверьте и нажмите «Сохранить».</p>' if draft is not None else "")
@@ -1657,8 +1708,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                       <div class="list-item-info"><div class="list-item-title">Картинка №{i}</div></div>
                       <div class="list-item-actions">
                         <form class="inline" method="post" action="/posts/{post_id}/image/{msg_id}/delete"
-                              onsubmit="return confirm('Удалить картинку №{i} из поста?')">{csrf_field(request)}
-                          <button class="icon" type="submit" title="Удалить картинку">✕</button></form>
+                              onsubmit="return tgConfirmSubmit(this, 'Удалить картинку №{i} из поста?')">{csrf_field(request)}
+                          <button class="icon" type="submit" title="Удалить картинку" aria-label="Удалить картинку">✕</button></form>
                       </div>
                     </div>"""
                 images_card = f"""
@@ -1720,6 +1771,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if err:
             return await post_detail(request, draft=text, flash=err, flash_kind="err")
         st.update_post_text(post_id, text)
+        app["regen_drafts"].pop(post_id, None)
         return await post_detail(request, flash="Сохранено.")
 
     async def post_regen(request: web.Request) -> web.Response:
@@ -1734,7 +1786,11 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             text = await pub.rebuild_post_text(row, extra)
         except LLMError as exc:
             return await post_detail(request, flash=f"Модель вернула ошибку: {exc}", flash_kind="err")
-        return await post_detail(request, draft=text, flash="Черновик готов — не забудьте сохранить.")
+        # Redirect (не рендерим черновик прямо в ответе на POST): обновление
+        # страницы после POST иначе переотправило бы этот же запрос и снова
+        # дёрнуло бы ИИ — см. app["regen_drafts"] выше.
+        app["regen_drafts"][post_id] = text
+        return _redirect(f"/posts/{post_id}")
 
     async def post_delete_image(request: web.Request) -> web.Response:
         pub: Publisher = app["publisher"]
@@ -1802,7 +1858,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             <form method="post" action="/duplicates/{row['id']}/publish">{csrf_field(request)}
               <button class="primary" type="submit">✅ Опубликовать всё же</button></form>
             <form method="post" action="/duplicates/{row['id']}/delete"
-                  onsubmit="return confirm('Удалить из очереди? Новость останется неопубликованной.')">{csrf_field(request)}
+                  onsubmit="return tgConfirmSubmit(this, 'Удалить из очереди? Новость останется неопубликованной.')">{csrf_field(request)}
               <button class="link-btn" type="submit">Удалить, это правда дубль</button></form>
           </div>
         </div>
