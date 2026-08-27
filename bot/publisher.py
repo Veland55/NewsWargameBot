@@ -302,6 +302,16 @@ class Publisher:
         return self.llm
 
     @property
+    def backend_key(self) -> str:
+        """Ключ активного сейчас бэкенда для Quota ('default'/'claude'/'gemini') —
+        расход каждого считается отдельно (см. bot/quota.py)."""
+        if self.claude_mode and self.claude:
+            return "claude"
+        if self.gemini_mode and self.gemini:
+            return "gemini"
+        return "default"
+
+    @property
     def active_backend_label(self) -> str:
         """Имя реально активного сейчас бэкенда — для статусов и сообщений
         вместо жёстко зашитого «DeepSeek», который бэкендом быть не обязан
@@ -411,7 +421,7 @@ class Publisher:
         if self._postponed_dupes:
             await self._report_dupes()
         if stats["published"] and self.quota:
-            await self.quota.check_and_alert()
+            await self.quota.check_and_alert(self.backend_key)
         return stats
 
     async def _report_flood(self) -> None:

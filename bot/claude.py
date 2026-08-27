@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Callable
 
 import aiohttp
 
@@ -30,12 +31,17 @@ class ClaudeClient:
         max_tokens: int = 1024,
         temperature: float = 0.3,
         retries: int = 2,
+        on_usage: Callable[[dict], None] | None = None,
     ):
         self.api_key = api_key
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.retries = retries
+        # См. LLMClient.on_usage — тот же смысл: учёт расхода не знает про
+        # HTTP, клиент не знает про базу. У Anthropic нет поля "cost" в
+        # ответе (в отличие от OpenRouter) — считаем только запросы/токены.
+        self.on_usage = on_usage
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._session: aiohttp.ClientSession | None = None
 
@@ -69,6 +75,13 @@ class ClaudeClient:
         if system:
             payload["system"] = system
 
+        def record(usage: dict) -> None:
+            if self.on_usage:
+                try:
+                    self.on_usage(usage)
+                except Exception:
+                    log.exception("сбой в учёте расхода")
+
         last_error = "неизвестная ошибка"
         last_status: int | None = None
         for attempt in range(1, self.retries + 2):
@@ -81,9 +94,14 @@ class ClaudeClient:
                     body = await resp.text()
                     if resp.status == 200:
                         try:
-                            return self._extract(body)
+                            text, usage = self._extract(body)
                         except LLMEmpty as exc:
                             last_error = str(exc)
+                            if exc.usage:
+                                record(exc.usage)
+                        else:
+                            record(usage)
+                            return text
                     else:
                         last_error = f"HTTP {resp.status}: {body[:300]}"
                         last_status = resp.status
@@ -106,7 +124,7 @@ class ClaudeClient:
         raise LLMError(last_error)
 
     @staticmethod
-    def _extract(body: str) -> str:
+    def _extract(body: str) -> tuple[str, dict]:
         import json
 
         try:
@@ -118,11 +136,20 @@ class ClaudeClient:
             err = data.get("error") or {}
             raise LLMError(str(err.get("message") or body[:300]))
 
+        raw = data.get("usage") or {}
+        # У Anthropic нет поля "cost" (это особенность ответов OpenRouter) —
+        # только количество токенов, стоимость в деньгах отсюда не посчитать.
+        usage = {
+            "tokens_in": int(raw.get("input_tokens") or 0),
+            "tokens_out": int(raw.get("output_tokens") or 0),
+            "cost": 0.0,
+        }
+
         parts = data.get("content") or []
         text = "".join(
             p.get("text", "") for p in parts if isinstance(p, dict) and p.get("type") == "text"
         ).strip()
         if not text:
             stop = str(data.get("stop_reason") or "")
-            raise LLMEmpty(f"Claude вернул пустой ответ, stop_reason={stop}", stop)
-        return text
+            raise LLMEmpty(f"Claude вернул пустой ответ, stop_reason={stop}", stop, usage)
+        return text, usage

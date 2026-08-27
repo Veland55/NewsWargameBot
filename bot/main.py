@@ -54,8 +54,6 @@ async def run() -> None:
     if saved_model := storage.get("model"):
         llm.model = saved_model
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    quota = Quota(storage, llm, bot, cfg.admin_ids)
-    llm.on_usage = quota.record
     vk = VKClient(cfg.vk_token, cfg.vk_group_id, cfg.vk_user_token)
     claude = ClaudeClient(cfg.claude_api_key, cfg.claude_model)
     # Gemini даёт OpenAI-совместимый /chat/completions — тот же LLMClient, что
@@ -71,6 +69,10 @@ async def run() -> None:
     # повтором с удвоенным лимитом, если и этого не хватит.
     gemini = LLMClient(cfg.gemini_base_url, cfg.gemini_api_key, cfg.gemini_model,
                        reasoning_effort="low", max_tokens=1600)
+    # Quota сама подключает on_usage у всех трёх клиентов (см. bot/quota.py) —
+    # раньше это делалось руками только для llm, и расход в режиме Claude/
+    # Gemini нигде не учитывался.
+    quota = Quota(storage, llm, bot, cfg.admin_ids, claude=claude, gemini=gemini)
     # Сайты без RSS (см. bot/search.py) находят новые статьи через веб-поиск,
     # не разбором ленты — своим средствам сайта узнать «что нового» доверять
     # нельзя, кэш CDN нередко отдаёт устаревший снимок. Bing News — бесплатный

@@ -48,6 +48,7 @@ class QuotaInfo:
     cost: float
     model: str
     is_free_model: bool
+    backend: str = "default"              # 'default' / 'claude' / 'gemini'
     request_limit: int | None = None      # суточный лимит запросов, если известен
     limit_source: str = ""                # откуда взят лимит
     credit_limit: float | None = None     # лимит трат по ключу
@@ -70,20 +71,40 @@ class QuotaInfo:
 
 
 class Quota:
-    def __init__(self, storage: Storage, llm: LLMClient, bot: Bot, admin_ids: set[int]):
+    def __init__(self, storage: Storage, llm: LLMClient, bot: Bot, admin_ids: set[int],
+                *, claude: "ClaudeClient | None" = None, gemini: "LLMClient | None" = None):
         self.st = storage
         self.llm = llm
+        self.claude = claude
+        self.gemini = gemini
         self.bot = bot
         self.admin_ids = set(admin_ids)
         self._key_cache: dict | None = None
         self._key_cache_at: float = 0.0
+        # Единственное место, где клиенты подключаются к учёту расхода —
+        # раньше это делали руками в main.py (llm.on_usage = quota.record) и
+        # про Claude с Gemini забыли: пока был включён один из них, расход
+        # нигде не считался — ни запросы, ни токены, ни предупреждения о
+        # лимите не срабатывали.
+        llm.on_usage = lambda usage: self.record(usage, "default")
+        if claude is not None:
+            claude.on_usage = lambda usage: self.record(usage, "claude")
+        if gemini is not None:
+            gemini.on_usage = lambda usage: self.record(usage, "gemini")
+
+    def _client_for(self, backend: str):
+        if backend == "claude":
+            return self.claude
+        if backend == "gemini":
+            return self.gemini
+        return self.llm
 
     # --- запись расхода --------------------------------------------------
-    def record(self, usage: dict) -> None:
-        """Колбэк для LLMClient.on_usage — синхронный и быстрый."""
+    def record(self, usage: dict, backend: str = "default") -> None:
+        """Колбэк для LLMClient/ClaudeClient.on_usage — синхронный и быстрый."""
         day = utc_day()
         self.st.bump_usage(
-            day,
+            day, backend,
             tokens_in=int(usage.get("tokens_in") or 0),
             tokens_out=int(usage.get("tokens_out") or 0),
             cost=float(usage.get("cost") or 0.0),
@@ -101,23 +122,37 @@ class Quota:
             self._key_cache_at = time.monotonic()
         return info
 
-    async def snapshot(self, force: bool = False) -> QuotaInfo:
+    async def snapshot(self, backend: str = "default", force: bool = False) -> QuotaInfo:
         day = utc_day()
-        used = self.st.usage(day)
+        used = self.st.usage(day, backend)
+        client = self._client_for(backend)
         info = QuotaInfo(
             day=day,
             requests=int(used["requests"]),
             tokens_in=int(used["tokens_in"]),
             tokens_out=int(used["tokens_out"]),
             cost=float(used["cost"]),
-            model=self.llm.model,
-            is_free_model=self.llm.is_free_model,
+            model=client.model if client else "—",
+            # is_free_model — эвристика OpenRouter (id модели оканчивается на
+            # ":free"), к Claude/Gemini отношения не имеет.
+            is_free_model=backend == "default" and self.llm.is_free_model,
+            backend=backend,
         )
 
+        # Ручной лимит — общая настройка, не завязанная на конкретного
+        # провайдера: админ мог сам прикинуть суточный лимит для Gemini/Claude
+        # так же, как для обычного LLM.
         manual = self.st.get_int("free_daily_limit")
         if manual > 0:
             info.request_limit = manual
             info.limit_source = "задан вручную"
+
+        if backend != "default":
+            # Остальное ниже — учёт кредитов ключа OpenRouter и автоматическая
+            # прикидка суточного лимита по тарифу OpenRouter. У Gemini нет
+            # понятия "кредиты на ключе", у Claude — свой биллинг, ни то ни
+            # другое этим API не проверить.
+            return info
 
         key = await self.key_info(force=force)
         if key:
@@ -150,12 +185,17 @@ class Quota:
                 out.append(int(part))
         return sorted(set(out))
 
-    async def check_and_alert(self) -> None:
-        """Вызывается после публикаций; отправляет только новые предупреждения."""
+    async def check_and_alert(self, backend: str = "default") -> None:
+        """Вызывается после публикаций; отправляет только новые предупреждения.
+
+        `backend` — тот, что реально обрабатывал новости в этом проходе
+        (см. Publisher.backend_key): у каждого свой счёт расхода, и порог
+        должен проверяться относительно него, а не всегда относительно
+        обычного LLM."""
         if not self.thresholds() or not self.admin_ids:
             return
         try:
-            info = await self.snapshot()
+            info = await self.snapshot(backend)
         except Exception:
             log.exception("не удалось собрать сведения о лимите")
             return
@@ -169,11 +209,13 @@ class Quota:
             if not crossed:
                 continue
             top = max(crossed)
-            flag = f"alerted:{info.day}:{kind}:{top}"
+            # backend в ключе — иначе предупреждение по одному бэкенду молча
+            # гасило бы такое же по другому в тот же день (общий флаг на день).
+            flag = f"alerted:{info.day}:{backend}:{kind}:{top}"
             if self.st.get(flag) == "1":
                 continue
             for lower in crossed:
-                self.st.set(f"alerted:{info.day}:{kind}:{lower}", "1")
+                self.st.set(f"alerted:{info.day}:{backend}:{kind}:{lower}", "1")
             await self._notify(self._alert_text(kind, top, pct, info))
 
     @staticmethod

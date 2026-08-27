@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS feeds (
@@ -51,14 +52,19 @@ CREATE TABLE IF NOT EXISTS page_image (
     checked_at INTEGER NOT NULL
 ) WITHOUT ROWID;
 
--- Расход по дням UTC: лимиты бесплатных моделей OpenRouter суточные,
+-- Расход по дням UTC, отдельно на каждый бэкенд ('default'/'claude'/'gemini') —
+-- иначе расход в режиме Claude/Gemini молча не учитывался бы вовсе (обычный
+-- LLM и альтернативные бэкенды делили бы одну строку, либо альтернативные
+-- вообще никуда не писали бы). Лимиты бесплатных моделей OpenRouter суточные,
 -- сбрасываются в 00:00 UTC.
 CREATE TABLE IF NOT EXISTS usage (
-    day        TEXT PRIMARY KEY,
+    day        TEXT NOT NULL,
+    backend    TEXT NOT NULL DEFAULT 'default',
     requests   INTEGER NOT NULL DEFAULT 0,
     tokens_in  INTEGER NOT NULL DEFAULT 0,
     tokens_out INTEGER NOT NULL DEFAULT 0,
-    cost       REAL    NOT NULL DEFAULT 0
+    cost       REAL    NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, backend)
 ) WITHOUT ROWID;
 
 -- Уже опубликованные посты — чтобы их можно было найти и отредактировать
@@ -190,6 +196,7 @@ class Storage:
             self._migrate_settings_keys()
             self._migrate_multi_images_to_feeds()
             self._migrate_sitemap_kind_to_search()
+            self._migrate_usage_backend_column()
             self._conn.commit()
 
     def _migrate(self) -> None:
@@ -256,6 +263,34 @@ class Storage:
                     )
                 self._conn.execute("DELETE FROM settings WHERE key = ?", (old,))
 
+    def _migrate_usage_backend_column(self) -> None:
+        """usage раньше не различала бэкенд — расход в режиме Claude/Gemini
+        нигде не считался (единственная строка на день писалась только для
+        обычного LLM). Разово переносим старые записи как backend='default'
+        (это и был единственный бэкенд, который тогда вообще учитывался) и
+        меняем первичный ключ на (day, backend), чтобы у каждого бэкенда была
+        своя строка за день."""
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(usage)").fetchall()}
+        if "backend" in cols:
+            return
+        self._conn.execute("ALTER TABLE usage RENAME TO usage_old")
+        self._conn.execute(
+            "CREATE TABLE usage ("
+            " day        TEXT NOT NULL,"
+            " backend    TEXT NOT NULL DEFAULT 'default',"
+            " requests   INTEGER NOT NULL DEFAULT 0,"
+            " tokens_in  INTEGER NOT NULL DEFAULT 0,"
+            " tokens_out INTEGER NOT NULL DEFAULT 0,"
+            " cost       REAL    NOT NULL DEFAULT 0,"
+            " PRIMARY KEY (day, backend)"
+            ") WITHOUT ROWID"
+        )
+        self._conn.execute(
+            "INSERT INTO usage (day, backend, requests, tokens_in, tokens_out, cost) "
+            "SELECT day, 'default', requests, tokens_in, tokens_out, cost FROM usage_old"
+        )
+        self._conn.execute("DROP TABLE usage_old")
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -284,6 +319,16 @@ class Storage:
             self._conn.commit()
 
     # --- ленты -----------------------------------------------------------
+    @staticmethod
+    def normalize_feed_url(url: str) -> str:
+        """Схема и хост регистронезависимы (RFC 3986) — приводим их к нижнему
+        регистру при сохранении, иначе https://Example.com/rss и
+        https://example.com/rss считаются разными лентами и одни и те же
+        новости уходят в канал дважды."""
+        parts = urlsplit(url)
+        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(),
+                           parts.path, parts.query, parts.fragment))
+
     def add_feed(self, url: str, title: str = "", kind: str = "rss",
                 article_path: str = "") -> int | None:
         """Возвращает id новой ленты или None, если такая уже есть.
@@ -292,6 +337,7 @@ class Storage:
         веб-поиск (см. bot/search.py), url хранит адрес сайта, article_path —
         часть пути, ограничивающая поисковый запрос (site:домен/путь).
         """
+        url = self.normalize_feed_url(url)
         with self._lock:
             try:
                 cur = self._conn.execute(
@@ -410,31 +456,32 @@ class Storage:
             self._conn.commit()
 
     # --- учёт расхода LLM ------------------------------------------------
-    def bump_usage(self, day: str, tokens_in: int = 0, tokens_out: int = 0,
-                   cost: float = 0.0) -> int:
-        """Плюс один запрос за день `day`. Возвращает новое число запросов."""
+    def bump_usage(self, day: str, backend: str = "default", tokens_in: int = 0,
+                   tokens_out: int = 0, cost: float = 0.0) -> int:
+        """Плюс один запрос за день `day` для конкретного бэкенда
+        ('default'/'claude'/'gemini'). Возвращает новое число запросов."""
         with self._lock:
             self._conn.execute(
-                "INSERT INTO usage (day, requests, tokens_in, tokens_out, cost) "
-                "VALUES (?, 1, ?, ?, ?) "
-                "ON CONFLICT(day) DO UPDATE SET "
+                "INSERT INTO usage (day, backend, requests, tokens_in, tokens_out, cost) "
+                "VALUES (?, ?, 1, ?, ?, ?) "
+                "ON CONFLICT(day, backend) DO UPDATE SET "
                 "  requests   = requests + 1,"
                 "  tokens_in  = tokens_in + excluded.tokens_in,"
                 "  tokens_out = tokens_out + excluded.tokens_out,"
                 "  cost       = cost + excluded.cost",
-                (day, tokens_in, tokens_out, cost),
+                (day, backend, tokens_in, tokens_out, cost),
             )
             self._conn.commit()
             row = self._conn.execute(
-                "SELECT requests FROM usage WHERE day = ?", (day,)
+                "SELECT requests FROM usage WHERE day = ? AND backend = ?", (day, backend)
             ).fetchone()
         return int(row["requests"]) if row else 0
 
-    def usage(self, day: str) -> dict[str, float]:
+    def usage(self, day: str, backend: str = "default") -> dict[str, float]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT requests, tokens_in, tokens_out, cost FROM usage WHERE day = ?",
-                (day,),
+                "SELECT requests, tokens_in, tokens_out, cost FROM usage WHERE day = ? AND backend = ?",
+                (day, backend),
             ).fetchone()
         if not row:
             return {"requests": 0, "tokens_in": 0, "tokens_out": 0, "cost": 0.0}
@@ -449,7 +496,7 @@ class Storage:
         with self._lock:
             self._conn.execute(
                 "DELETE FROM usage WHERE day NOT IN "
-                "(SELECT day FROM usage ORDER BY day DESC LIMIT ?)",
+                "(SELECT DISTINCT day FROM usage ORDER BY day DESC LIMIT ?)",
                 (keep_days,),
             )
             self._conn.commit()

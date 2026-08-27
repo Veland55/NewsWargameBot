@@ -136,11 +136,19 @@ def _rows_for(text: str, min_rows: int = 6, max_rows: int = 22) -> int:
     return max(min_rows, min(max_rows, text.count("\n") + 3))
 
 
+def _is_http_url(url: str) -> bool:
+    return url.strip().lower().startswith(("http://", "https://"))
+
+
 def _safe_href(url: str) -> str:
     """Ссылки в постах приходят из RSS/Atom лент — это контент сайта-источника,
     не то, что ввёл сам админ. javascript:-урлы там маловероятны, но раз мы всё
-    равно рендерим их кликабельными в браузере — лучше не давать возможности."""
-    if url.strip().lower().startswith(("http://", "https://")):
+    равно рендерим их кликабельными в браузере — лучше не давать возможности.
+
+    Для <a href> "#" — безопасный no-op. Для <img src> он вредный: браузер
+    тут же повторно запросит текущую страницу как картинку и покажет
+    «битую» иконку — там сначала проверяйте _is_http_url() и рисуйте плейсхолдер."""
+    if _is_http_url(url):
         return _e(url)
     return "#"
 
@@ -689,20 +697,26 @@ NAV_ITEMS = [
 async def _usage_body(pub: "Publisher") -> str:
     if pub.quota is None:
         return ""
-    info = await pub.quota.snapshot(force=True)
-    # Модель уже видна в карточке «Обрабатывает» на дашборде — здесь незачем
-    # повторять её ещё раз, пометка «бесплатная» тоже туда не влезает без
-    # лишней возни, а тут скорее про сам расход, а не про то, что за модель.
+    # Расход у каждого бэкенда свой (см. bot/quota.py) — раньше здесь всегда
+    # показывался счётчик обычного LLM, даже когда реально работал Gemini
+    # или Claude, и их расход нигде не отражался вообще.
+    backend = pub.backend_key
+    info = await pub.quota.snapshot(backend, force=True)
     rows = [
         ("Запросов сегодня", f"{info.requests}" + (f" из {info.request_limit} ({info.request_pct:.0f}%)" if info.request_limit else "")),
         ("Токены", f"{info.tokens_in} вход / {info.tokens_out} выход"),
     ]
+    if info.cost:
+        rows.append(("Стоимость", f"{info.cost:.4f} кредита"))
     if info.request_limit:
         rows.append(("Обнуление лимита", f"через {until_reset()} (00:00 UTC), источник: {info.limit_source}"))
     if info.credit_limit is not None:
         rows.append(("Кредиты на ключе", f"{info.credit_limit:.4f}, осталось {info.credit_remaining:.4f}"))
+    hint = ("Обычный режим — расход и лимиты по ключу OpenRouter." if backend == "default"
+           else f"Активен режим {pub.active_backend_label} — показан расход именно этого бэкенда, "
+                "у него свой отдельный счёт.")
     return ("<h2>Расход за сутки</h2>"
-            "<div class='section-hint'>Только обычный режим — у Claude и Gemini свой счёт.</div>"
+            f"<div class='section-hint'>{_e(hint)}</div>"
             "<div class='card scroll'><table class='kv'>") + "".join(
         f"<tr><td class='muted'>{_e(k)}</td><td>{_e(v)}</td></tr>" for k, v in rows
     ) + "</table></div>"
@@ -710,7 +724,7 @@ async def _usage_body(pub: "Publisher") -> str:
 
 def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok", active: str = "",
            wide: bool = False) -> str:
-    flash_html = f'<div class="flash {flash_kind}">{flash}</div>' if flash else ""
+    flash_html = f'<div class="flash {flash_kind}">{_e(flash)}</div>' if flash else ""
 
     nav_html = "".join(
         f'<a href="{path}" class="nav-link{" active" if path == active else ""}">'
@@ -758,8 +772,8 @@ def _login_page(error: str = "") -> str:
   <div id="tgLoginNote" class="flash ok" style="display:none;">Вхожу через Telegram…</div>
   <div class="card">
     <form method="post" action="/login">
-      <label>Пароль</label>
-      <input type="password" name="password" autofocus required>
+      <label for="login-password">Пароль</label>
+      <input type="password" id="login-password" name="password" autofocus required>
       <div style="margin-top:12px;"><button class="primary" type="submit" style="width:100%;">Войти</button></div>
     </form>
   </div>
@@ -822,6 +836,33 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     PUBLIC_PATHS = {"/login", "/tg-login"}
 
     @web.middleware
+    async def bad_id_middleware(request: web.Request, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]):
+        # Роуты вида /posts/{id}, /feeds/{id}/... делают int(match_info["id"])
+        # без проверки — нечисловой id (ссылка вручную, битая закладка) иначе
+        # ронял бы запрос в голый 500 вместо понятного «не найдено».
+        try:
+            return await handler(request)
+        except ValueError:
+            return web.Response(status=404, text="Не найдено — некорректный идентификатор в адресе.")
+
+    app.middlewares.append(bad_id_middleware)
+
+    @web.middleware
+    async def security_headers_middleware(request: web.Request, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]):
+        # Полноценный CSP тут не завести без переписывания вёрстки — весь
+        # HTML/CSS/JS страницы инлайновый (см. STYLE/TG_INIT_SCRIPT и
+        # style=/onsubmit= по всему файлу), 'unsafe-inline' свёл бы CSP к
+        # пустой формальности. X-Frame-Options не ставим — панель открывается
+        # как Telegram Mini App во встроенном webview. То, что можно включить
+        # без риска что-то сломать, — включаем.
+        resp = await handler(request)
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        return resp
+
+    app.middlewares.append(security_headers_middleware)
+
+    @web.middleware
     async def auth_middleware(request: web.Request, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]):
         if request.path in PUBLIC_PATHS:
             return await handler(request)
@@ -832,7 +873,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if request.method == "POST":
             form = await request.post()
             if not secrets.compare_digest(str(form.get("csrf", "")), session["csrf"]):
-                return web.Response(status=403, text="CSRF-токен не совпадает — обновите страницу и попробуйте снова.")
+                # Голый текст без стилей и без выхода — тупик для Telegram
+                # Mini App, где назад можно уйти только системным жестом.
+                body = ('<div class="card"><p>Токен формы устарел — обычно значит, что страница была'
+                       ' открыта давно в другой вкладке. Обновите её и попробуйте снова.</p>'
+                       '<a class="btn" href="/">На главную</a></div>')
+                return web.Response(status=403, text=_layout("Токен устарел", body), content_type="text/html")
             request["form"] = form
         return await handler(request)
 
@@ -847,8 +893,22 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             return _redirect("/")
         return web.Response(text=_login_page(), content_type="text/html")
 
+    def client_ip(request: web.Request) -> str:
+        # За nginx (см. SETUP.md) request.remote — всегда 127.0.0.1, и все
+        # посетители делят один и тот же счётчик неудачных попыток: пять
+        # чужих неверных паролей блокируют вход и самому админу. Доверяем
+        # X-Forwarded-For только когда панель действительно поднята за
+        # прокси (secure_cookies включён вместе с WEB_PANEL_PUBLIC_URL) —
+        # иначе это открытый порт наружу, и заголовок мог бы подделать кто
+        # угодно, обходя блокировку.
+        if secure_cookies:
+            fwd = request.headers.get("X-Forwarded-For")
+            if fwd:
+                return fwd.split(",")[0].strip()
+        return request.remote or "?"
+
     async def login_post(request: web.Request) -> web.Response:
-        ip = request.remote or "?"
+        ip = client_ip(request)
         if auth.locked_out(ip):
             return web.Response(
                 text=_login_page(f"Слишком много попыток — подождите {LOGIN_LOCKOUT // 60} минут."),
@@ -890,7 +950,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         return resp
 
     # --- статус -------------------------------------------------------------
-    async def dashboard(request: web.Request) -> web.Response:
+    async def dashboard(request: web.Request, flash: str = "", flash_kind: str = "ok") -> web.Response:
         st: Storage = app["st"]
         pub: Publisher = app["publisher"]
         feeds = st.feeds()
@@ -937,7 +997,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         <div class="stat-grid">{stat_html}</div>
         """
         body += await _usage_body(pub)
-        return web.Response(text=_layout("Статус", body, active="/", wide=True), content_type="text/html")
+        return web.Response(text=_layout("Статус", body, flash, flash_kind, active="/", wide=True), content_type="text/html")
 
     async def pause_post(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -945,9 +1005,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         return _redirect("/")
 
     async def checknow_post(request: web.Request) -> web.Response:
+        # Голый редирект без обратной связи выглядел как нерабочая кнопка —
+        # результат (новые посты) появляется не мгновенно, а после того как
+        # проснувшийся цикл реально опросит ленты.
         pub: Publisher = app["publisher"]
         pub.wake()
-        return _redirect("/")
+        return await dashboard(request, "Проверка запущена — новые публикации появятся в течение минуты.")
 
     # --- ленты ---------------------------------------------------------------
     def _dupes_section_html(st: "Storage") -> str:
@@ -967,7 +1030,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                             if matched else f'пост #{r["matched_post_id"]} (уже удалён)')
             thumb = (f'<img class="dupe-thumb" src="{_safe_href(r["image"])}" alt="" '
                     f'style="object-fit:cover;">'
-                    if r["image"] else '<div class="dupe-thumb" style="background:var(--field-bg);"></div>')
+                    if r["image"] and _is_http_url(r["image"])
+                    else '<div class="dupe-thumb" style="background:var(--field-bg);"></div>')
             when = time.strftime("%d.%m %H:%M", time.localtime(r["detected_at"]))
             items += f"""<div class="list-item">
               {thumb}
@@ -1017,36 +1081,48 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </div>
         </div>"""
 
-    async def feeds_get(request: web.Request, flash: str = "", flash_kind: str = "ok") -> web.Response:
+    async def feeds_get(request: web.Request, flash: str = "", flash_kind: str = "ok",
+                        rss_prefill: dict[str, str] | None = None,
+                        search_prefill: dict[str, str] | None = None) -> web.Response:
         st: Storage = app["st"]
         dupes_html = _dupes_section_html(st)
         rows = st.feeds()
         rss_rows = [f for f in rows if f["kind"] != "search"]
         search_rows = [f for f in rows if f["kind"] == "search"]
 
+        # grid-column: 1/-1 — на широком экране .list.list-grid раскладывает
+        # содержимое в 2 колонки (см. CSS), без этого заглушка занимала бы
+        # только левую половину карточки вместо центрирования по всей ширине.
         rss_list = "".join(_feed_row_html(f, request, st)
                            for f in rss_rows) or (
-            "<div style='padding:28px 16px; text-align:center;'>"
+            "<div style='padding:28px 16px; text-align:center; grid-column:1/-1;'>"
             "<div style='font-size:28px; margin-bottom:8px;'>📰</div>"
             "<div class='muted'>Лент пока нет — добавьте первую выше.</div></div>"
         )
         search_list = "".join(_feed_row_html(f, request, st)
                               for f in search_rows) or (
-            "<div style='padding:28px 16px; text-align:center;'>"
+            "<div style='padding:28px 16px; text-align:center; grid-column:1/-1;'>"
             "<div style='font-size:28px; margin-bottom:8px;'>🔎</div>"
             "<div class='muted'>Сайтов без RSS пока нет — добавьте первый выше.</div></div>"
         )
 
+        # При ошибке добавления форма перерисовывается заново — раньше поля
+        # были всегда пустыми (value= не подставлялся), и адрес с названием
+        # приходилось набирать заново; заодно открываем <details>, чтобы
+        # ошибку было видно сразу, а не только после ручного разворачивания.
+        rss_prefill = rss_prefill or {}
+        search_prefill = search_prefill or {}
+
         body = f"""
         {dupes_html}
         <h2>Ленты <span class="muted" style="font-weight:400;">({len(rss_rows)})</span></h2>
-        <details>
+        <details {"open" if rss_prefill else ""}>
           <summary class="disclosure">Добавить ленту</summary>
           <div class="card" style="margin-top:10px;">
             <form method="post" action="/feeds/add">{csrf_field(request)}
               <div class="row" style="align-items:flex-end;">
-                <div style="flex:2;"><label>URL ленты</label><input type="text" name="url" placeholder="https://example.com/rss" required></div>
-                <div style="flex:1;"><label>Название (необязательно)</label><input type="text" name="title"></div>
+                <div style="flex:2;"><label for="rss-url">URL ленты</label><input type="text" id="rss-url" name="url" placeholder="https://example.com/rss" value="{_e(rss_prefill.get('url', ''))}" required></div>
+                <div style="flex:1;"><label for="rss-title">Название (необязательно)</label><input type="text" id="rss-title" name="title" value="{_e(rss_prefill.get('title', ''))}"></div>
                 <button class="primary" type="submit">Добавить</button>
               </div>
             </form>
@@ -1059,17 +1135,17 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           разбором ленты: у собственных средств сайта узнать «что нового» (sitemap.xml, страница списка
           новостей) кэш нередко отдаёт устаревший снимок, поиск от этого не зависит. Нужен ключ поиска —
           см. SETUP.md.</div>
-        <details>
+        <details {"open" if search_prefill else ""}>
           <summary class="disclosure">Добавить сайт без RSS</summary>
           <div class="card" style="margin-top:10px;">
             <form method="post" action="/feeds/add-search">{csrf_field(request)}
               <div class="row" style="align-items:flex-end;">
-                <div style="flex:2;"><label>Адрес сайта</label><input type="text" name="url" placeholder="https://example.com/" required></div>
-                <div style="flex:1;"><label>Название (необязательно)</label><input type="text" name="title"></div>
+                <div style="flex:2;"><label for="search-url">Адрес сайта</label><input type="text" id="search-url" name="url" placeholder="https://example.com/" value="{_e(search_prefill.get('url', ''))}" required></div>
+                <div style="flex:1;"><label for="search-title">Название (необязательно)</label><input type="text" id="search-title" name="title" value="{_e(search_prefill.get('title', ''))}"></div>
               </div>
               <div class="row" style="align-items:flex-end; margin-top:8px;">
-                <div style="flex:2;"><label>Часть адреса статей (необязательно)</label>
-                  <input type="text" name="article_path" placeholder="/articles/"></div>
+                <div style="flex:2;"><label for="search-article-path">Часть адреса статей (необязательно)</label>
+                  <input type="text" id="search-article-path" name="article_path" placeholder="/articles/" value="{_e(search_prefill.get('article_path', ''))}"></div>
                 <button class="primary" type="submit">Добавить</button>
               </div>
               <div class="field-hint" style="margin-top:4px;">Сужает поисковый запрос (site:домен + этот
@@ -1085,16 +1161,17 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         form = request["form"]
         url = str(form.get("url", "")).strip()
         title = str(form.get("title", "")).strip()
-        if not url.startswith(("http://", "https://")):
-            return await feeds_get(request, "Нужна ссылка, начинающаяся на http:// или https://", "err")
+        prefill = {"url": url, "title": title}
+        if not url.lower().startswith(("http://", "https://")):
+            return await feeds_get(request, "Нужна ссылка, начинающаяся на http:// или https://", "err", rss_prefill=prefill)
         result = await fetch(url)
         if result.error:
-            return await feeds_get(request, f"Лента недоступна: {result.error}", "err")
+            return await feeds_get(request, f"Лента недоступна: {result.error}", "err", rss_prefill=prefill)
         if not result.entries:
-            return await feeds_get(request, "В ленте нет записей — проверьте адрес.", "err")
+            return await feeds_get(request, "В ленте нет записей — проверьте адрес.", "err", rss_prefill=prefill)
         feed_id = app["st"].add_feed(url, title or result.feed_title[:120])
         if feed_id is None:
-            return await feeds_get(request, "Такая лента уже добавлена.", "err")
+            return await feeds_get(request, "Такая лента уже добавлена.", "err", rss_prefill=prefill)
         app["publisher"].wake()
         return _redirect("/feeds")
 
@@ -1103,29 +1180,30 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         url = str(form.get("url", "")).strip()
         title = str(form.get("title", "")).strip()
         article_path = str(form.get("article_path", "")).strip()
-        if not url.startswith(("http://", "https://")):
-            return await feeds_get(request, "Нужна ссылка, начинающаяся на http:// или https://", "err")
+        prefill = {"url": url, "title": title, "article_path": article_path}
+        if not url.lower().startswith(("http://", "https://")):
+            return await feeds_get(request, "Нужна ссылка, начинающаяся на http:// или https://", "err", search_prefill=prefill)
         publisher: Publisher = app["publisher"]
         if publisher.bing is None and (publisher.search is None or not publisher.search.configured):
             return await feeds_get(
                 request,
                 "Поиск недоступен ни одним из источников. Проверьте SERPER_API_KEY в .env "
-                "— см. SETUP.md, раздел «Сайты без RSS».", "err")
+                "— см. SETUP.md, раздел «Сайты без RSS».", "err", search_prefill=prefill)
         domain = urlsplit(url).netloc
         if not domain:
-            return await feeds_get(request, "Не разобрал домен в этой ссылке.", "err")
+            return await feeds_get(request, "Не разобрал домен в этой ссылке.", "err", search_prefill=prefill)
         query = site_query(domain, article_path)
         items, error = await publisher.search_articles(domain, article_path)
         if error:
-            return await feeds_get(request, f"Поиск не ответил: {error}", "err")
+            return await feeds_get(request, f"Поиск не ответил: {error}", "err", search_prefill=prefill)
         if not items:
             return await feeds_get(
                 request,
                 f"По запросу «{query}» поиск ничего не нашёл за последнюю неделю — либо сайт "
-                f"не публиковал новостей, либо часть адреса статей выбрана неверно.", "err")
+                f"не публиковал новостей, либо часть адреса статей выбрана неверно.", "err", search_prefill=prefill)
         feed_id = app["st"].add_feed(url, title, kind="search", article_path=article_path)
         if feed_id is None:
-            return await feeds_get(request, "Такой сайт уже добавлен.", "err")
+            return await feeds_get(request, "Такой сайт уже добавлен.", "err", search_prefill=prefill)
         app["publisher"].wake()
         return _redirect("/feeds")
 
@@ -1284,6 +1362,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
     async def content_format_post(request: web.Request) -> web.Response:
         text = str(request["form"].get("text", "")).strip()
+        if not text:
+            return await content_get(request, "Формат поста не может быть пустым — не сохранено.", "err",
+                                     format_draft=text)
         if "{ai}" not in text:
             return await content_get(request, "Без {ai} в посте не будет текста от модели — не сохранено.", "err",
                                      format_draft=text)
@@ -1306,8 +1387,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             # title=hint — на широком экране .field-hint обрезается в одну
             # строку (иначе разнобой в высоте подсказок раздувает раздел
             # «Настройки» по вертикали), полный текст всплывает по наведению.
-            return (f'<div class="field"><label>{_e(label)} <span class="unit">({_e(unit)})</span></label>'
-                    f'<input type="text" name="{_e(key)}" value="{_e(st.get(key))}">'
+            # for=/id= — без них скринридер объявляет поле безымянным.
+            field_id = f"field-{_e(key)}"
+            return (f'<div class="field"><label for="{field_id}">{_e(label)} <span class="unit">({_e(unit)})</span></label>'
+                    f'<input type="text" id="{field_id}" name="{_e(key)}" value="{_e(st.get(key))}">'
                     f'<div class="field-hint" title="{_e(hint)}">{_e(hint)}</div></div>')
 
         groups_html = "".join(
@@ -1364,8 +1447,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         <div class="card">
           <form method="post" action="/settings/channel">{csrf_field(request)}
             <div class="row" style="align-items:flex-end;">
-              <div style="flex:1;"><label>@канал или числовой id</label>
-                <input type="text" name="channel" value="{_e(pub.channel)}" placeholder="@my_news_channel"></div>
+              <div style="flex:1;"><label for="settings-channel">@канал или числовой id</label>
+                <input type="text" id="settings-channel" name="channel" value="{_e(pub.channel)}" placeholder="@my_news_channel"></div>
             </div>
             <div class="card-actions"><button class="primary" type="submit">Сохранить</button></div>
           </form>
@@ -1417,8 +1500,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             {'· ключ не задан (VK_TOKEN в .env)' if not (pub.vk and pub.vk.token) else ''}</div>
           <form method="post" action="/settings/vk">{csrf_field(request)}
             <div class="row" style="align-items:flex-end;">
-              <div style="flex:1;"><label>id сообщества (числовой)</label>
-                <input type="text" name="vk_group_id" value="{_e(st.get('vk_group_id'))}" placeholder="123456789"></div>
+              <div style="flex:1;"><label for="settings-vk-group">id сообщества (числовой)</label>
+                <input type="text" id="settings-vk-group" name="vk_group_id" value="{_e(st.get('vk_group_id'))}" placeholder="123456789"></div>
             </div>
             <input type="hidden" name="action" value="{'off' if pub.vk_on else 'on'}">
             <div class="card-actions">
@@ -1444,23 +1527,41 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         app["publisher"].wake()
         return await settings_get(request, f"Публикую в «{chat.title or chat.id}».")
 
+    # ключ → человекочитаемая подпись (GENERAL_GROUPS уже их содержит —
+    # переиспользуем вместо голых snake_case-имён в сообщениях об ошибках).
+    _FIELD_LABELS = {k: label for _, fields in GENERAL_GROUPS for k, label, _, _ in fields}
+
+    def _ascii_digits(v: str) -> bool:
+        # str.isdigit() пропускает не-ASCII цифры (напр. "٣٥", "²"), которые
+        # int() не всегда разбирает так, как ожидает пользователь — тогда
+        # панель бы сказала «сохранено» со значением, которое на деле не
+        # действует (get_int молча падает в дефолт на не-ASCII вводе).
+        return v.isascii() and v.isdigit()
+
     async def settings_general(request: web.Request) -> web.Response:
         st: Storage = app["st"]
         form = request["form"]
+        # Сначала проверяем всё и только потом пишем — иначе при ошибке в
+        # одном поле часть остальных уже была бы сохранена, а флеш говорит
+        # "ничего не сохранено", что вводит в заблуждение.
+        to_set: dict[str, str] = {}
         for k in SETTINGS_EDITABLE:
             if k not in form:
                 continue
             v = str(form.get(k, "")).strip()
+            label = _FIELD_LABELS.get(k, k)
             if k == "alert_thresholds":
                 parts = [p for p in v.replace(" ", "").split(",") if p]
-                if not parts or not all(p.isdigit() and 1 <= int(p) <= 100 for p in parts):
-                    return await settings_get(request, f"{k}: пороги — числа 1-100 через запятую.", "err")
+                if not parts or not all(_ascii_digits(p) and 1 <= int(p) <= 100 for p in parts):
+                    return await settings_get(request, f"«{label}» — числа 1-100 через запятую.", "err")
                 v = ",".join(str(int(p)) for p in sorted({int(p) for p in parts}))
             elif k == "max_images":
-                if not v.isdigit() or not (1 <= int(v) <= 10):
+                if not _ascii_digits(v) or not (1 <= int(v) <= 10):
                     return await settings_get(request, "Картинок в альбом — число от 1 до 10.", "err")
-            elif not v.isdigit():
-                return await settings_get(request, f"{k} должно быть числом.", "err")
+            elif not _ascii_digits(v):
+                return await settings_get(request, f"«{label}» должно быть числом.", "err")
+            to_set[k] = v
+        for k, v in to_set.items():
             st.set(k, v)
         for k in SETTINGS_TOGGLES:
             st.set(k, "1" if form.get(k) == "1" else "0")
@@ -1476,7 +1577,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         form = request["form"]
         group = str(form.get("vk_group_id", "")).strip().lstrip("-")
         if group:
-            if not group.isdigit():
+            if not _ascii_digits(group):
                 return await settings_get(request, "id сообщества должен быть числом.", "err")
             st.set("vk_group_id", group)
         st.set("vk_enabled", "1" if form.get("action") == "on" else "0")
@@ -1488,14 +1589,19 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         помнить это правило глазами, а не видеть его в самом интерфейсе."""
         st: Storage = app["st"]
         form = request["form"]
+        pub: Publisher = app["publisher"]
         mode = str(form.get("mode", "normal"))
+        # Проверяем ключ ДО записи в базу — иначе флаг claude_mode/gemini_mode
+        # уже стоит "1", хотя карточка тут же говорит "переключение не
+        # подействует": состояние в базе и то, что видно на экране, расходятся,
+        # а как только ключ появится в .env, режим включится молча без ведома
+        # админа (bump перезапуска подхватит уже сохранённый флаг).
+        if mode == "claude" and not (pub.claude and pub.claude.api_key):
+            return await settings_get(request, "Выбран Claude, но не хватает CLAUDE_API_KEY в .env — режим не сохранён.", "err")
+        if mode == "gemini" and not (pub.gemini and pub.gemini.api_key):
+            return await settings_get(request, "Выбран Gemini, но не хватает GEMINI_API_KEY в .env — режим не сохранён.", "err")
         st.set("claude_mode", "1" if mode == "claude" else "0")
         st.set("gemini_mode", "1" if mode == "gemini" else "0")
-        pub: Publisher = app["publisher"]
-        if mode == "claude" and not pub.claude_mode:
-            return await settings_get(request, "Выбран Claude, но не хватает CLAUDE_API_KEY в .env — переключение не подействует.", "err")
-        if mode == "gemini" and not pub.gemini_mode:
-            return await settings_get(request, "Выбран Gemini, но не хватает GEMINI_API_KEY в .env — переключение не подействует.", "err")
         return await settings_get(request, "Сохранено.")
 
     # --- посты -----------------------------------------------------------
@@ -1679,7 +1785,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                         else f'пост #{row["matched_post_id"]} (уже удалён)')
         image_html = (f'<img src="{_safe_href(row["image"])}" alt="" '
                       f'style="max-width:100%; border-radius:10px; margin-top:10px;">'
-                      if row["image"] else "")
+                      if row["image"] and _is_http_url(row["image"]) else "")
         body = f"""
         <div><a href="/feeds#duplicates" class="back-link">‹ Ленты</a></div>
         <h2 class="page-heading after-back">Дубль #{row['id']}</h2>

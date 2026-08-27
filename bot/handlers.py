@@ -1357,10 +1357,12 @@ async def cmd_usage(message: Message, st: Storage, publisher: Publisher) -> None
         await _reply(message, "Учёт расхода недоступен.")
         return
     await _reply(message, "Запрашиваю сведения о лимите…")
-    info = await publisher.quota.snapshot(force=True)
+    # У каждого бэкенда свой счёт (см. bot/quota.py) — показываем расход
+    # именно того, что сейчас реально обрабатывает новости.
+    info = await publisher.quota.snapshot(publisher.backend_key, force=True)
 
     lines = [
-        f"<b>Расход за {info.day}</b> (сутки UTC)",
+        f"<b>Расход за {info.day}</b> ({publisher.active_backend_label}, сутки UTC)",
         f"Запросов: {info.requests}"
         + (f" из {info.request_limit} — <b>{info.request_pct:.0f}%</b>"
            if info.request_limit else ""),
