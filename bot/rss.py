@@ -378,6 +378,11 @@ CHROME_URL_HINTS = (
     "assets.warhammer-community.com/uk-flag.png",
     "assets.warhammer-community.com/warhammer40000.png",
     "assets.warhammer-community.com/warhammerageofsigmar.png",
+    # warhammer-community.com: баннер подписки на рассылку в подвале статьи —
+    # адрес картинки сам содержит "newsletter", по URL ловится надёжнее, чем
+    # по контексту (до него от текста "Sign up to the newsletter" дальше,
+    # чем _CONTEXT_WINDOW).
+    "newsletter",
 )
 CHROME_CONTEXT_HINTS = (
     "breaking-news", "breaking-thumb", "entry-preview", "post-preview",
@@ -390,8 +395,51 @@ CHROME_CONTEXT_HINTS = (
     # 40k / Kill Team...) в шапке статьи — тот же для всех статей раздела,
     # не имеет отношения к конкретной новости.
     "gamesystemshero",
+    # warhammer-community.com: промо-карточки «в продаже сейчас» / подписка
+    # на Warhammer+ в подвале статьи (class="shared-ctaCard"/"article-ctaCards") —
+    # витрина магазина, не иллюстрация новости.
+    "ctacard",
+    # warhammer-community.com: за карточкой explore-more-cards/*.jpg (уже
+    # ловится по URL выше) сразу идёт лого игровой системы того же виджета
+    # (killteam.png, necromunda....png и т.п.) — у самого лого в URL этой
+    # подстроки уже нет, только в соседнем теге чуть выше по разметке.
+    "explore-more-cards",
+    # warhammer-community.com: тот же виджет "исследуйте другие игровые
+    # системы", но не у всех слайдов фоновая картинка лежит под
+    # /explore-more-cards/ — например Warhammer Underworlds отдаёт
+    # /whuw_exploremore-oct2024-*.jpg прямо в корне assets-хоста, и хинт
+    # по URL выше его не ловит. Зато class="...aspect-[725/350] object-cover..."
+    # на самом теге <img> — общий для фона ЛЮБОГО слайда этого виджета
+    # независимо от того, под какой путь легла картинка конкретной системы.
+    "aspect-[725/350]",
+    # То же самое для лого игровой системы поверх фона слайда (killteam.png,
+    # necromunda....png, whuw_700wide...png) — общий class этой карточки,
+    # не завязан на конкретное имя файла лого.
+    "h-110 object-contain",
+    # warhammer-community.com: класс на <img> в любой карточке-превью статьи
+    # (виджеты "More from...", "More Warhammer 40,000 news" и т.п., рендерятся
+    # компонентом <Image> Next.js). Проверка по дате-папке (_date_folder) не
+    # спасает, когда виджет "последние новости" включает саму текущую статью —
+    # у её карточки в разметке та же неделя wcDD-MM, что и у настоящих
+    # иллюстраций. Собственные картинки статьи из тела всегда обычный
+    # <img src=...> без class вообще (см. _body_images) — этот признак их
+    # не задевает.
+    "object-cover-absolute",
 )
-_CONTEXT_WINDOW = 500
+# warhammer-community.com переиспользует одну и ту же React-компоненту
+# карточки для РАЗНЫХ виджетов — "shared-articleCard" (похожие статьи),
+# "shared-ctaCard" (промо магазина), "shared-gameSystemCard" (карусель
+# Swiper "другие игровые системы") — и явно каждый новый находить себе
+# дороже, чем поймать саму конвенцию имени класса один раз. Тело статьи
+# такой class никогда не носит (см. комментарий у object-cover-absolute).
+_SHARED_CARD_RE = re.compile(r"\bshared-\w*card\b", re.I)
+# Было 500 — карточка внутри карточки (лого поверх фона слайда внутри
+# shared-gameSystemCard) на warhammer-community.com отодвигает открывающий
+# тег с классом на 700+ символов назад лишними обёрточными <div>. Проверено:
+# у настоящих иллюстраций статьи (обычный <img src=...> в вёрстке
+# WYSIWYG-тела) даже окно в 1000 символов назад не подхватывает ни одного
+# из хинтов CHROME_CONTEXT_HINTS/_SHARED_CARD_RE — ложных срабатываний не даёт.
+_CONTEXT_WINDOW = 1000
 
 _TOKEN_RE = re.compile(
     r"<a\b[^>]*?\bhref\s*=\s*[\"']([^\"']*)[\"'][^>]*>"
@@ -409,6 +457,13 @@ _RESIZE_SUFFIX_RE = re.compile(r"-\d{2,5}x\d{2,5}(?=\.\w+$)")
 # у статей из виджета «похожие материалы» дата (и потому папка) почти
 # всегда другая, у картинок текущей статьи — та же.
 _DATE_FOLDER_RE = re.compile(r"/(\d{4}/\d{1,2})/")
+# warhammer-community.com не использует /YYYY/MM/ — вместо этого папка вида
+# /0-2026/august/wc24-08/ ("week commencing"). Без этого второго паттерна
+# _date_folder() возвращал None для ЛЮБОЙ картинки этого сайта, primary_folder
+# ни разу не выставлялся, и весь фильтр по дате-папке ниже был выключен —
+# из-за этого в пост вместе со своими попадали три-четыре картинки из виджета
+# «More from Warhammer 40,000» (другие статьи, другой wcDD-MM).
+_WC_FOLDER_RE = re.compile(r"/(wc\d{2}-\d{2})/", re.I)
 
 
 def image_dedup_key(url: str) -> str:
@@ -421,7 +476,10 @@ def image_dedup_key(url: str) -> str:
 
 def _date_folder(url: str) -> str | None:
     m = _DATE_FOLDER_RE.search(url)
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+    m = _WC_FOLDER_RE.search(url)
+    return m.group(1).lower() if m else None
 
 
 def _same_page(href_abs: str, article_url: str) -> bool:
@@ -480,8 +538,21 @@ def _body_images(page: str, article_url: str, primary_folder: str | None) -> lis
         if primary_folder and _date_folder(url) not in (None, primary_folder):
             continue
 
+        # context — текст СТРОГО ДО <img (родительские теги вида
+        # <figure class="..."> или <article class="shared-articleCard">).
+        # own_attrs — атрибуты самого тега ДО src (например class="..." перед
+        # src="..." в одном <img>) — m.start() стоит на "<img", а не на "src",
+        # поэтому свой собственный class тега в context не попадает вообще,
+        # только в own_attrs. Без own_attrs карточка виджета "последние
+        # новости", которая включает саму текущую статью (та же неделя
+        # wcDD-MM, дата-фильтр не спасает), проходила бы неотличимо от
+        # настоящей иллюстрации: у обеих <img> нет ни оборачивающего тега,
+        # ни ссылки-предка в пределах _CONTEXT_WINDOW.
         context = page[max(0, m.start() - _CONTEXT_WINDOW):m.start()].lower()
-        if any(hint in context for hint in CHROME_CONTEXT_HINTS):
+        own_attrs = m.group(0).lower()
+        if any(hint in context or hint in own_attrs for hint in CHROME_CONTEXT_HINTS):
+            continue
+        if _SHARED_CARD_RE.search(context) or _SHARED_CARD_RE.search(own_attrs):
             continue
 
         key = image_dedup_key(url)
