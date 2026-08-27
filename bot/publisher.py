@@ -1132,11 +1132,20 @@ class Publisher:
                 kept_in_batch.append({"id": None, "title": entry.title, "summary": entry.summary})
                 continue
             post_id, score = match
-            self.st.mark_seen(feed_id, key)
             if post_id is None:
+                # Дубль внутри пачки — сослаться в очереди /duplicates не на
+                # что (сама «оригинальная» запись ещё не опубликована, id
+                # поста появится только после этого прохода). НЕ помечаем
+                # прочитанной: если сходство ложное (два разных анонса с
+                # похожими заголовками), запись просто вернётся на следующем
+                # опросе и сравнится уже против реального опубликованного
+                # поста — тогда матч попадёт в очередь на разбор нормально,
+                # с рабочей кнопкой «опубликовать всё же», а не потеряется
+                # безвозвратно.
                 log.info("лента #%s: %r — похоже на дубль другой записи из этой же "
-                         "пачки, пропускаю", feed_id, entry.title[:80])
+                         "пачки, откладываю на следующий проход", feed_id, entry.title[:80])
                 continue
+            self.st.mark_seen(feed_id, key)
             self.st.add_dedup_candidate(
                 feed_id=feed_id, title=entry.title, summary=entry.summary,
                 link=entry.link, source=feed["title"] or "", published=entry.published,

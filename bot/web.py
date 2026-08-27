@@ -45,6 +45,7 @@ SESSION_COOKIE = "bot_session"
 SESSION_TTL = 7 * 24 * 3600      # неделя — снова логиниться каждый день утомительно
 LOGIN_MAX_FAILS = 5              # неудачных попыток с одного адреса
 LOGIN_LOCKOUT = 15 * 60          # прежде чем снова можно пробовать
+REGEN_DRAFT_TTL = 24 * 3600      # черновик, который так и не сохранили — не копить в памяти вечно
 
 SETTINGS_EDITABLE = (
     "interval", "max_per_cycle", "post_delay", "backfill",
@@ -853,8 +854,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     # POST /regen и последующим GET, а не отдаём их прямо в ответе на POST
     # (см. post_regen/post_detail): иначе обновление страницы/pull-to-refresh
     # в Telegram Mini App переотправляет тот же POST и повторно тратит деньги
-    # на ИИ-перегенерацию, которую админ не запрашивал.
-    app["regen_drafts"] = {}
+    # на ИИ-перегенерацию, которую админ не запрашивал. Значение — (текст,
+    # время создания): если админ так и не сохранил и не открыл пост заново,
+    # запись иначе осталась бы в памяти процесса навсегда — см. REGEN_DRAFT_TTL.
+    app["regen_drafts"]: dict[int, tuple[str, float]] = {}
     # SameSite=Lax (без Secure) — обычный браузер по прямому https/http-адресу.
     # SameSite=None+Secure — когда панель открыта как Telegram Mini App
     # (WEB_PANEL_PUBLIC_URL задан, Telegram требует https для WebApp URL):
@@ -1688,7 +1691,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if draft is None:
             pending = app["regen_drafts"].get(post_id)
             if pending is not None:
-                draft, flash, flash_kind = pending, "Черновик готов — не забудьте сохранить.", "ok"
+                draft, flash, flash_kind = pending[0], "Черновик готов — не забудьте сохранить.", "ok"
         text = draft if draft is not None else row["text"]
         draft_note = ('<p class="muted">⚠️ Это черновик после перегенерации — ещё не сохранён в канале. '
                       'Проверьте и нажмите «Сохранить».</p>' if draft is not None else "")
@@ -1789,7 +1792,16 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         # Redirect (не рендерим черновик прямо в ответе на POST): обновление
         # страницы после POST иначе переотправило бы этот же запрос и снова
         # дёрнуло бы ИИ — см. app["regen_drafts"] выше.
-        app["regen_drafts"][post_id] = text
+        now = time.time()
+        drafts = app["regen_drafts"]
+        drafts[post_id] = (text, now)
+        # Заодно чистим чужие устаревшие черновики — если админ ушёл со
+        # страницы, не сохранив и не открыв её заново, drafts иначе рос бы
+        # без ограничения годами работы бота (единственная другая точка
+        # удаления — успешное /save, которое случается не всегда).
+        stale = [pid for pid, (_, ts) in drafts.items() if now - ts > REGEN_DRAFT_TTL]
+        for pid in stale:
+            del drafts[pid]
         return _redirect(f"/posts/{post_id}")
 
     async def post_delete_image(request: web.Request) -> web.Response:
