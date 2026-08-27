@@ -45,9 +45,62 @@ IMAGE_DOWNLOAD_CONCURRENCY = 4
 DEDUP_MIN_SIGNAL = 0.25
 _DEDUP_WORD_RE = re.compile(r"[а-яёa-z0-9]+", re.I)
 
+# Franchise/газетные слова — сами по себе не удостоверяют, что новость об
+# одном и том же товаре: «New Warhammer Age of Sigmar ...», «New Space
+# Marine ...» — общий префикс десятков заголовков о совершенно разных
+# моделях. См. _shares_named_run: значимыми при подсчёте совпадения
+# считаются только слова НЕ из этого набора.
+_DEDUP_STOPWORDS = frozenset({
+    "a", "an", "the", "new", "is", "are", "was", "were", "for", "with",
+    "and", "or", "in", "on", "into", "of", "to", "from", "by", "at",
+    "warhammer", "games", "workshop", "age", "sigmar", "40k", "40", "000",
+    "space", "marine", "marines",
+    "reveal", "reveals", "revealed", "announce", "announces", "announced",
+    "unveil", "unveils", "unveiled", "preview", "previewed", "review",
+    "reviewed", "first", "look", "coming", "soon", "here", "box", "boxed",
+    "game", "mini", "kit", "model", "miniature", "miniatures",
+})
+# Порог для _shares_named_run: сколько подряд идущих слов заголовка должно
+# совпасть, и сколько из них — значимых (не из _DEDUP_STOPWORDS).
+_NAMED_RUN_MIN_LEN = 3
+_NAMED_RUN_MIN_SIGNAL = 2
+
 
 def _dedup_words(text: str) -> set[str]:
     return set(_DEDUP_WORD_RE.findall(text.lower()))
+
+
+def _shares_named_run(title_a: str, title_b: str) -> bool:
+    """Общее для двух заголовков название продукта/модели — сильнее, чем
+    доля общих слов (_dedup_similarity): разные сайты почти всегда
+    переписывают заголовок и описание своими словами, но собственное имя
+    анонса («Captain on Bike», «Brawlers of Behemat») повторяют дословно.
+
+    Ищем самую длинную ОБЩУЮ ПОДРЯД ИДУЩУЮ последовательность слов в двух
+    заголовках (не просто пересечение множеств — порядок важен, иначе
+    «набор одних и тех же общих слов» ловил бы то же самое, для чего уже
+    есть DEDUP_MIN_SIGNAL и его проблема с непохожими summary). Найденный
+    случай реально сработал: warhammer-community.com и ontabletop.com
+    дали заголовкам «New Space Marine Captain On Bike Rides Into
+    Warhammer 40,000» и «New Space Marine Captain on Bike revealed» дают
+    схожесть по словам всего 0.5, а их описания — вообще другими словами
+    (0.12), ниже DEDUP_MIN_SIGNAL — связка не считалась дублем вовсе.
+    """
+    wa = _DEDUP_WORD_RE.findall(title_a.lower())
+    wb = _DEDUP_WORD_RE.findall(title_b.lower())
+    best: list[str] = []
+    for i in range(len(wa)):
+        if len(wa) - i <= len(best):
+            break
+        for j in range(len(wb)):
+            k = 0
+            while i + k < len(wa) and j + k < len(wb) and wa[i + k] == wb[j + k]:
+                k += 1
+            if k > len(best):
+                best = wa[i:i + k]
+    if len(best) < _NAMED_RUN_MIN_LEN:
+        return False
+    return sum(1 for w in best if w not in _DEDUP_STOPWORDS) >= _NAMED_RUN_MIN_SIGNAL
 
 
 def _dedup_similarity(a: str, b: str) -> float:
@@ -971,23 +1024,44 @@ class Publisher:
         «анонсировала» жёстко завышали бы схожесть у пары никак не
         связанных новостей.
 
+        Это правило само по себе пропускало настоящие дубли: разные сайты
+        почти всегда пишут summary своими словами, и его схожесть падает
+        ниже DEDUP_MIN_SIGNAL даже когда заголовки явно об одном и том же
+        товаре (проверено на практике — warhammer-community.com и
+        ontabletop.com про один и тот же «Captain on Bike»: заголовки
+        совпали на 0.5, а summary — только на 0.12, запись не отсеивалась
+        и публиковалась дважды). Поэтому вдобавок к порогу по обоим
+        сигналам считаем дублем и то, что прошло _shares_named_run —
+        общее собственное название анонса в заголовках, не требуя
+        похожести summary вовсе.
+
         `candidates` — результат recent_posts(), считанный один раз в
         _drop_duplicates на всю пачку fresh, а не заново на каждую запись:
         при первом опросе ленты (десятки записей разом) это было N
         одинаковых SQL-запросов вместо одного.
         """
+        threshold = max(1, min(100, self.st.get_int("dedup_threshold"))) / 100
         best: tuple[int, float] | None = None
+        best_named: tuple[int, float] | None = None
         for row in candidates:
             title_sim = _dedup_similarity(entry.title, row["title"])
             summary_sim = _dedup_similarity(entry.summary, row["summary"])
-            if title_sim < DEDUP_MIN_SIGNAL or summary_sim < DEDUP_MIN_SIGNAL:
+            named = _shares_named_run(entry.title, row["title"])
+            if (title_sim < DEDUP_MIN_SIGNAL or summary_sim < DEDUP_MIN_SIGNAL) and not named:
                 continue
             score = (title_sim + summary_sim) / 2
             if best is None or score > best[1]:
                 best = (row["id"], score)
-        threshold = max(1, min(100, self.st.get_int("dedup_threshold"))) / 100
+            if named and (best_named is None or score > best_named[1]):
+                best_named = (row["id"], score)
         if best is not None and best[1] >= threshold:
             return best
+        if best_named is not None:
+            # Общее название анонса надёжнее среднего по словам — считаем
+            # дублем, даже если сам score ниже настроенного порога, но
+            # показываем его как минимум на уровне порога, чтобы не сбивать
+            # админа заниженным процентом в очереди на разбор.
+            return (best_named[0], max(best_named[1], threshold))
         return None
 
     def _drop_duplicates(self, feed: sqlite3.Row, fresh: list[tuple[str, Entry]]
