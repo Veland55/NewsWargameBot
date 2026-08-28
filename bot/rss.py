@@ -270,6 +270,82 @@ async def close_http() -> None:
 TITLE_KEYS = ("og:title", "twitter:title")
 DESCRIPTION_KEYS = ("og:description", "twitter:description", "description")
 
+# og:description/description — маркетинговый тизер в одну строку, часто
+# составленный редактором отдельно от текста и не отражающий суть материала
+# (проверено на практике: warhammer-community.com для статьи про новые
+# ПРАВИЛА армии — фразу "Learn how the Lord of Change is spreading confusion"
+# — по этой фразе модель придумала анонс новой МИНИАТЮРЫ, которого не было).
+# Классы контейнера реального текста статьи — общий паттерн у многих CMS
+# (WordPress: entry-content/post-content, кастомные сайты: article-content/
+# article-body, редакторские wysiwyg-блоки) — если находится, отдаём модели
+# настоящие абзацы вместо тизера. Не находится — сайт не подходит под этот
+# эвристику, fetch_article_entry просто возвращается к description как раньше.
+_ARTICLE_BODY_CLASS_RE = re.compile(
+    r'class="[^"]*\b(?:article-content|article-body|entry-content|post-content|wysiwyg)\b[^"]*"',
+    re.I,
+)
+_TAG_START_RE = re.compile(r"<(\w+)\b")
+_ARTICLE_P_RE = re.compile(r"<p\b[^>]*>(.*?)</p>", re.I | re.S)
+# Дальше вперёд от найденного контейнера не считаем вложенность — контейнер
+# статьи закрывается раньше, а вебстраница целиком может быть сотни КБ.
+ARTICLE_BODY_SCAN = 20000
+ARTICLE_BODY_LIMIT = 3000
+
+
+def _article_container_end(page: str, tag_start: int, tag: str, limit: int) -> int:
+    """Где реально закрывается тег контейнера, открывшийся в tag_start —
+    считаем вложенность одноимённых тегов, а не берём фиксированное окно
+    символов. Без этого в короткой статье к её абзацам подмешался бы текст
+    уже ПОСЛЕ неё (виджет «похожие статьи», комментарии — то, что лежит
+    в разметке недалеко от конца короткого контейнера). Не нашли закрывающий
+    тег в пределах limit — берём limit как есть (страница обрублена или
+    разметка нестандартная, лучше немного лишнего текста, чем ничего)."""
+    open_re = re.compile(rf"<{tag}\b", re.I)
+    close_re = re.compile(rf"</{tag}\s*>", re.I)
+    pos = tag_start
+    depth = 0
+    while pos < limit:
+        next_open = open_re.search(page, pos, limit)
+        next_close = close_re.search(page, pos, limit)
+        if next_close is None:
+            break
+        if next_open is not None and next_open.start() < next_close.start():
+            depth += 1
+            pos = next_open.end()
+        else:
+            depth -= 1
+            pos = next_close.end()
+            if depth <= 0:
+                return next_close.start()
+    return limit
+
+
+def _article_body_text(page: str) -> str:
+    """Первые несколько абзацев реального текста статьи из контейнера
+    _ARTICLE_BODY_CLASS_RE (в его настоящих границах, см.
+    _article_container_end), или пустая строка, если такого контейнера нет."""
+    m = _ARTICLE_BODY_CLASS_RE.search(page)
+    if not m:
+        return ""
+    tag_start = page.rfind("<", 0, m.start())
+    tm = _TAG_START_RE.match(page, tag_start) if tag_start != -1 else None
+    if tm is None:
+        return ""
+    scan_limit = min(len(page), tag_start + ARTICLE_BODY_SCAN)
+    end = _article_container_end(page, tag_start, tm.group(1).lower(), scan_limit)
+    scope = page[tag_start:end]
+    paragraphs: list[str] = []
+    total = 0
+    for pm in _ARTICLE_P_RE.finditer(scope):
+        text = strip_html(pm.group(1)).strip()
+        if not text:
+            continue
+        paragraphs.append(text)
+        total += len(text)
+        if total >= ARTICLE_BODY_LIMIT:
+            break
+    return "\n\n".join(paragraphs)[:ARTICLE_BODY_LIMIT]
+
 
 def _meta_tags(head: str, keys: tuple[str, ...] = META_KEYS) -> dict[str, str]:
     """Метатеги страницы, отфильтрованные по нужным ключам — страницу
@@ -831,6 +907,11 @@ async def fetch_article_entry(url: str, published_ts: float, published: str) -> 
         if metas.get(key):
             summary = html.unescape(metas[key]).strip()
             break
+
+    # Реальный текст статьи вместо тизера — см. _article_body_text.
+    body_text = _article_body_text(page)
+    if body_text:
+        summary = body_text
 
     image = ""
     for key in META_KEYS:

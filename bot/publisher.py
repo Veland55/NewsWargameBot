@@ -721,9 +721,17 @@ class Publisher:
                 log.warning("лента #%s: LLM отказала (%s)", feed_id, exc)
                 if self.st.get("on_llm_error") != "raw":
                     # Новость остаётся непрочитанной: лучше опубликовать её
-                    # позже обработанной, чем сейчас — сырой.
+                    # позже обработанной, чем сейчас — сырой. Пишем и в БД
+                    # (не только в self._postponed, который живёт только до
+                    # конца этого прохода) — иначе в веб-панели админ не видит
+                    # вообще ничего, пока сам не откроет журнал.
                     self._postponed.append((feed["title"] or f"лента #{feed_id}",
                                             str(exc)))
+                    self.st.add_postponed(
+                        feed_id=feed_id, key=key, title=entry.title, summary=entry.summary,
+                        link=entry.link, published=entry.published, image=entry.image,
+                        error=str(exc),
+                    )
                     continue
                 post = await self._fallback_post(entry, feed)
 
@@ -735,6 +743,10 @@ class Publisher:
                 sent = await self._send(post.text, image=post.image, images=post.images)
                 if sent:
                     self.st.mark_seen(feed_id, key)
+                    # Могла раньше отказать и попасть в очередь «Отложенные» —
+                    # теперь прошла (автоматически или после того как админ
+                    # починил бэкенд), убираем оттуда.
+                    self.st.remove_postponed(feed_id, key)
                     published += 1
                     self._record_post(feed_id, entry, feed, post, sent)
                     # После отметки о прочтении: новость уже не повторится, значит
@@ -1170,6 +1182,37 @@ class Publisher:
         if not sent:
             return "Не удалось опубликовать — канал недоступен или не задан."
         self._record_post(feed["id"] if feed else None, entry, feed, post, sent)
+        await self.send_vk(post)
+        return None
+
+    async def retry_postponed(self, item_id: int) -> str | None:
+        """Повторная попытка одной записи из очереди «Отложенные» (веб-панель,
+        раздел «Ленты») — не дожидаясь следующего автоматического цикла.
+        Возвращает None при успехе, иначе текст ошибки — запись остаётся в
+        очереди с обновлённым счётчиком попыток."""
+        row = self.st.postponed_item(item_id)
+        if row is None:
+            return "Запись не найдена — возможно, уже обработана."
+        feed_id, key = row["feed_id"], row["key"]
+        feed = self.st.feed(feed_id)
+        entry = Entry(key_parts=(key,), title=row["title"], link=row["link"],
+                      summary=row["summary"], published=row["published"], published_ts=0,
+                      image=row["image"])
+        try:
+            post = await self.build_post(entry, feed)
+        except LLMError as exc:
+            self.st.add_postponed(
+                feed_id=feed_id, key=key, title=row["title"], summary=row["summary"],
+                link=row["link"], published=row["published"], image=row["image"],
+                error=str(exc),
+            )
+            return f"Модель снова отказала: {exc}"
+        sent = await self._send(post.text, image=post.image, images=post.images)
+        if not sent:
+            return "Не удалось опубликовать — канал недоступен или не задан."
+        self.st.mark_seen(feed_id, key)
+        self.st.remove_postponed(feed_id, key)
+        self._record_post(feed_id, entry, feed, post, sent)
         await self.send_vk(post)
         return None
 

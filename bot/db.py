@@ -109,6 +109,29 @@ CREATE TABLE IF NOT EXISTS dedup_candidates (
     detected_at     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dedup_detected ON dedup_candidates (detected_at DESC);
+
+-- Новости, которые модель не смогла обработать (LLM отказала) — не
+-- публикуются сами. Источник истины по-прежнему `seen` (запись остаётся
+-- непрочитанной и переоценивается каждый цикл автоматически, см.
+-- Publisher._process_feed) — эта таблица только для видимости в
+-- веб-панели («Отложенные») и ручного повтора/отказа, ключ (feed_id, key)
+-- тот же, что и в `seen`, чтобы обе стороны не расходились.
+CREATE TABLE IF NOT EXISTS postponed (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    feed_id         INTEGER NOT NULL,
+    key             TEXT NOT NULL,
+    title           TEXT NOT NULL DEFAULT '',
+    summary         TEXT NOT NULL DEFAULT '',
+    link            TEXT NOT NULL DEFAULT '',
+    published       TEXT NOT NULL DEFAULT '',
+    image           TEXT NOT NULL DEFAULT '',
+    error           TEXT NOT NULL DEFAULT '',
+    attempts        INTEGER NOT NULL DEFAULT 1,
+    first_failed_at INTEGER NOT NULL,
+    last_failed_at  INTEGER NOT NULL,
+    UNIQUE (feed_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_postponed_last ON postponed (last_failed_at DESC);
 """
 
 DEFAULT_TEMPLATE = """\
@@ -385,6 +408,7 @@ class Storage:
         with self._lock:
             cur = self._conn.execute("DELETE FROM feeds WHERE id = ?", (feed_id,))
             self._conn.execute("DELETE FROM seen WHERE feed_id = ?", (feed_id,))
+            self._conn.execute("DELETE FROM postponed WHERE feed_id = ?", (feed_id,))
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -662,6 +686,65 @@ class Storage:
             self._conn.execute("DELETE FROM dedup_candidates WHERE detected_at < ?", (cutoff,))
             self._conn.commit()
 
+    # --- отложенные из-за отказа ИИ (веб-панель, «Отложенные») --------------
+    def add_postponed(self, *, feed_id: int, key: str, title: str, summary: str,
+                      link: str, published: str, image: str, error: str) -> None:
+        """Upsert по (feed_id, key) — повторный отказ той же записи не плодит
+        дубли строк, а обновляет счётчик попыток и последнюю ошибку."""
+        now = int(time.time())
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO postponed (feed_id, key, title, summary, link, published, "
+                "image, error, attempts, first_failed_at, last_failed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?) "
+                "ON CONFLICT(feed_id, key) DO UPDATE SET "
+                "error = excluded.error, attempts = attempts + 1, last_failed_at = excluded.last_failed_at",
+                (feed_id, key, title, summary, link, published, image, error, now, now),
+            )
+            self._conn.commit()
+
+    def remove_postponed(self, feed_id: int, key: str) -> None:
+        """Запись обработалась (автоматически на следующем цикле или через
+        ручной повтор в веб-панели) — убираем из очереди."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM postponed WHERE feed_id = ? AND key = ?", (feed_id, key)
+            )
+            self._conn.commit()
+
+    def postponed_list(self, limit: int = 50) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT p.*, f.title AS feed_title FROM postponed p "
+                "LEFT JOIN feeds f ON f.id = p.feed_id "
+                "ORDER BY p.last_failed_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+
+    def postponed_item(self, item_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT p.*, f.title AS feed_title FROM postponed p "
+                "LEFT JOIN feeds f ON f.id = p.feed_id WHERE p.id = ?", (item_id,)
+            ).fetchone()
+
+    def delete_postponed(self, item_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM postponed WHERE id = ?", (item_id,))
+            self._conn.commit()
+
+    def count_postponed(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS n FROM postponed").fetchone()
+            return int(row["n"]) if row else 0
+
+    def prune_postponed(self, keep_days: int = 30) -> None:
+        """Отложенные, которые не разрешились месяц (лента отключена/удалена,
+        либо проблема так и не исправлена) — чистим, как и dedup_candidates."""
+        cutoff = int(time.time() - keep_days * 86400)
+        with self._lock:
+            self._conn.execute("DELETE FROM postponed WHERE last_failed_at < ?", (cutoff,))
+            self._conn.commit()
+
     def drop_alerts_except(self, day: str) -> None:
         """Чистим отметки об отправленных предупреждениях за прошлые дни."""
         with self._lock:
@@ -685,6 +768,7 @@ class Storage:
         self.prune_page_images()
         self.prune_posts()
         self.prune_dedup_candidates()
+        self.prune_postponed()
         with self._lock:
             # TRUNCATE возвращает файл WAL к нулю, а не просто помечает
             # содержимое переиспользуемым.

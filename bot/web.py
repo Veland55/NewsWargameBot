@@ -1011,6 +1011,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if errors:
             feeds_value += f' <span class="pill off">{len(errors)} с ошибкой</span>'
         dupes = st.count_dedup_candidates()
+        postponed = st.count_postponed()
         stats = [
             ("Модель", _e(pub.active_backend_label)),
             ("Канал", _e(pub.channel or "не задан")),
@@ -1018,6 +1019,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             ("VK", ('<span class="pill on">' + _e(pub.vk_group) + '</span>')
                    if pub.vk_on else '<span class="pill neutral">выключен</span>'),
         ]
+        if postponed:
+            stats.append(("Отложенные", f'<a href="/feeds#postponed" class="pill off" '
+                                        f'style="text-decoration:none;">{postponed} ждут — '
+                                        f'модель отказала ›</a>'))
         if dupes:
             stats.append(("Дубли", f'<a href="/feeds#duplicates" class="pill warn" style="text-decoration:none;">{dupes} на разбор ›</a>'))
         stat_html = "".join(
@@ -1095,6 +1100,35 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         <div class="list">{items}</div>
         """
 
+    def _postponed_section_html(st: "Storage") -> str:
+        """Новости, на которых модель отказала (сбой бэкенда, квота, гео-блок
+        и т.п.) — не потеряны, каждый автопроход переоценивает их заново
+        сам, но до тех пор админ не видел вообще ничего, кроме почасового
+        отчёта в личке. Пусто — секция не рендерится, как и «Дубли»."""
+        rows = st.postponed_list(50)
+        if not rows:
+            return ""
+        items = ""
+        for r in rows:
+            when = time.strftime("%d.%m %H:%M", time.localtime(r["last_failed_at"]))
+            attempts = f" · попыток: {r['attempts']}" if r["attempts"] > 1 else ""
+            items += f"""<div class="list-item">
+              <div class="list-item-info">
+                <div class="list-item-title">{_e(r['title'][:140])}</div>
+                <div class="muted">{_e(r['feed_title'] or 'лента удалена')} · отказ {when}{attempts}</div>
+                <div class="muted" style="color:var(--red)">{_e(r['error'][:150])}</div>
+              </div>
+              <div class="list-item-actions">
+                <a class="btn icon" href="/postponed/{r['id']}" title="Подробнее" aria-label="Подробнее">›</a>
+              </div>
+            </div>"""
+        return f"""
+        <h2 id="postponed">Отложенные <span class="muted" style="font-weight:400;">({len(rows)})</span></h2>
+        <div class="section-hint">Модель отказала при обработке — новость не потеряна и переоценивается
+          сама на каждом автопроходе; здесь можно повторить прямо сейчас или отказаться от публикации.</div>
+        <div class="list">{items}</div>
+        """
+
     def _feed_row_html(f: sqlite3.Row, request: web.Request, st: "Storage") -> str:
         """Строка ленты или сайта без RSS — разметка общая: управление (свой
         промпт, несколько картинок, пауза, удаление) не зависит от того,
@@ -1134,6 +1168,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                         search_prefill: dict[str, str] | None = None) -> web.Response:
         st: Storage = app["st"]
         dupes_html = _dupes_section_html(st)
+        postponed_html = _postponed_section_html(st)
         rows = st.feeds()
         rss_rows = [f for f in rows if f["kind"] != "search"]
         search_rows = [f for f in rows if f["kind"] == "search"]
@@ -1162,6 +1197,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         search_prefill = search_prefill or {}
 
         body = f"""
+        {postponed_html}
         {dupes_html}
         <h2>Ленты <span class="muted" style="font-weight:400;">({len(rss_rows)})</span></h2>
         <details {"open" if rss_prefill else ""}>
@@ -1897,6 +1933,63 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         st.delete_dedup_candidate(cid)
         return await feeds_get(request, flash="Убрано из очереди.")
 
+    # --- отложенные из-за отказа ИИ ----------------------------------------
+    async def postponed_detail(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        pid = int(request.match_info["id"])
+        row = st.postponed_item(pid)
+        if row is None:
+            raise web.HTTPNotFound(text="Запись не найдена — возможно, уже обработана")
+        when_first = time.strftime("%d.%m %H:%M", time.localtime(row["first_failed_at"]))
+        when_last = time.strftime("%d.%m %H:%M", time.localtime(row["last_failed_at"]))
+        image_html = (f'<img src="{_safe_href(row["image"])}" alt="" '
+                      f'style="max-width:100%; border-radius:10px; margin-top:10px;">'
+                      if row["image"] and _is_http_url(row["image"]) else "")
+        body = f"""
+        <div><a href="/feeds#postponed" class="back-link">‹ Ленты</a></div>
+        <h2 class="page-heading after-back">Отложено #{row['id']}</h2>
+        <div class="card">
+          <div class="line"><b>{_e(row['title'])}</b></div>
+          <div class="muted">{_e(row['feed_title'] or 'лента удалена')} ·
+            <a href="{_safe_href(row['link'])}" target="_blank" rel="noopener">исходная новость</a></div>
+          <div class="muted" style="margin-top:6px;">Первый отказ {when_first}, последний {when_last},
+            попыток: {row['attempts']}</div>
+          <div class="muted" style="color:var(--red); margin-top:6px;">{_e(row['error'])}</div>
+          {image_html}
+          <hr class="sep">
+          <div class="field-hint" style="margin:0 0 6px;">Как есть в ленте, без обработки ИИ:</div>
+          <pre class="post">{_e(row['summary'] or '(пусто)')}</pre>
+          <div class="card-actions">
+            <form method="post" action="/postponed/{row['id']}/retry">{csrf_field(request)}
+              <button class="primary" type="submit">🔄 Повторить сейчас</button></form>
+            <form method="post" action="/postponed/{row['id']}/delete"
+                  onsubmit="return tgConfirmSubmit(this, 'Отказаться от публикации? Новость больше не будет предложена.')">{csrf_field(request)}
+              <button class="link-btn" type="submit">Не публиковать</button></form>
+          </div>
+        </div>
+        """
+        return web.Response(text=_layout(f"Отложено #{row['id']}", body, active="/feeds"), content_type="text/html")
+
+    async def postponed_retry(request: web.Request) -> web.Response:
+        pub: Publisher = app["publisher"]
+        pid = int(request.match_info["id"])
+        error = await pub.retry_postponed(pid)
+        if error:
+            return await feeds_get(request, flash=error, flash_kind="err")
+        return await feeds_get(request, flash="Опубликовано.")
+
+    async def postponed_delete(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        pid = int(request.match_info["id"])
+        row = st.postponed_item(pid)
+        if row is not None:
+            # Убираем и из очереди, и из «непрочитанного» — иначе запись
+            # молча вернулась бы в канал на следующем автопроходе, хотя
+            # админ только что явно сказал «не публиковать».
+            st.mark_seen(row["feed_id"], row["key"])
+            st.delete_postponed(pid)
+        return await feeds_get(request, flash="Отклонено — публиковаться не будет.")
+
     app.router.add_get("/login", login_get)
     app.router.add_post("/login", login_post)
     app.router.add_post("/tg-login", tg_login_post)
@@ -1932,6 +2025,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_get("/duplicates/{id}", duplicate_detail)
     app.router.add_post("/duplicates/{id}/publish", duplicate_publish)
     app.router.add_post("/duplicates/{id}/delete", duplicate_delete)
+    app.router.add_get("/postponed/{id}", postponed_detail)
+    app.router.add_post("/postponed/{id}/retry", postponed_retry)
+    app.router.add_post("/postponed/{id}/delete", postponed_delete)
 
     return app
 
