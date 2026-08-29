@@ -82,7 +82,8 @@ async def run() -> None:
     bing = BingNewsClient()
     publisher = Publisher(bot, storage, llm, cfg.channel_id,
                           admin_ids=cfg.admin_ids, quota=quota, vk=vk, claude=claude,
-                          gemini=gemini, search=search, bing=bing)
+                          gemini=gemini, search=search, bing=bing,
+                          panel_url=cfg.web_panel_public_url)
 
     dp = Dispatcher()
     handlers.setup(handlers.router, cfg.admin_ids)

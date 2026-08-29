@@ -132,6 +132,35 @@ CREATE TABLE IF NOT EXISTS postponed (
     UNIQUE (feed_id, key)
 );
 CREATE INDEX IF NOT EXISTS idx_postponed_last ON postponed (last_failed_at DESC);
+
+-- Готовые посты, ждущие ручного согласования (settings.manual = 1). В
+-- отличие от `postponed`, запись помечается прочитанной СРАЗУ при
+-- постановке в очередь (см. Publisher._queue_for_review): текст уже
+-- сгенерирован моделью и лежит здесь как есть, переоценивать его каждый
+-- проход — заново тратить лимит ИИ и плодить дубли карточек. Отклонение —
+-- обычный DELETE, новость сама не вернётся (mark_seen уже стоит).
+CREATE TABLE IF NOT EXISTS moderation (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    feed_id      INTEGER NOT NULL,
+    key          TEXT NOT NULL,
+    title        TEXT NOT NULL DEFAULT '',    -- заголовок исходной новости, для списка
+    summary      TEXT NOT NULL DEFAULT '',    -- исходный текст, для /regen и "как в ленте"
+    link         TEXT NOT NULL DEFAULT '',
+    source       TEXT NOT NULL DEFAULT '',
+    published    TEXT NOT NULL DEFAULT '',
+    text         TEXT NOT NULL DEFAULT '',    -- готовый пост (HTML) — то, что уйдёт в канал
+    image        TEXT NOT NULL DEFAULT '',    -- первая картинка, адрес (байты не храним — см. план)
+    extra_images TEXT NOT NULL DEFAULT '',    -- остальные адреса альбома, по одному в строке
+    multi        INTEGER NOT NULL DEFAULT 0,  -- лента была в режиме "несколько картинок"
+    status       TEXT NOT NULL DEFAULT 'queued',   -- 'queued' | 'publishing'
+    claimed_at   INTEGER NOT NULL DEFAULT 0,  -- когда взяли в публикацию — protects от гонки/двойного клика
+    claimed_by   TEXT NOT NULL DEFAULT '',
+    error        TEXT NOT NULL DEFAULT '',    -- последняя неудача публикации
+    queued_at    INTEGER NOT NULL,
+    edited_at    INTEGER,
+    UNIQUE (feed_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_moderation_queued ON moderation (queued_at DESC);
 """
 
 DEFAULT_TEMPLATE = """\
@@ -188,6 +217,16 @@ DEFAULTS: dict[str, str] = {
     "dedup_enabled": "1",      # не публиковать новость, похожую на уже опубликованную с другой ленты
     "dedup_window_days": "3",  # за сколько последних дней сравнивать посты
     "dedup_threshold": "55",   # % схожести (заголовок+summary), после которого считаем дублем
+    # Названо "moderation", не "manual" — у run_once(manual=...) "manual" уже
+    # значит "запущено вручную командой /checknow", это про другое: здесь —
+    # режим, в котором посты ждут согласования (команда /manual on|off,
+    # см. bot/handlers.py). Разные имена в коде — чтобы не путать эти два
+    # смысла друг с другом при чтении Publisher.
+    "moderation": "0",              # ручное согласование: посты не публикуются сами, ждут одобрения
+    "moderation_max_queue": "100",  # больше — новые новости не обрабатываем, пока не разберут (0 = без лимита)
+    "moderation_notify": "1",       # слать админам сводку о новых карточках на согласование
+    "moderation_remind_hours": "0", # напомнить, если очередь не разбирают N часов (0 = не напоминать)
+    "moderation_keep_days": "14",   # авто-отклонение карточек старше N дней при уборке
 }
 
 # Лимиты бесплатных моделей OpenRouter (значения из их документации).
@@ -221,6 +260,7 @@ class Storage:
             self._migrate_sitemap_kind_to_search()
             self._migrate_usage_backend_column()
             self._conn.commit()
+        self.reset_stuck_moderation()
 
     def _migrate(self) -> None:
         """Добавляет колонки, появившиеся после создания базы.
@@ -409,6 +449,7 @@ class Storage:
             cur = self._conn.execute("DELETE FROM feeds WHERE id = ?", (feed_id,))
             self._conn.execute("DELETE FROM seen WHERE feed_id = ?", (feed_id,))
             self._conn.execute("DELETE FROM postponed WHERE feed_id = ?", (feed_id,))
+            self._conn.execute("DELETE FROM moderation WHERE feed_id = ?", (feed_id,))
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -745,6 +786,146 @@ class Storage:
             self._conn.execute("DELETE FROM postponed WHERE last_failed_at < ?", (cutoff,))
             self._conn.commit()
 
+    # --- очередь ручного согласования (settings.manual) ---------------------
+    def add_moderation(self, *, feed_id: int, key: str, title: str, summary: str,
+                       link: str, source: str, published: str, text: str,
+                       image: str, extra_images: str, multi: bool) -> int | None:
+        """INSERT OR IGNORE по (feed_id, key) — None, если уже стояла (гонка
+        автопрохода и /checknow), иначе id новой карточки."""
+        now = int(time.time())
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO moderation (feed_id, key, title, summary, link, "
+                "source, published, text, image, extra_images, multi, queued_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (feed_id, key, title, summary, link, source, published, text,
+                 image, extra_images, int(multi), now),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid) if cur.rowcount else None
+
+    def moderation_list(self, limit: int = 25, offset: int = 0) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT m.*, f.title AS feed_title FROM moderation m "
+                "LEFT JOIN feeds f ON f.id = m.feed_id "
+                "ORDER BY m.queued_at DESC, m.id DESC LIMIT ? OFFSET ?", (limit, offset)
+            ).fetchall()
+
+    def moderation_neighbor(self, item_id: int) -> int | None:
+        """id следующей карточки в том же порядке, что moderation_list
+        (сначала новые) — чтобы после публикации/отклонения перейти сразу к
+        следующей, не возвращаясь в список. Тай-брейк по id обязателен: у
+        карточек одного прохода queued_at совпадает секунда в секунду."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT queued_at, id FROM moderation WHERE id = ?", (item_id,)
+            ).fetchone()
+            if cur is None:
+                return None
+            row = self._conn.execute(
+                "SELECT id FROM moderation WHERE queued_at < ? OR (queued_at = ? AND id < ?) "
+                "ORDER BY queued_at DESC, id DESC LIMIT 1",
+                (cur["queued_at"], cur["queued_at"], cur["id"]),
+            ).fetchone()
+            return int(row["id"]) if row else None
+
+    def moderation_item(self, item_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT m.*, f.title AS feed_title FROM moderation m "
+                "LEFT JOIN feeds f ON f.id = m.feed_id WHERE m.id = ?", (item_id,)
+            ).fetchone()
+
+    def update_moderation_text(self, item_id: int, text: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE moderation SET text = ?, edited_at = ? WHERE id = ?",
+                (text, int(time.time()), item_id),
+            )
+            self._conn.commit()
+
+    def claim_moderation(self, item_id: int, actor: str, stale_after: int) -> bool:
+        """Атомарный захват карточки под публикацию одним UPDATE (как
+        Storage.set_if_absent, только на строке очереди) — второй админ,
+        нажавший «Опубликовать» на ту же карточку почти одновременно,
+        получит False вместо второй публикации в канале. Захват «протухает»
+        через stale_after секунд: если процесс упал или Telegram завис между
+        отправкой и удалением карточки, она не должна остаться в
+        'publishing' навсегда — иначе её будет нельзя ни опубликовать
+        повторно, ни отклонить."""
+        now = int(time.time())
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE moderation SET status='publishing', claimed_at=?, claimed_by=? "
+                "WHERE id=? AND (status='queued' OR (status='publishing' AND claimed_at < ?))",
+                (now, actor, item_id, now - stale_after),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def release_moderation(self, item_id: int, error: str) -> None:
+        """Публикация не удалась — возвращаем в очередь, а не оставляем
+        застрявшей в 'publishing' до истечения stale_after."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE moderation SET status='queued', error=? WHERE id=?",
+                (error, item_id),
+            )
+            self._conn.commit()
+
+    def reset_stuck_moderation(self) -> None:
+        """При старте процесса ни одной настоящей публикации 'в полёте' быть
+        не может — снимаем застрявший с прошлого раза claim."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE moderation SET status='queued', claimed_at=0 WHERE status='publishing'"
+            )
+            self._conn.commit()
+
+    def delete_moderation(self, item_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM moderation WHERE id = ?", (item_id,))
+            self._conn.commit()
+
+    def restore_moderation(self, row: sqlite3.Row) -> None:
+        """Возвращает только что отклонённую карточку — «Отменить» во
+        флеше (см. web.py). Вставляет с тем же id, что был: столбец
+        AUTOINCREMENT не мешает явной вставке конкретного, ещё не занятого
+        значения — иначе ссылка «Отменить», уже отрисованная в ответе на
+        предыдущий запрос, вела бы в карточку с другим номером."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO moderation (id, feed_id, key, title, summary, link, "
+                "source, published, text, image, extra_images, multi, status, claimed_at, "
+                "claimed_by, error, queued_at, edited_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, '', '', ?, ?)",
+                (row["id"], row["feed_id"], row["key"], row["title"], row["summary"], row["link"],
+                 row["source"], row["published"], row["text"], row["image"], row["extra_images"],
+                 row["multi"], row["queued_at"], row["edited_at"]),
+            )
+            self._conn.commit()
+
+    def count_moderation(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS n FROM moderation").fetchone()
+            return int(row["n"]) if row else 0
+
+    def oldest_moderation_at(self) -> int | None:
+        with self._lock:
+            row = self._conn.execute("SELECT MIN(queued_at) AS ts FROM moderation").fetchone()
+            return int(row["ts"]) if row and row["ts"] is not None else None
+
+    def prune_moderation(self, keep_days: int = 14) -> int:
+        """В отличие от prune_postponed/prune_dedup_candidates — это ГОТОВЫЕ
+        посты, молча выбрасывать их нельзя, поэтому возвращаем число
+        удалённых, чтобы вызывающий код мог о них сообщить админам."""
+        cutoff = int(time.time() - keep_days * 86400)
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM moderation WHERE queued_at < ?", (cutoff,))
+            self._conn.commit()
+            return cur.rowcount
+
     def drop_alerts_except(self, day: str) -> None:
         """Чистим отметки об отправленных предупреждениях за прошлые дни."""
         with self._lock:
@@ -754,7 +935,8 @@ class Storage:
             )
             self._conn.commit()
 
-    def maintain(self, keep_seen: int, keep_usage_days: int = 60) -> dict[str, int]:
+    def maintain(self, keep_seen: int, keep_usage_days: int = 60,
+                keep_moderation_days: int = 14) -> dict[str, int]:
         """Периодическая уборка: обрезает таблицы и ужимает WAL.
 
         Без неё отметки о прочитанном подчищались только у тех лент, которые
@@ -769,13 +951,14 @@ class Storage:
         self.prune_posts()
         self.prune_dedup_candidates()
         self.prune_postponed()
+        moderation_pruned = self.prune_moderation(keep_moderation_days)
         with self._lock:
             # TRUNCATE возвращает файл WAL к нулю, а не просто помечает
             # содержимое переиспользуемым.
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self._conn.execute("PRAGMA optimize")
             self._conn.commit()
-        return {"before": before, "after": self.db_bytes()}
+        return {"before": before, "after": self.db_bytes(), "moderation_pruned": moderation_pruned}
 
     def db_bytes(self) -> int:
         """Размер базы вместе с WAL — то, что реально занято на диске."""

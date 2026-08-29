@@ -24,7 +24,7 @@ import secrets
 import sqlite3
 import time
 from typing import Awaitable, Callable
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -36,7 +36,7 @@ from .llm import LLMError
 from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, html_problem,
                         tg_len)
 from .quota import until_reset
-from .rss import Entry, fetch
+from .rss import Entry, fetch, strip_html
 from .search import site_query
 
 log = logging.getLogger(__name__)
@@ -46,11 +46,13 @@ SESSION_TTL = 7 * 24 * 3600      # неделя — снова логинить�
 LOGIN_MAX_FAILS = 5              # неудачных попыток с одного адреса
 LOGIN_LOCKOUT = 15 * 60          # прежде чем снова можно пробовать
 REGEN_DRAFT_TTL = 24 * 3600      # черновик, который так и не сохранили — не копить в памяти вечно
+UNDO_TTL = 20                    # окно «Отменить» после отклонения карточки очереди согласования
 
 SETTINGS_EDITABLE = (
     "interval", "max_per_cycle", "post_delay", "backfill",
     "max_age_days", "flood_guard", "keep_seen",
     "alert_thresholds", "free_daily_limit", "max_images",
+    "moderation_max_queue", "moderation_remind_hours", "moderation_keep_days",
 )
 SETTINGS_TOGGLES = ("require_russian", "disable_preview", "images", "og_image")
 
@@ -77,6 +79,14 @@ GENERAL_GROUPS: list[tuple[str, list[tuple[str, str, str, str]]]] = [
     ]),
     ("Картинки", [
         ("max_images", "Картинок в альбом", "1-10", "Сколько скачивать за раз лентам с «несколькими картинками» — включается у каждой ленты отдельно, на «Лентах»"),
+    ]),
+    ("Ручное согласование", [
+        ("moderation_max_queue", "Потолок очереди", "карточек",
+         "Больше — новые новости не обрабатываются, пока не разберёте текущие. 0 — без ограничения"),
+        ("moderation_remind_hours", "Напомнить через", "ч",
+         "Если самая старая карточка ждёт дольше — пришлём напоминание. 0 — не напоминать"),
+        ("moderation_keep_days", "Автоотклонение через", "дней",
+         "Карточки, которые никто не разобрал столько дней, отклоняются сами"),
     ]),
 ]
 
@@ -229,6 +239,7 @@ STYLE = """
   --blue: #42d4e0; --blue-dim: #0e262a; --blue-hover: #6fe0ea;
   --green: #4ade80; --green-dim: #132818; --green-text: #a3f5c0;
   --amber: #e8b13a; --amber-dim: #2f2410;
+  --purple: #c792ea; --purple-dim: #241f30;
   --red: #ff6b6b; --red-dim: #301316; --red-border: #4a2226; --red-hover: #3d181b; --red-text: #ffb4b4;
   --gray-dim: #182019; --gray: #84998b;
   --btn-hover: #182219; --btn-border-hover: #2c4033;
@@ -349,6 +360,10 @@ h3 { font-size: 10.5px; color: var(--text-faint); margin: 0 0 8px; font-weight: 
 .card.scroll { overflow-x: auto; }
 .card + h2 { margin-top: 24px; }
 .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+/* Отдельный класс, не .row — на узком экране .row > * растягивается на всю
+   ширину (!important, см. media-запрос ниже), и «‹ Назад / Стр. N / Вперёд ›»
+   встали бы тремя полными строками вместо одной компактной. */
+.pager { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; gap: 8px; }
 .row > * { flex: 1 1 220px; }
 .row > button, .row > .btn { flex: 0 1 auto; }
 .row:last-child { margin-bottom: 0; }
@@ -423,6 +438,9 @@ h2.page-heading.after-back { margin-top: 6px; }
          border-left: 3px solid transparent; }
 .flash.ok { background: var(--green-dim); color: var(--green-text); border-left-color: var(--green); }
 .flash.err { background: var(--red-dim); color: var(--red-text); border-left-color: var(--red); }
+.flash form { display: inline; margin-left: 8px; }
+.flash .undo-btn { background: none; border: none; padding: 0; font: inherit; color: inherit;
+                   text-decoration: underline; cursor: pointer; }
 .muted { color: var(--text-dim); font-size: 12.5px; }
 .mono { font-family: var(--font); font-size: 12.5px; overflow-wrap: anywhere; }
 .mono.ellipsis { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
@@ -457,6 +475,12 @@ a.list-item:hover { background: var(--card-hover); }
 .list-item-title { color: var(--text); font-size: 13.5px; overflow-wrap: break-word; }
 .list-item-actions { display: flex; gap: 6px; flex-shrink: 0; align-items: center; }
 .list-item-chevron { color: var(--text-faint); font-size: 18px; flex-shrink: 0; }
+/* Строка с быстрыми действиями (очередь согласования): открыть карточку —
+   тап по всей строке (.list-item-cover накрывает её целиком), а кнопки
+   быстрых действий лежат выше по стеку и получают клик первыми. */
+.list-item.actionable { position: relative; }
+.list-item-cover { position: absolute; inset: 0; z-index: 0; }
+.list-item.actionable .list-item-actions { position: relative; z-index: 1; }
 .dupe-thumb { width: 64px; height: 64px; border-radius: var(--radius-sm); flex-shrink: 0; }
 /* Дашборд: сетка карточек-метрик вместо списка строк «подпись: значение» —
    легче окинуть взглядом состояние бота целиком. */
@@ -474,10 +498,12 @@ a.list-item:hover { background: var(--card-hover); }
 }
 .hero-card.paused { border-left-color: var(--amber); }
 .hero-card.debug { border-left-color: var(--blue); }
+.hero-card.moderation { border-left-color: var(--purple); }
 .hero-card .hero-state { font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 9px; }
 .hero-card .hero-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
 .hero-card.paused .hero-dot { background: var(--amber); }
 .hero-card.debug .hero-dot { background: var(--blue); }
+.hero-card.moderation .hero-dot { background: var(--purple); }
 .hero-card .hero-sub { color: var(--text-dim); font-size: 12px; margin-top: 3px; }
 /* Выбор ИИ-бэкенда в настройках — три варианта в виде селектируемых строк
    вместо трёх отдельных карточек-дублей с одинаковой формой включения.
@@ -530,6 +556,12 @@ a.list-item:hover { background: var(--card-hover); }
   .card-actions { flex-direction: column; align-items: stretch; }
   .card-actions button.primary { width: 100%; }
   .card-actions .link-btn { align-self: center; }
+  /* Когда каждая кнопка в .card-actions — своя отдельная <form> (несколько
+     независимых действий подряд, как в очереди согласования), stretch выше
+     растягивает саму форму, а не кнопку внутри неё — кнопка остаётся по
+     размеру текста и прижимается к левому краю. display:contents убирает
+     форму из раскладки, оставляя кнопку прямым flex-элементом. */
+  .card-actions > form { display: contents; }
 }
 @media (min-width: 641px) {
   .side-nav { display: flex; }
@@ -593,10 +625,14 @@ a.list-item:hover { background: var(--card-hover); }
   .list.list-grid .list-item:nth-child(odd) { border-right: 1px solid var(--border-soft); }
   .list.list-grid .list-item:last-child { border-right: none; }
   .dupe-thumb { width: 44px; height: 44px; }
-  .content-grid, .settings-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 0 22px; align-items: start; }
+  .content-grid, .settings-columns { display: grid; gap: 0 22px; align-items: start; }
   /* Промпт и формат — сознательно парная пара карточек рядом; тянем их до
      одной высоты, чтобы кнопки под ними не разъезжались на разных уровнях. */
-  .content-grid { align-items: stretch; }
+  .content-grid { grid-template-columns: 1fr 1fr; align-items: stretch; }
+  /* auto-fit, не жёсткие 1fr 1fr: карточек в этом блоке то 4, то 5 (появилось
+     «Согласование») — при нечётном числе жёсткая сетка оставляла бы половину
+     последней строки пустой; auto-fit сам решает, сколько влезает в ряд. */
+  .settings-columns { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
   .content-grid > div { display: flex; flex-direction: column; }
   .content-grid .card { display: flex; flex-direction: column; flex: 1; }
   .content-grid .card form { display: flex; flex-direction: column; flex: 1; }
@@ -687,6 +723,13 @@ function tgConfirmSubmit(form, message) {
   var tg = window.Telegram && window.Telegram.WebApp;
   if (!tg) return;
   try { tg.ready(); tg.expand(); } catch (e) {}
+  // Каждая страница по умолчанию прячет MainButton/BackButton — это полная
+  // перезагрузка страницы, а не SPA, так что состояние кнопок с прошлой
+  // страницы (см. очередь согласования ниже) иначе могло бы протечь на
+  // страницы, которые о нём не знают. Кто хочет свои — включает сам,
+  // ниже, в собственном <script> конкретной страницы.
+  try { if (tg.MainButton) tg.MainButton.hide(); } catch (e) {}
+  try { if (tg.BackButton) tg.BackButton.hide(); } catch (e) {}
   function applyInsets() {
     var sa = tg.safeAreaInset || {}, csa = tg.contentSafeAreaInset || {};
     document.documentElement.style.setProperty('--tg-top', ((sa.top||0)+(csa.top||0)) + 'px');
@@ -710,6 +753,7 @@ function tgConfirmSubmit(form, message) {
 NAV_ITEMS = [
     ("/", "📊", "Статус"),
     ("/feeds", "📰", "Ленты"),
+    ("/queue", "🖐", "Очередь"),
     ("/content", "📝", "Контент"),
     ("/settings", "⚙️", "Настройки"),
     ("/posts", "📮", "Посты"),
@@ -745,8 +789,11 @@ async def _usage_body(pub: "Publisher") -> str:
 
 
 def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok", active: str = "",
-           wide: bool = False) -> str:
-    flash_html = f'<div class="flash {flash_kind}">{_e(flash)}</div>' if flash else ""
+           wide: bool = False, flash_action: str = "") -> str:
+    # flash_action — готовый HTML (например, форма «Отменить»), не текст:
+    # вызывающий код сам решает, что туда положить, поэтому не экранируем,
+    # в отличие от flash. Пусто по умолчанию — большинство флешей его не используют.
+    flash_html = (f'<div class="flash {flash_kind}">{_e(flash)}{flash_action}</div>' if flash else "")
 
     nav_html = "".join(
         f'<a href="{path}" class="nav-link{" active" if path == active else ""}">'
@@ -780,7 +827,17 @@ def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok", acti
 </body></html>"""
 
 
-def _login_page(error: str = "") -> str:
+def _safe_next(path: str) -> str:
+    """Путь для возврата после входа — только свой же адрес. Без этого
+    /login?next=https://... стал бы открытым редиректом, а голый "//evil"
+    браузер тоже понимает как переход на чужой хост."""
+    if path and path.startswith("/") and not path.startswith("//") and "://" not in path:
+        return path
+    return "/"
+
+
+def _login_page(error: str = "", next_path: str = "/") -> str:
+    next_path = _safe_next(next_path)
     err_html = f'<div class="flash err">{_e(error)}</div>' if error else ""
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
@@ -790,11 +847,12 @@ def _login_page(error: str = "") -> str:
 <style>{STYLE}</style></head><body>
 <main style="max-width:360px; margin:calc(15vh + var(--tg-top)) auto 0;">
   <div style="text-align:center; font-size:34px; margin-bottom:6px;">📰</div>
-  <h2 style="justify-content:center;">Вход в панель</h2>
+  <h2 style="text-align:center;">Вход в панель</h2>
   {err_html}
   <div id="tgLoginNote" class="flash ok" style="display:none;">Вхожу через Telegram…</div>
   <div class="card">
     <form method="post" action="/login">
+      <input type="hidden" name="next" value="{_e(next_path)}">
       <label for="login-password">Пароль</label>
       <input type="password" id="login-password" name="password" required>
       <div style="margin-top:12px;"><button class="primary" type="submit" style="width:100%;">Войти</button></div>
@@ -803,6 +861,7 @@ def _login_page(error: str = "") -> str:
 </main>
 <script>
 (function () {{
+  var nextPath = {json.dumps(next_path)};
   var tg = window.Telegram && window.Telegram.WebApp;
   if (!tg || !tg.initData) {{
     // Вне Telegram авто-входа не будет — фокус на пароль как раньше,
@@ -820,7 +879,7 @@ def _login_page(error: str = "") -> str:
   function finish(ok) {{
     if (settled) return;
     settled = true;
-    if (ok) {{ location.href = '/'; }}
+    if (ok) {{ location.href = nextPath; }}
     else {{ document.getElementById('tgLoginNote').style.display = 'none'; }}
   }}
   setTimeout(function () {{ finish(false); }}, 6000);
@@ -837,6 +896,16 @@ def _login_page(error: str = "") -> str:
 
 def _redirect(path: str) -> web.HTTPFound:
     return web.HTTPFound(path)
+
+
+def _gone_page(title: str, message: str, status: int = 404,
+              back_href: str = "/", back_label: str = "На главную") -> web.Response:
+    """Страница-тупик (404/битый id и т.п.) через _layout, а не голый текст —
+    в Telegram Mini App системного «назад» может не быть вовсе, без ссылки
+    это реальный тупик, не только неаккуратная вёрстка."""
+    body = (f'<div class="card"><p>{_e(message)}</p>'
+           f'<a class="btn" href="{_e(back_href)}">{_e(back_label)}</a></div>')
+    return web.Response(status=status, text=_layout(title, body), content_type="text/html")
 
 
 # ======================== приложение ========================
@@ -858,6 +927,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     # время создания): если админ так и не сохранил и не открыл пост заново,
     # запись иначе осталась бы в памяти процесса навсегда — см. REGEN_DRAFT_TTL.
     app["regen_drafts"]: dict[int, tuple[str, float]] = {}
+    # Последняя отклонённая карточка очереди согласования — для «Отменить»
+    # во флеше вместо confirm()-диалога на каждое отклонение (см.
+    # queue_reject/queue_undo). Один слот, не словарь: «отменить» имеет
+    # смысл только для самого недавнего действия, более ранние уже не
+    # актуальны, а хранить историю ради этого незачем.
+    app["undo_stash"]: tuple[dict, float] | None = None
     # SameSite=Lax (без Secure) — обычный браузер по прямому https/http-адресу.
     # SameSite=None+Secure — когда панель открыта как Telegram Mini App
     # (WEB_PANEL_PUBLIC_URL задан, Telegram требует https для WebApp URL):
@@ -880,7 +955,13 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         try:
             return await handler(request)
         except ValueError:
-            return web.Response(status=404, text="Не найдено — некорректный идентификатор в адресе.")
+            return _gone_page("Не найдено", "Некорректный идентификатор в адресе.")
+        except web.HTTPNotFound as exc:
+            # Хендлеры делают `raise web.HTTPNotFound(text="...")` (запись уже
+            # удалена/обработана — обычное дело для очередей на разбор, не
+            # только опечатка в адресе) — тот же тупик без стилей и выхода,
+            # если не перехватить здесь и не отрисовать через _layout.
+            return _gone_page("Не найдено", exc.text or "Запись не найдена.")
 
     app.middlewares.append(bad_id_middleware)
 
@@ -905,7 +986,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             return await handler(request)
         session = auth.verify(request.cookies.get(SESSION_COOKIE))
         if session is None:
-            return _redirect("/login")
+            # ?next= — чтобы после входа вернуться туда, куда шли (например,
+            # по кнопке "Открыть очередь" из уведомления), а не на дашборд.
+            return _redirect(f"/login?next={quote(request.path, safe='')}")
         request["csrf"] = session["csrf"]
         if request.method == "POST":
             form = await request.post()
@@ -926,9 +1009,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
     # --- аутентификация ---------------------------------------------------
     async def login_get(request: web.Request) -> web.Response:
+        next_path = _safe_next(request.query.get("next", "/"))
         if auth.verify(request.cookies.get(SESSION_COOKIE)):
-            return _redirect("/")
-        return web.Response(text=_login_page(), content_type="text/html")
+            return _redirect(next_path)
+        return web.Response(text=_login_page(next_path=next_path), content_type="text/html")
 
     def client_ip(request: web.Request) -> str:
         # За nginx (см. SETUP.md) request.remote — всегда 127.0.0.1, и все
@@ -951,17 +1035,20 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
     async def login_post(request: web.Request) -> web.Response:
         ip = client_ip(request)
+        form = await request.post()
+        next_path = _safe_next(str(form.get("next", "/")))
         if auth.locked_out(ip):
             return web.Response(
-                text=_login_page(f"Слишком много попыток — подождите {LOGIN_LOCKOUT // 60} минут."),
+                text=_login_page(f"Слишком много попыток — подождите {LOGIN_LOCKOUT // 60} минут.",
+                                 next_path=next_path),
                 content_type="text/html", status=429)
-        form = await request.post()
         if not auth.check(str(form.get("password", ""))):
             auth.record_fail(ip)
-            return web.Response(text=_login_page("Неверный пароль."), content_type="text/html", status=401)
+            return web.Response(text=_login_page("Неверный пароль.", next_path=next_path),
+                                content_type="text/html", status=401)
         auth.record_success(ip)
         token = auth.new_session()
-        resp = _redirect("/")
+        resp = _redirect(next_path)
         resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, **app["cookie_kwargs"])
         return resp
 
@@ -999,10 +1086,15 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         active = sum(1 for f in feeds if f["enabled"])
         errors = [f for f in feeds if f["last_error"]]
         paused = st.get("paused") == "1"
+        queue_n = st.count_moderation()
         if pub.debug and paused:
             hero_class, state_text = "debug", "Отладка · на паузе"
         elif pub.debug:
             hero_class, state_text = "debug", "Отладка — посты в личку"
+        elif pub.moderation and paused:
+            hero_class, state_text = "moderation", "Согласование · на паузе"
+        elif pub.moderation:
+            hero_class, state_text = "moderation", f"Согласование{f' · ждут: {queue_n}' if queue_n else ''}"
         elif paused:
             hero_class, state_text = "paused", "На паузе"
         else:
@@ -1019,6 +1111,13 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             ("VK", ('<span class="pill on">' + _e(pub.vk_group) + '</span>')
                    if pub.vk_on else '<span class="pill neutral">выключен</span>'),
         ]
+        # Пилюлю очереди согласования показываем и без включённого режима —
+        # выключили с непустой очередью, сами карточки не публикуются (см.
+        # settings_moderation), забыть про них иначе легко.
+        if queue_n:
+            stats.append(("Согласование", f'<a href="/queue" class="pill" '
+                                          f'style="text-decoration:none; background:var(--purple-dim); '
+                                          f'color:var(--purple);">{queue_n} ждут ›</a>'))
         if postponed:
             stats.append(("Отложенные", f'<a href="/feeds#postponed" class="pill off" '
                                         f'style="text-decoration:none;">{postponed} ждут — '
@@ -1072,6 +1171,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         dupes = st.dedup_candidates(50)
         if not dupes:
             return ""
+        total = st.count_dedup_candidates()
+        more_note = (f'<div class="muted" style="margin-top:6px;">Показаны первые 50 из {total}.</div>'
+                    if total > len(dupes) else "")
         matched_ids = st.existing_post_ids(
             [r["matched_post_id"] for r in dupes if r["matched_post_id"]])
         items = ""
@@ -1095,9 +1197,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
               </div>
             </div>"""
         return f"""
-        <h2 id="duplicates">Дубли <span class="muted" style="font-weight:400;">({len(dupes)})</span></h2>
+        <h2 id="duplicates">Дубли <span class="muted" style="font-weight:400;">({total})</span></h2>
         <div class="section-hint">Похожи на уже опубликованные с другой ленты — не в канале, ждут решения.</div>
         <div class="list">{items}</div>
+        {more_note}
         """
 
     def _postponed_section_html(st: "Storage") -> str:
@@ -1108,6 +1211,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         rows = st.postponed_list(50)
         if not rows:
             return ""
+        total = st.count_postponed()
+        more_note = (f'<div class="muted" style="margin-top:6px;">Показаны первые 50 из {total}.</div>'
+                    if total > len(rows) else "")
         items = ""
         for r in rows:
             when = time.strftime("%d.%m %H:%M", time.localtime(r["last_failed_at"]))
@@ -1123,10 +1229,11 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
               </div>
             </div>"""
         return f"""
-        <h2 id="postponed">Отложенные <span class="muted" style="font-weight:400;">({len(rows)})</span></h2>
+        <h2 id="postponed">Отложенные <span class="muted" style="font-weight:400;">({total})</span></h2>
         <div class="section-hint">Модель отказала при обработке — новость не потеряна и переоценивается
           сама на каждом автопроходе; здесь можно повторить прямо сейчас или отказаться от публикации.</div>
         <div class="list">{items}</div>
+        {more_note}
         """
 
     def _feed_row_html(f: sqlite3.Row, request: web.Request, st: "Storage") -> str:
@@ -1328,8 +1435,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             if is_custom else ""
         )
         reset_btn = (f'<button type="submit" form="reset-feed-template-{feed_id}" class="link-btn" '
-                    f'onclick="return confirm(\'Вернуть общий промпт? Свой текст для этой ленты будет потерян.\')">'
-                    f'Вернуть общий промпт</button>' if is_custom else "")
+                    f'onclick="return tgConfirmSubmit(this.form, \'Вернуть общий промпт? Свой текст для '
+                    f'этой ленты будет потерян.\')">Вернуть общий промпт</button>' if is_custom else "")
         body = f"""
         <div><a href="/feeds" class="back-link">‹ Все ленты</a></div>
         <h2 class="page-heading after-back">Промпт ленты #{feed_id}</h2>
@@ -1406,7 +1513,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             <div class="card-actions">
               <button class="primary" type="submit">Сохранить промпт</button>
               <button type="submit" form="reset-template" class="link-btn"
-                      onclick="return confirm('Сбросить промпт к умолчанию? Текущий текст будет потерян.')">Сбросить к умолчанию</button>
+                      onclick="return tgConfirmSubmit(this.form, 'Сбросить промпт к умолчанию? Текущий текст будет потерян.')">Сбросить к умолчанию</button>
             </div>
           </form>
           <form id="reset-template" method="post" action="/content/prompt/reset">{csrf_field(request)}</form>
@@ -1423,7 +1530,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             <div class="card-actions">
               <button class="primary" type="submit">Сохранить формат</button>
               <button type="submit" form="reset-format" class="link-btn"
-                      onclick="return confirm('Сбросить формат к умолчанию? Текущий текст будет потерян.')">Сбросить к умолчанию</button>
+                      onclick="return tgConfirmSubmit(this.form, 'Сбросить формат к умолчанию? Текущий текст будет потерян.')">Сбросить к умолчанию</button>
             </div>
           </form>
           <form id="reset-format" method="post" action="/content/format/reset">{csrf_field(request)}</form>
@@ -1464,18 +1571,24 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         return _redirect("/content")
 
     # --- настройки -------------------------------------------------------
-    async def settings_get(request: web.Request, flash: str = "", flash_kind: str = "ok") -> web.Response:
+    async def settings_get(request: web.Request, flash: str = "", flash_kind: str = "ok",
+                           prefill: dict[str, str] | None = None) -> web.Response:
         st: Storage = app["st"]
         pub: Publisher = app["publisher"]
+        prefill = prefill or {}
 
         def field(key: str, label: str, unit: str, hint: str) -> str:
             # title=hint — на широком экране .field-hint обрезается в одну
             # строку (иначе разнобой в высоте подсказок раздувает раздел
             # «Настройки» по вертикали), полный текст всплывает по наведению.
             # for=/id= — без них скринридер объявляет поле безымянным.
+            # prefill — то, что админ только что ввёл (при ошибке валидации
+            # в ОДНОМ поле форма иначе перерисовывалась бы значениями из БД,
+            # молча стирая правки во всех остальных полях того же сохранения).
             field_id = f"field-{_e(key)}"
+            value = prefill.get(key, st.get(key))
             return (f'<div class="field"><label for="{field_id}">{_e(label)} <span class="unit">({_e(unit)})</span></label>'
-                    f'<input type="text" id="{field_id}" name="{_e(key)}" value="{_e(st.get(key))}">'
+                    f'<input type="text" id="{field_id}" name="{_e(key)}" value="{_e(value)}">'
                     f'<div class="field-hint" title="{_e(hint)}">{_e(hint)}</div></div>')
 
         groups_html = "".join(
@@ -1579,6 +1692,21 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         </div>
 
         <div>
+        <h2>Согласование</h2>
+        <div class="card">
+          <div class="line">Сейчас: <span class="pill {'on' if pub.moderation else 'neutral'}">{'включено' if pub.moderation else 'выключено'}</span></div>
+          <p class="muted">Готовые посты не публикуются сами — ждут одобрения в
+            <a href="/queue">очереди</a>. {'В отладке не действует.' if pub.debug else ''}</p>
+          <form method="post" action="/settings/moderation">{csrf_field(request)}
+            <div class="card-actions">
+              <button class="{'' if pub.moderation else 'primary'}" type="submit">
+                {'Выключить' if pub.moderation else 'Включить согласование'}</button>
+            </div>
+          </form>
+        </div>
+        </div>
+
+        <div>
         <h2>VK</h2>
         <div class="card">
           <div class="line">Сейчас: <span class="pill {'on' if pub.vk_on else 'neutral'}">
@@ -1627,6 +1755,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     async def settings_general(request: web.Request) -> web.Response:
         st: Storage = app["st"]
         form = request["form"]
+        # Всё, что ввёл админ в этой отправке — если валидация упадёт на
+        # одном поле, форма перерисуется этим (а не старыми значениями из
+        # БД) и правки во всех остальных полях не потеряются молча.
+        prefill = {k: str(form.get(k, "")).strip() for k in SETTINGS_EDITABLE if k in form}
         # Сначала проверяем всё и только потом пишем — иначе при ошибке в
         # одном поле часть остальных уже была бы сохранена, а флеш говорит
         # "ничего не сохранено", что вводит в заблуждение.
@@ -1639,13 +1771,15 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             if k == "alert_thresholds":
                 parts = [p for p in v.replace(" ", "").split(",") if p]
                 if not parts or not all(_ascii_digits(p) and 1 <= int(p) <= 100 for p in parts):
-                    return await settings_get(request, f"«{label}» — числа 1-100 через запятую.", "err")
+                    return await settings_get(request, f"«{label}» — числа 1-100 через запятую.", "err",
+                                              prefill=prefill)
                 v = ",".join(str(int(p)) for p in sorted({int(p) for p in parts}))
             elif k == "max_images":
                 if not _ascii_digits(v) or not (1 <= int(v) <= 10):
-                    return await settings_get(request, "Картинок в альбом — число от 1 до 10.", "err")
+                    return await settings_get(request, "Картинок в альбом — число от 1 до 10.", "err",
+                                              prefill=prefill)
             elif not _ascii_digits(v):
-                return await settings_get(request, f"«{label}» должно быть числом.", "err")
+                return await settings_get(request, f"«{label}» должно быть числом.", "err", prefill=prefill)
             to_set[k] = v
         for k, v in to_set.items():
             st.set(k, v)
@@ -1657,6 +1791,25 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         st: Storage = app["st"]
         st.set("debug", "0" if st.get("debug") == "1" else "1")
         return _redirect("/settings")
+
+    async def settings_moderation(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        turning_on = st.get("moderation") != "1"
+        st.set("moderation", "1" if turning_on else "0")
+        if turning_on:
+            pending = st.count_moderation()
+            flash = ("✅ Согласование включено. Новости больше не публикуются сами — "
+                    "собираются в очереди («Согласование» в меню). Уже опубликованное "
+                    "не трогается.")
+            if pending:
+                flash += f" В очереди уже есть {pending} карточек с прошлого раза."
+        else:
+            pending = st.count_moderation()
+            flash = "✅ Согласование выключено, публикую в канал автоматически."
+            if pending:
+                flash += (f" В очереди осталось {pending} карточек — сами они не уйдут, "
+                         f"разберите вручную («Согласование» в меню).")
+        return await settings_get(request, flash)
 
     async def settings_vk(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -1714,7 +1867,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             "<div style='font-size:28px; margin-bottom:8px;'>📮</div>"
             "<div class='muted'>Опубликованных постов пока нет.</div></div>"
         )
-        body = f"<h2 class='page-heading'>Последние посты</h2><div class='list'>{list_html}</div>"
+        body = (f"<h2 class='page-heading'>Последние посты "
+               f"<span class='muted' style='font-weight:400;'>(до 30)</span></h2>"
+               f"<div class='list'>{list_html}</div>")
         return web.Response(text=_layout("Посты", body, active="/posts"), content_type="text/html")
 
     async def post_detail(request: web.Request, draft: str | None = None,
@@ -1990,6 +2145,373 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             st.delete_postponed(pid)
         return await feeds_get(request, flash="Отклонено — публиковаться не будет.")
 
+    # --- очередь ручного согласования (self.moderation) ---------------------
+    QUEUE_PER_PAGE = 20
+
+    def _queue_row_html(request: web.Request, r: sqlite3.Row, page: int) -> str:
+        thumb = (f'<img class="dupe-thumb" src="{_safe_href(r["image"])}" alt="" '
+                f'style="object-fit:cover;">'
+                if r["image"] and _is_http_url(r["image"])
+                else '<div class="dupe-thumb" style="background:var(--field-bg);"></div>')
+        when = time.strftime("%d.%m %H:%M", time.localtime(r["queued_at"]))
+        badges = ""
+        if r["status"] == "publishing":
+            badges += ' <span class="pill warn">публикуется…</span>'
+        if r["error"]:
+            badges += ' <span class="pill off">ошибка публикации</span>'
+        if r["edited_at"]:
+            badges += ' <span class="pill neutral">ред.</span>'
+        # Заголовок исходной новости из ленты — ориентир в списке; но
+        # публикуется сгенерированный текст (r["text"]), который отличается
+        # и без которого непонятно, что реально готово уйти в канал.
+        preview = _e(strip_html(r["text"])[:100])
+        page_field = f'<input type="hidden" name="page" value="{page}">' if page else ""
+        # Открыть карточку можно тапом по всей строке — ссылка накрывает её
+        # целиком (position:absolute поверх контента, см. .list-item.
+        # actionable), а кнопки быстрых действий лежат выше по z-index и
+        # получают клик первыми. Публикация/отклонение отсюда — без захода
+        # в карточку; для отказа не спрашиваем подтверждение — есть «Отменить»
+        # в флеше (см. queue_reject/queue_undo), а не для публикации — та
+        # необратима, доверяем разовому tgConfirmSubmit.
+        return f"""<div class="list-item actionable">
+          <a href="/queue/{r['id']}?page={page}" class="list-item-cover" aria-label="Открыть #{r['id']}"></a>
+          {thumb}
+          <div class="list-item-info">
+            <div class="list-item-title">{_e(r['title'][:140])}{badges}</div>
+            <div class="muted">{_e(r['feed_title'] or 'лента удалена')} · {when}</div>
+            <div class="muted" style="margin-top:2px;">{preview}</div>
+          </div>
+          <div class="list-item-actions">
+            <form method="post" action="/queue/{r['id']}/publish"
+                  onsubmit="return tgConfirmSubmit(this, 'Опубликовать в канал прямо сейчас?')">
+              {csrf_field(request)}{page_field}
+              <button class="icon" type="submit" title="Опубликовать" aria-label="Опубликовать">✅</button></form>
+            <form method="post" action="/queue/{r['id']}/reject">{csrf_field(request)}{page_field}
+              <button class="icon" type="submit" title="Отклонить" aria-label="Отклонить">🚫</button></form>
+          </div>
+        </div>"""
+
+    def _undo_flash_action(request: web.Request, page: str = "") -> str:
+        page_field = f'<input type="hidden" name="page" value="{_e(page)}">' if page else ""
+        return (f'<form method="post" action="/queue/undo">{csrf_field(request)}{page_field}'
+               f'<button type="submit" class="undo-btn">Отменить</button></form>')
+
+    async def queue_get(request: web.Request, flash: str = "", flash_kind: str = "ok",
+                        page_override: int | None = None, flash_action: str = "") -> web.Response:
+        st: Storage = app["st"]
+        pub: Publisher = app["publisher"]
+        if page_override is not None:
+            page = max(1, page_override)
+        else:
+            try:
+                page = max(1, int(request.query.get("page", "1")))
+            except ValueError:
+                page = 1
+        total = st.count_moderation()
+        pages = max(1, -(-total // QUEUE_PER_PAGE))
+        page = min(page, pages)
+        rows = st.moderation_list(limit=QUEUE_PER_PAGE, offset=(page - 1) * QUEUE_PER_PAGE)
+        items = "".join(_queue_row_html(request, r, page) for r in rows) if rows else (
+            "<div style='padding:28px 16px; text-align:center;'>"
+            "<div style='font-size:28px; margin-bottom:8px;'>🖐</div>"
+            "<div class='muted'>Очередь пуста.</div></div>"
+        )
+        pager = ""
+        if pages > 1:
+            prev_html = (f'<a href="/queue?page={page - 1}" class="btn">‹ Назад</a>'
+                        if page > 1 else '<span class="btn" style="visibility:hidden;">‹ Назад</span>')
+            next_html = (f'<a href="/queue?page={page + 1}" class="btn">Вперёд ›</a>'
+                        if page < pages else '<span class="btn" style="visibility:hidden;">Вперёд ›</span>')
+            pager = (f'<div class="pager">{prev_html}'
+                    f'<span class="muted">Стр. {page} из {pages}</span>{next_html}</div>')
+        if not total:
+            hint = ("" if pub.moderation else
+                   "<div class='section-hint'>Режим выключен, новости публикуются сами — включить "
+                   "можно в Настройках. Когда очередь появится, карточки будут ждать здесь.</div>")
+        elif pub.moderation:
+            hint = ("<div class='section-hint'>Новости не уходят в канал, пока вы их не одобрите "
+                    "здесь — откройте карточку, чтобы отредактировать, опубликовать или отклонить.</div>")
+        else:
+            hint = ("<div class='section-hint'>Согласование сейчас выключено — новые новости "
+                   "публикуются автоматически. Здесь то, что накопилось раньше — само не уйдёт, "
+                   "разберите вручную или включите режим обратно в Настройках.</div>")
+        body = f"""
+        <h2 class="page-heading">Согласование <span class="muted" style="font-weight:400;">({total})</span></h2>
+        {hint}
+        <div class="list">{items}</div>
+        {pager}
+        """
+        return web.Response(text=_layout("Согласование", body, flash, flash_kind, active="/queue",
+                                         flash_action=flash_action),
+                            content_type="text/html")
+
+    async def queue_detail(request: web.Request, draft: str | None = None,
+                           flash: str = "", flash_kind: str = "ok", flash_action: str = "",
+                           page: str = "", item_id_override: int | None = None) -> web.Response:
+        st: Storage = app["st"]
+        # item_id_override — переход к следующей карточке сразу после
+        # публикации/отклонения (см. queue_publish/queue_reject), без
+        # промежуточного захода в список: id из URL был бы уже не той
+        # карточки, которую нужно показать.
+        item_id = item_id_override if item_id_override is not None else int(request.match_info["id"])
+        row = st.moderation_item(item_id)
+        if row is None:
+            raise web.HTTPNotFound(text="Запись не найдена — возможно, уже обработана (опубликована, "
+                                        "отклонена или её взял в работу другой администратор).")
+        # ?page= — с какой страницы списка открыли карточку, чтобы кнопки
+        # ниже (и «‹ Согласование») вернули туда же, а не всегда на первую.
+        page = page or request.query.get("page", "")
+        back_href = f"/queue?page={page}" if page else "/queue"
+        page_field = f'<input type="hidden" name="page" value="{_e(page)}">' if page else ""
+        if draft is None and request.query.get("regen") == "1":
+            flash, flash_kind = "Черновик обновлён через ИИ.", "ok"
+        text = draft if draft is not None else row["text"]
+        draft_note = ('<p class="muted">⚠️ Черновик после перегенерации — ещё не сохранён отдельно, '
+                     'но уже виден ниже; жмите «Опубликовать» или поправьте и сохраните.</p>'
+                     if draft is not None else "")
+        when = time.strftime("%d.%m %H:%M", time.localtime(row["queued_at"]))
+        error_html = (f'<div class="muted" style="color:var(--red); margin-top:6px;">'
+                     f'Не удалось опубликовать в прошлый раз: {_e(row["error"])}</div>'
+                     if row["error"] else "")
+        publishing = row["status"] == "publishing"
+        status_html = ('<div class="muted" style="color:var(--amber); margin-top:6px;">'
+                      '⏳ Уже публикуется — либо вы только что нажали «Опубликовать», либо это '
+                      'делает другой администратор. Кнопки ниже разблокируются, если публикация '
+                      'оборвалась и не завершилась за несколько минут.</div>' if publishing else "")
+        disabled = "disabled" if publishing else ""
+
+        urls = [u for u in [row["image"], *row["extra_images"].split("\n")] if u]
+        gallery = ""
+        if len(urls) == 1 and _is_http_url(urls[0]):
+            gallery = (f'<a href="{_safe_href(urls[0])}" target="_blank" rel="noopener">'
+                      f'<img src="{_safe_href(urls[0])}" alt="" '
+                      f'style="max-width:100%; border-radius:10px; margin-top:10px;"></a>')
+        elif urls:
+            thumbs = "".join(
+                f'<a href="{_safe_href(u)}" target="_blank" rel="noopener">'
+                f'<img src="{_safe_href(u)}" alt="" style="width:100%; border-radius:8px; '
+                f'aspect-ratio:1; object-fit:cover;">{" <span class=\"pill neutral\">1-я, с подписью</span>" if i == 0 else ""}</a>'
+                for i, u in enumerate(urls) if _is_http_url(u)
+            )
+            gallery = (f'<div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(100px,1fr)); '
+                      f'gap:8px; margin-top:10px;">{thumbs}</div>'
+                      f'<div class="muted" style="margin-top:4px;">Альбом — уйдёт без подписи под каждой '
+                      f'картинкой, текст отдельным сообщением следом.</div>' if len(urls) > 1 else "")
+
+        caption_note = ("Альбом — картинки уйдут без общей подписи, текст отдельным сообщением следом."
+                        if row["multi"] and len(urls) > 1 else
+                        f"С картинкой и текстом длиннее {TG_CAPTION_LIMIT} — уйдёт текстом, "
+                        f"картинка станет превью-ссылкой над ним.")
+
+        body = f"""
+        <div><a href="{back_href}" class="back-link">‹ Согласование</a></div>
+        <h2 class="page-heading after-back">На согласовании #{row['id']}</h2>
+        <div class="card">
+          <div class="line"><b>{_e(row['title'])}</b></div>
+          <div class="muted">{_e(row['feed_title'] or 'лента удалена')} · поставлено {when} ·
+            <a href="{_safe_href(row['link'])}" target="_blank" rel="noopener">исходная новость</a></div>
+          {error_html}
+          {status_html}
+          {gallery}
+          <details style="margin-top:10px;">
+            <summary class="disclosure">Как есть в ленте, без обработки ИИ</summary>
+            <pre class="post">{_e(row['summary'] or '(пусто)')}</pre>
+          </details>
+          <hr class="sep">
+          {draft_note}
+          <form method="post" action="/queue/{row['id']}/publish" id="queue-publish-form">{csrf_field(request)}{page_field}
+            <label>Текст поста — уйдёт в канал как есть</label>
+            <textarea name="text" rows="{_rows_for(text, min_rows=8)}" maxlength="{TG_LIMIT}">{_e(text)}</textarea>
+            <div class="muted" style="margin-top:4px;">Лимит: {TG_LIMIT} символов. {caption_note}</div>
+            <div class="card-actions">
+              <button class="primary" type="submit" {disabled}
+                      onclick="return tgConfirmSubmit(this.form, 'Опубликовать в канал прямо сейчас?')">
+                ✅ Опубликовать</button>
+              <button type="submit" formaction="/queue/{row['id']}/save" {disabled}>💾 Сохранить черновик</button>
+            </div>
+          </form>
+        </div>
+        <div class="card">
+          <form method="post" action="/queue/{row['id']}/regen?page={page}">{csrf_field(request)}
+            <label>Перегенерировать через ИИ из исходной новости</label>
+            <p class="field-hint" style="margin:0 0 8px;">Пожелание необязательно. Заменит текст выше —
+              несохранённые правки в поле пропадут.</p>
+            <div class="row">
+              <input type="text" name="extra" placeholder="например: короче и без хештегов" style="flex:1;">
+              <button type="submit" {disabled}>🤖 Перегенерировать</button>
+            </div>
+          </form>
+        </div>
+        <div class="card">
+          <div class="card-actions">
+            <form method="post" action="/queue/{row['id']}/preview">{csrf_field(request)}{page_field}
+              <button type="submit">👁 Показать в личке</button></form>
+            <form method="post" action="/queue/{row['id']}/reject">{csrf_field(request)}{page_field}
+              <button class="link-btn" type="submit" {disabled}>🚫 Отклонить</button></form>
+          </div>
+        </div>
+        <script>
+        (function () {{
+          // Родные кнопки Telegram (thumb zone внизу экрана, вне прокрутки) —
+          // необязательное улучшение поверх уже рабочих кнопок на странице:
+          // сама форма и её onclick/tgConfirmSubmit остаются рабочим
+          // способом опубликовать, если у клиента нет MainButton/BackButton
+          // или сеть/версия не подтянули API. Всё в try/catch — не должно
+          // ронять страницу, если что-то из этого недоступно.
+          var tg = window.Telegram && window.Telegram.WebApp;
+          if (!tg) return;
+          var publishing = {json.dumps(publishing)};
+          try {{
+            if (tg.BackButton) {{
+              tg.BackButton.show();
+              tg.BackButton.onClick(function () {{ location.href = {json.dumps(back_href)}; }});
+            }}
+          }} catch (e) {{}}
+          var form = document.getElementById('queue-publish-form');
+          if (!publishing && tg.MainButton && form) {{
+            try {{
+              tg.MainButton.setText('✅ Опубликовать');
+              tg.MainButton.show();
+              tg.MainButton.onClick(function () {{
+                if (tg.HapticFeedback) {{ try {{ tg.HapticFeedback.notificationOccurred('success'); }} catch (e) {{}} }}
+                if (window.tgConfirmSubmit) {{ tgConfirmSubmit(form, 'Опубликовать в канал прямо сейчас?'); }}
+                else {{ form.submit(); }}
+              }});
+            }} catch (e) {{}}
+          }}
+        }})();
+        </script>
+        """
+        return web.Response(text=_layout(f"Согласование #{row['id']}", body, flash, flash_kind, active="/queue",
+                                         flash_action=flash_action),
+                            content_type="text/html")
+
+    def _form_page(request: web.Request) -> str:
+        """Номер страницы списка, с которой открыли карточку — только цифры,
+        чтобы не тащить произвольный текст в query string."""
+        v = str(request["form"].get("page", "")).strip()
+        return v if v.isdigit() else ""
+
+    async def queue_save(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        item_id = int(request.match_info["id"])
+        row = st.moderation_item(item_id)
+        if row is None:
+            raise web.HTTPNotFound(text="Запись не найдена — возможно, уже обработана")
+        page = _form_page(request)
+        text = str(request["form"].get("text", "")).strip()
+        if not text:
+            return await queue_detail(request, flash="Пустой текст не сохранён.", flash_kind="err", page=page)
+        if tg_len(text) > TG_LIMIT:
+            return await queue_detail(request, draft=text, page=page,
+                                      flash=f"Текст длиннее лимита ({tg_len(text)} из {TG_LIMIT}) — не сохранено.",
+                                      flash_kind="err")
+        problem = html_problem(text)
+        if problem:
+            return await queue_detail(request, draft=text, page=page,
+                                      flash=f"Разметка не годится: {problem}", flash_kind="err")
+        st.update_moderation_text(item_id, text)
+        return await queue_detail(request, flash="Сохранено.", page=page)
+
+    async def queue_publish(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        pub: Publisher = app["publisher"]
+        item_id = int(request.match_info["id"])
+        row = st.moderation_item(item_id)
+        if row is None:
+            raise web.HTTPNotFound(text="Запись не найдена — возможно, уже обработана")
+        page = _form_page(request)
+        # Публикуем ровно то, что сейчас в поле формы, а не то, что лежало в
+        # БД до открытия страницы — иначе несохранённая правка молча
+        # терялась бы при нажатии «Опубликовать» (пост ушёл бы старым текстом).
+        # Из строки списка text не передаётся вовсе (там нет textarea) —
+        # это ожидаемо, публикуется как есть сохранённый в карточке текст.
+        text = str(request["form"].get("text", "")).strip()
+        if text and text != row["text"]:
+            if tg_len(text) > TG_LIMIT:
+                return await queue_detail(request, draft=text, page=page,
+                                          flash=f"Текст длиннее лимита ({tg_len(text)} из {TG_LIMIT}) — "
+                                               f"не опубликовано.", flash_kind="err")
+            problem = html_problem(text)
+            if problem:
+                return await queue_detail(request, draft=text, page=page,
+                                          flash=f"Разметка не годится: {problem}", flash_kind="err")
+            st.update_moderation_text(item_id, text)
+        # До публикации — после неё строки уже не будет, искать в ней «следующую» поздно.
+        next_id = st.moderation_neighbor(item_id)
+        error = await pub.publish_moderated(item_id)
+        if error:
+            return await queue_detail(request, flash=error, flash_kind="err", page=page)
+        if next_id is not None:
+            return await queue_detail(request, item_id_override=next_id, page=page,
+                                      flash="Опубликовано. Следующая карточка:")
+        return await queue_get(request, flash="Опубликовано — очередь разобрана.",
+                               page_override=int(page) if page else None)
+
+    async def queue_reject(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        item_id = int(request.match_info["id"])
+        page = _form_page(request)
+        row = st.moderation_item(item_id)
+        next_id = st.moderation_neighbor(item_id) if row is not None else None
+        if row is not None:
+            # На отмену — «Отменить» во флеше вместо confirm()-диалога на
+            # каждое отклонение (см. queue_undo). Один слот в памяти, не
+            # персистентно: окно всего UNDO_TTL секунд, переживать рестарт
+            # процесса ему незачем.
+            app["undo_stash"] = (dict(row), time.time())
+            st.delete_moderation(item_id)
+        if next_id is not None:
+            return await queue_detail(request, item_id_override=next_id, page=page,
+                                      flash="Отклонено.", flash_action=_undo_flash_action(request, page))
+        return await queue_get(request, flash="Отклонено — очередь разобрана.",
+                               page_override=int(page) if page else None,
+                               flash_action=_undo_flash_action(request, page))
+
+    async def queue_regen(request: web.Request) -> web.Response:
+        pub: Publisher = app["publisher"]
+        item_id = int(request.match_info["id"])
+        page = request.query.get("page", "")
+        extra = str(request["form"].get("extra", "")).strip()
+        error = await pub.regen_moderated(item_id, extra)
+        if error:
+            return await queue_detail(request, flash=error, flash_kind="err", page=page)
+        # Redirect, а не прямой рендер: обновление страницы после POST иначе
+        # переотправило бы этот же запрос и снова дёрнуло бы платную ИИ-модель
+        # (текст уже сохранён в карточке — черновик-в-памяти тут не нужен,
+        # в отличие от /posts/{id}/regen, см. Publisher.regen_moderated).
+        suffix = f"&page={page}" if page else ""
+        return _redirect(f"/queue/{item_id}?regen=1{suffix}")
+
+    async def queue_preview(request: web.Request) -> web.Response:
+        pub: Publisher = app["publisher"]
+        item_id = int(request.match_info["id"])
+        page = _form_page(request)
+        error = await pub.preview_moderated(item_id)
+        if error:
+            return await queue_detail(request, flash=error, flash_kind="err", page=page)
+        return await queue_detail(request, flash="Отправлено в личку — если панель открыта как Mini App, "
+                                                  "сверните её, чтобы увидеть сообщение.", page=page)
+
+    async def queue_undo(request: web.Request) -> web.Response:
+        """Возвращает последнюю отклонённую карточку — см. queue_reject.
+        Работает только в окне UNDO_TTL и только для самого недавнего
+        отклонения; более раннее уже не отменить (стэш — один слот)."""
+        st: Storage = app["st"]
+        stash = app["undo_stash"]
+        page = _form_page(request)
+        if stash is None:
+            return await queue_get(request, flash="Отменять уже нечего.", flash_kind="err",
+                                   page_override=int(page) if page else None)
+        row, stashed_at = stash
+        app["undo_stash"] = None
+        if time.time() - stashed_at > UNDO_TTL:
+            return await queue_get(request, flash="Слишком поздно — карточка уже удалена насовсем.",
+                                   flash_kind="err", page_override=int(page) if page else None)
+        st.restore_moderation(row)
+        return await queue_detail(request, item_id_override=row["id"], page=page,
+                                  flash="Восстановлено.")
+
     app.router.add_get("/login", login_get)
     app.router.add_post("/login", login_post)
     app.router.add_post("/tg-login", tg_login_post)
@@ -2015,6 +2537,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/settings/channel", settings_channel)
     app.router.add_post("/settings/general", settings_general)
     app.router.add_post("/settings/debug", settings_debug)
+    app.router.add_post("/settings/moderation", settings_moderation)
     app.router.add_post("/settings/vk", settings_vk)
     app.router.add_post("/settings/ai", settings_ai)
     app.router.add_get("/posts", posts_get)
@@ -2028,6 +2551,14 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_get("/postponed/{id}", postponed_detail)
     app.router.add_post("/postponed/{id}/retry", postponed_retry)
     app.router.add_post("/postponed/{id}/delete", postponed_delete)
+    app.router.add_get("/queue", queue_get)
+    app.router.add_get("/queue/{id}", queue_detail)
+    app.router.add_post("/queue/{id}/save", queue_save)
+    app.router.add_post("/queue/{id}/publish", queue_publish)
+    app.router.add_post("/queue/{id}/reject", queue_reject)
+    app.router.add_post("/queue/{id}/regen", queue_regen)
+    app.router.add_post("/queue/{id}/preview", queue_preview)
+    app.router.add_post("/queue/undo", queue_undo)
 
     return app
 

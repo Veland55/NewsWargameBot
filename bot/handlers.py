@@ -54,6 +54,13 @@ SETUP.md). Удобнее через веб-панель, раздел «Лен�
 /regen &lt;id&gt; [пожелание] — перегенерировать текст через ИИ из исходной новости
 /delimage &lt;id&gt; &lt;номер&gt; — убрать одну картинку из альбома (если их больше 1)
 
+<b>Ручное согласование</b>
+/manual on · /manual off — новости не публикуются сами, ждут одобрения
+/queue [n] — список новостей на согласовании (посмотреть картинки,
+отредактировать, опубликовать или отклонить — удобнее в веб-панели,
+раздел «Согласование»). Бот пришлёт сообщение, как только появится
+новая новость на согласование.
+
 <b>Отладка</b>
 /debug on · /debug off — посты приходят в личку вместо канала
 /usage — расход лимита ИИ за сутки
@@ -720,12 +727,16 @@ async def cmd_checknow(message: Message, st: Storage, publisher: Publisher) -> N
         tail += f", в VK: {stats['vk']}"
     if stats.get("postponed"):
         tail += f", отложено: {stats['postponed']}"
+    if stats.get("queued"):
+        tail += f", на согласование: {stats['queued']}"
     hint = ""
     if stats.get("postponed"):
         hint = ("\n\n⏳ Отложенные новости модель не смогла обработать. Они не "
                 "потеряны и уйдут в канал со следующей попыткой — подробности "
                 "в журнале. Публиковать такие без обработки: "
                 "<code>/set on_llm_error raw</code>.")
+    if stats.get("queued") and not hint:
+        hint = "\n\n🖐 Новости ждут согласования — /queue или веб-панель, раздел «Согласование»."
     if debug and not stats["published"]:
         hint = ("\n\nНовых новостей нет. Отладка показывает только непрочитанные — "
                 "чтобы посмотреть на конкретной новости, используйте "
@@ -932,6 +943,63 @@ async def cmd_debug(message: Message, command: CommandObject, st: Storage,
     await _reply(message, f"Режим отладки {state}.\n"
                           f"Как использовать: <code>/debug on</code> · "
                           f"<code>/debug off</code>")
+
+
+@router.message(Command("manual"))
+async def cmd_manual(message: Message, command: CommandObject, st: Storage,
+                     publisher: Publisher) -> None:
+    arg = (command.args or "").strip().lower()
+    if arg in ("on", "вкл", "1"):
+        st.set("moderation", "1")
+        pending = st.count_moderation()
+        extra = f"\n\nВ очереди уже есть {pending} карточек с прошлого включения." if pending else ""
+        await _reply(
+            message,
+            "🖐 <b>Ручное согласование включено.</b>\n\n"
+            "· новости больше не публикуются сами — собираются в очереди "
+            "на согласование (<code>/queue</code> или веб-панель, раздел "
+            "«Согласование»)\n"
+            "· новость помечается прочитанной сразу при постановке в очередь "
+            "— повторно её не обработает\n"
+            "· уже опубликованное не трогается\n"
+            "· отложенные из-за отказа модели и дубли между лентами — "
+            "отдельные очереди, работают как раньше\n"
+            "· в режиме отладки (<code>/debug</code>) не действует\n\n"
+            f"Выключить: <code>/manual off</code>{extra}",
+        )
+        return
+    if arg in ("off", "выкл", "0"):
+        st.set("moderation", "0")
+        pending = st.count_moderation()
+        extra = (f"\n\n⚠️ В очереди осталось {pending} карточек — сами они не уйдут, "
+                f"разберите вручную (<code>/queue</code>)." if pending else "")
+        await _reply(message, "✅ Ручное согласование выключено, публикую в канал "
+                             f"автоматически.{extra}")
+        return
+    state = "включено 🖐" if publisher.moderation else "выключено"
+    pending = st.count_moderation()
+    queue_line = f"\nВ очереди на согласование: {pending}." if pending else ""
+    await _reply(message, f"Ручное согласование {state}.{queue_line}\n"
+                          f"Как использовать: <code>/manual on</code> · "
+                          f"<code>/manual off</code> · список — <code>/queue</code>")
+
+
+@router.message(Command("queue"))
+async def cmd_queue(message: Message, command: CommandObject, st: Storage) -> None:
+    n = _parse_id(command.args)
+    n = 10 if n is None else max(1, min(30, n))
+    rows = st.moderation_list(limit=n)
+    if not rows:
+        await _reply(message, "Очередь на согласование пуста.")
+        return
+    lines = [f"<b>На согласовании</b> (до {n} из {st.count_moderation()})"]
+    for r in rows:
+        when = time.strftime("%d.%m %H:%M", time.localtime(r["queued_at"]))
+        lines.append(f"#{r['id']} · {_e((r['feed_title'] or 'лента удалена'))}: "
+                     f"{_e(r['title'][:70])} ({when})")
+    lines.append("\nПосмотреть картинки, отредактировать, опубликовать или "
+                 "отклонить — в веб-панели, раздел «Согласование».")
+    await _reply(message, "\n".join(lines))
 
 
 @router.message(Command("feedimages"))
@@ -1421,13 +1489,20 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
             "require_russian", "disable_preview", "images", "og_image",
             "max_images",
             "keep_seen", "alert_thresholds", "free_daily_limit",
-            "dedup_enabled", "dedup_window_days", "dedup_threshold")
+            "dedup_enabled", "dedup_window_days", "dedup_threshold",
+            "moderation_max_queue", "moderation_remind_hours", "moderation_keep_days")
     dupes = st.count_dedup_candidates()
+    postponed = st.count_postponed()
+    queue_n = st.count_moderation()
     multi_feeds = sum(1 for f in feeds if f["multi_images"])
     search_feeds = sum(1 for f in feeds if f["kind"] == "search")
     mode = "⏸ на паузе" if paused else "▶️ работает"
+    if publisher.moderation:
+        mode = f"🖐 согласование — ждут: {queue_n}, /manual off чтобы публиковать самому"
     if publisher.debug:
         mode = "🔧 отладка — посты в личку, /debug off чтобы публиковать"
+        if publisher.moderation:
+            mode += " (согласование приостановлено, пока отладка включена)"
     claude = publisher.claude
     gemini = publisher.gemini
     await _reply(
@@ -1447,6 +1522,8 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
         + (f", без RSS (поиск): {search_feeds}" if search_feeds else "") + "\n"
         + (f"Несколько картинок: у {multi_feeds} из {len(feeds)} лент — /feedimages <id>\n"
            if multi_feeds else "")
+        + (f"На согласовании: {queue_n} — /queue или веб-панель\n" if queue_n else "")
+        + (f"Отложено (модель отказала): {postponed} — веб-панель, «Ленты»\n" if postponed else "")
         + (f"Дублей на разбор: {dupes} — /duplicates или веб-панель\n" if dupes else "")
         + f"Модель: <code>{_e(llm.model)}</code>\n"
         f"Endpoint: <code>{_e(llm.endpoint)}</code>\n"

@@ -13,8 +13,9 @@ from dataclasses import dataclass, field
 from aiogram import Bot
 from aiogram.exceptions import (TelegramAPIError, TelegramBadRequest,
                                 TelegramNetworkError, TelegramRetryAfter)
-from aiogram.types import (BufferedInputFile, InputMediaPhoto,
-                            LinkPreviewOptions, Message)
+from aiogram.types import (BufferedInputFile, InlineKeyboardButton,
+                            InlineKeyboardMarkup, InputMediaPhoto,
+                            LinkPreviewOptions, Message, WebAppInfo)
 
 from .claude import ClaudeClient
 from .db import Storage, entry_key
@@ -34,6 +35,11 @@ TG_CAPTION_LIMIT = 1024   # подпись к фото Telegram обрезает
 ELLIPSIS = "…"
 MAINTENANCE_EVERY = 6 * 3600   # уборка в базе, секунды
 ALERT_EVERY = 3600             # как часто напоминать об отложенных новостях
+# Захват карточки очереди согласования под публикацию (claim_moderation)
+# "протухает" через столько секунд — запас на скачивание альбома и ретраи
+# _send (до 3 попыток с задержками). Не наткнуться на dead lock, если
+# процесс упал между отправкой и удалением карточки из очереди.
+PUBLISH_CLAIM_TTL = 180
 RU_ATTEMPTS = 2                # попыток добиться от модели русского текста
 # Сколько картинок для одной новости качать параллельно (см. _images_of_page).
 # Сайт-источник и его CDN — общие: слишком широкий веер бьёт по ним не хуже,
@@ -284,7 +290,7 @@ class Publisher:
                  admin_ids: set[int] | None = None, quota: "Quota | None" = None,
                  vk: "VKClient | None" = None, claude: "ClaudeClient | None" = None,
                  gemini: "LLMClient | None" = None, search: "SearchClient | None" = None,
-                 bing: "BingNewsClient | None" = None):
+                 bing: "BingNewsClient | None" = None, panel_url: str = ""):
         self.bot = bot
         self.st = storage
         self.llm = llm
@@ -295,6 +301,9 @@ class Publisher:
         self.quota = quota
         self.vk = vk
         self.search = search
+        # Для кнопки в уведомлении о новых карточках на согласование
+        # (открывает веб-панель сразу на /queue) — пусто, если панель выключена.
+        self.panel_url = panel_url.rstrip("/")
         self.bing = bing
         self._wake = asyncio.Event()
         self._running = False
@@ -305,6 +314,8 @@ class Publisher:
         self._postponed: list[tuple[str, str]] = []
         self._postponed_flood: list[tuple[int, int]] = []
         self._postponed_dupes: list[tuple[int, str, int, float]] = []
+        self._queued: list[tuple[str, str, int]] = []
+        self._queue_overflow = False
         # Первую уборку делаем не сразу после старта, а через MAINTENANCE_EVERY.
         self._last_maintenance = time.time()
         # Взводится, когда Telegram отказал по причине, которую повтором не
@@ -320,6 +331,18 @@ class Publisher:
     @property
     def debug(self) -> bool:
         return self.st.get("debug") == "1"
+
+    @property
+    def moderation(self) -> bool:
+        """Ручное согласование (см. /manual): готовые посты не публикуются
+        сами, ждут одобрения в веб-панели/Telegram. Названо не "manual" —
+        этим словом уже занят параметр run_once(manual=...) («запущено
+        командой /checknow»), смысл другой, разные имена — чтобы не путать."""
+        return self.st.get("moderation") == "1"
+
+    def _moderation_queue_full(self) -> bool:
+        limit = self.st.get_int("moderation_max_queue")
+        return limit > 0 and self.st.count_moderation() >= limit
 
     @property
     def claude_mode(self) -> bool:
@@ -399,7 +422,7 @@ class Publisher:
                 await self.run_once()
             except Exception:
                 log.exception("сбой в цикле опроса")
-            self._housekeeping()
+            await self._housekeeping()
             interval = max(1, self.st.get_int("interval")) * 60
             self._wake.clear()
             try:
@@ -412,22 +435,29 @@ class Publisher:
         self._running = False
         self._wake.set()
 
-    def _housekeeping(self) -> None:
+    async def _housekeeping(self) -> None:
         """После прохода: вернуть память системе и раз в несколько часов
         подчистить базу. Обе операции дешёвые и делаются между проходами,
         чтобы не задерживать публикацию."""
         release_memory()
         now = time.time()
         if now - self._last_maintenance < MAINTENANCE_EVERY:
+            await self._check_moderation_reminder()
             return
         self._last_maintenance = now
         try:
-            sizes = self.st.maintain(max(50, self.st.get_int("keep_seen")))
+            sizes = self.st.maintain(
+                max(50, self.st.get_int("keep_seen")),
+                keep_moderation_days=max(1, self.st.get_int("moderation_keep_days")),
+            )
         except Exception:
             log.exception("уборка в базе не удалась")
             return
         log.info("уборка в базе: %.0f → %.0f КБ",
                  sizes["before"] / 1024, sizes["after"] / 1024)
+        if sizes.get("moderation_pruned"):
+            await self._report_moderation_pruned(sizes["moderation_pruned"])
+        await self._check_moderation_reminder()
 
     async def run_once(self, manual: bool = False) -> dict[str, int]:
         """Один проход по всем активным лентам. Возвращает сводку.
@@ -436,7 +466,7 @@ class Publisher:
         автоматический проход публикацию не делает: новости не помечаются
         прочитанными, и одни и те же посты приходили бы в личку каждый цикл.
         """
-        stats = {"feeds": 0, "published": 0, "errors": 0, "vk": 0,
+        stats = {"feeds": 0, "published": 0, "queued": 0, "errors": 0, "vk": 0,
                  "postponed": 0, "debug": int(self.debug)}
         if self.st.get("paused") == "1":
             log.info("публикация на паузе — пропускаем проход")
@@ -456,11 +486,15 @@ class Publisher:
             self._postponed = []
             self._postponed_flood = []
             self._postponed_dupes = []
+            self._queued = []
+            self._queue_overflow = False
             self._blocked = False
             for feed in self.st.feeds(only_enabled=True):
                 stats["feeds"] += 1
                 try:
-                    stats["published"] += await self._process_feed(feed)
+                    published, queued = await self._process_feed(feed)
+                    stats["published"] += published
+                    stats["queued"] += queued
                 except Exception:
                     stats["errors"] += 1
                     log.exception("лента #%s (%s) — необработанная ошибка",
@@ -479,7 +513,11 @@ class Publisher:
             await self._report_flood()
         if self._postponed_dupes:
             await self._report_dupes()
-        if stats["published"] and self.quota:
+        if self._queued and self.st.get("moderation_notify") == "1":
+            await self._report_queued()
+        if self._queue_overflow:
+            await self._report_queue_overflow()
+        if (stats["published"] or stats["queued"]) and self.quota:
             await self.quota.check_and_alert(self.backend_key)
         return stats
 
@@ -605,8 +643,107 @@ class Publisher:
             except TelegramAPIError as exc:
                 log.warning("не удалось предупредить админа %s: %s", admin_id, exc)
 
+    async def _report_queued(self) -> None:
+        """Сообщить о новых карточках на согласование.
+
+        Без троттлинга, в отличие от _report_postponed/_report_gemini_quota:
+        там повторяется один и тот же отказ каждый проход, а здесь каждая
+        карточка уведомляется РОВНО ОДИН РАЗ за свою жизнь (mark_seen уже
+        стоит при постановке в очередь) — объём сообщений равен объёму
+        новых новостей, троттлинг только прятал бы часть из них.
+        """
+        if not self.admin_ids:
+            return
+        total = self.st.count_moderation()
+        lines = [f"🖐 На согласование: {len(self._queued)} (в очереди всего {total})", ""]
+        for feed_title, title, _item_id in self._queued[:5]:
+            lines.append(f"· {html.escape(feed_title[:30])}: {html.escape(title[:60])}")
+        lines += ["", "Открыть очередь — /queue или веб-панель, раздел «Согласование»."]
+        text = "\n".join(lines)
+        kb = None
+        if self.panel_url:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text="🖐 Открыть очередь", web_app=WebAppInfo(url=f"{self.panel_url}/queue"))]])
+        for admin_id in sorted(self.admin_ids):
+            try:
+                await self.bot.send_message(chat_id=admin_id, text=text,
+                                            parse_mode="HTML", reply_markup=kb)
+            except TelegramAPIError as exc:
+                log.warning("не удалось уведомить админа %s об очереди согласования: %s",
+                            admin_id, exc)
+
+    async def _report_queue_overflow(self) -> None:
+        """Очередь согласования заполнена — новые новости не обрабатываются
+        вовсе, пока админ её не разберёт. Троттлинг как у _report_postponed:
+        иначе застрявшая переполненная очередь слала бы это на каждом проходе."""
+        if not self.admin_ids:
+            return
+        now = int(time.time())
+        try:
+            last = int(self.st.get("moderation_overflow_alert_at") or 0)
+        except ValueError:
+            last = 0
+        if now - last < ALERT_EVERY:
+            return
+        self.st.set("moderation_overflow_alert_at", now)
+        limit = self.st.get_int("moderation_max_queue")
+        text = (f"⚠️ Очередь согласования заполнена ({limit}) — новые новости не "
+               f"обрабатываются, пока не разберёте текущие. /queue")
+        for admin_id in sorted(self.admin_ids):
+            try:
+                await self.bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML")
+            except TelegramAPIError as exc:
+                log.warning("не удалось предупредить админа %s о переполнении очереди: %s",
+                            admin_id, exc)
+
+    async def _report_moderation_pruned(self, count: int) -> None:
+        """В отличие от prune_postponed/prune_dedup_candidates (чистят молча)
+        — здесь выбрасываются ГОТОВЫЕ посты, которые никто не разобрал за
+        moderation_keep_days; молчать об этом нельзя."""
+        if not self.admin_ids:
+            return
+        text = (f"🗑 Автоматически отклонено {count} карточек на согласование — "
+               f"не разобрали дольше {self.st.get_int('moderation_keep_days')} дней.")
+        for admin_id in sorted(self.admin_ids):
+            try:
+                await self.bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML")
+            except TelegramAPIError as exc:
+                log.warning("не удалось сообщить админу %s об уборке очереди: %s",
+                            admin_id, exc)
+
+    async def _check_moderation_reminder(self) -> None:
+        """Напоминание, если очередь согласования не разбирают долго (см.
+        moderation_remind_hours) — иначе фича молча превращается в «канал
+        перестал публиковать», и не сразу понятно, почему."""
+        hours = self.st.get_int("moderation_remind_hours")
+        if hours <= 0 or not self.admin_ids:
+            return
+        oldest = self.st.oldest_moderation_at()
+        if oldest is None:
+            return
+        age = time.time() - oldest
+        if age < hours * 3600:
+            return
+        now = int(time.time())
+        try:
+            last = int(self.st.get("moderation_remind_at") or 0)
+        except ValueError:
+            last = 0
+        if now - last < ALERT_EVERY:
+            return
+        self.st.set("moderation_remind_at", now)
+        total = self.st.count_moderation()
+        text = (f"⏰ В очереди согласования {total} — самая старая карточка "
+               f"ждёт {age / 3600:.0f} ч. Открыть — /queue.")
+        for admin_id in sorted(self.admin_ids):
+            try:
+                await self.bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML")
+            except TelegramAPIError as exc:
+                log.warning("не удалось напомнить админу %s об очереди согласования: %s",
+                            admin_id, exc)
+
     # --- внутреннее ------------------------------------------------------
-    async def _process_feed(self, feed: sqlite3.Row) -> int:
+    async def _process_feed(self, feed: sqlite3.Row) -> tuple[int, int]:
         feed_id = feed["id"]
         kind = feed["kind"]
         debug = self.debug
@@ -713,10 +850,25 @@ class Publisher:
         to_post = fresh[: max(1, self.st.get_int("max_per_cycle"))]
 
         published = 0
+        queued = 0
+        # Ручное согласование не действует в отладке — у них несовместимые
+        # контракты: debug обязан ничего не менять в состоянии (seen/etag не
+        # пишутся), а постановка в очередь согласования, наоборот, обязана
+        # пометить запись прочитанной (см. _queue_for_review) — иначе один
+        # /checknow в отладке плодил бы в очереди дубли карточек.
+        moderation_now = self.moderation and not debug
         delay = max(0, self.st.get_int("post_delay"))
         for i, (key, entry) in enumerate(to_post):
+            if moderation_now and self._moderation_queue_full():
+                log.warning("лента #%s: очередь согласования заполнена — "
+                            "новости не обрабатываю, пока не разберут", feed_id)
+                self._queue_overflow = True
+                break
             try:
-                post = await self.build_post(entry, feed)
+                if moderation_now:
+                    text = await self.build_post_text(entry, feed)
+                else:
+                    post = await self.build_post(entry, feed)
             except LLMError as exc:
                 log.warning("лента #%s: LLM отказала (%s)", feed_id, exc)
                 if self.st.get("on_llm_error") != "raw":
@@ -724,7 +876,10 @@ class Publisher:
                     # позже обработанной, чем сейчас — сырой. Пишем и в БД
                     # (не только в self._postponed, который живёт только до
                     # конца этого прохода) — иначе в веб-панели админ не видит
-                    # вообще ничего, пока сам не откроет журнал.
+                    # вообще ничего, пока сам не откроет журнал. Отказ модели
+                    # обрабатывается ДО постановки в очередь согласования —
+                    # это две разные очереди с разным смыслом («бот не
+                    # смог» и «бот смог, ждём человека»), пересекаться им незачем.
                     self._postponed.append((feed["title"] or f"лента #{feed_id}",
                                             str(exc)))
                     self.st.add_postponed(
@@ -733,12 +888,18 @@ class Publisher:
                         error=str(exc),
                     )
                     continue
-                post = await self._fallback_post(entry, feed)
+                if moderation_now:
+                    text = self._fallback_text(entry, feed)
+                else:
+                    post = await self._fallback_post(entry, feed)
 
             if debug:
                 # Прочитанным не помечаем: после /debug off новость уйдёт в канал.
                 if await self._send_debug(post, feed):
                     published += 1
+            elif moderation_now:
+                if await self._queue_for_review(feed, key, entry, text):
+                    queued += 1
             else:
                 sent = await self._send(post.text, image=post.image, images=post.images)
                 if sent:
@@ -756,28 +917,33 @@ class Publisher:
             if self._blocked:
                 break
 
-            if i < len(to_post) - 1 and delay:
+            # post_delay защищает канал от пачки сообщений подряд — при
+            # постановке в очередь согласования в канал ничего не уходит,
+            # ждать между записями незачем.
+            if i < len(to_post) - 1 and delay and not moderation_now:
                 await asyncio.sleep(delay)
 
+        handled = published + queued
         if not debug:
-            # Остались непубликованные новости — обрезали по max_per_cycle, не
-            # смогли доставить или пропустили из-за отказа модели. На следующем
-            # проходе обойдём условный GET, иначе 304 спрячет их до тех пор,
-            # пока лента сама не обновится.
-            updates["pending"] = int(published < len(fresh))
+            # Остались необработанные новости — обрезали по max_per_cycle, не
+            # смогли доставить, пропустили из-за отказа модели или очередь
+            # согласования заполнена. На следующем проходе обойдём условный
+            # GET, иначе 304 спрячет их до тех пор, пока лента сама не обновится.
+            updates["pending"] = int(handled < len(fresh))
 
         self.st.update_feed(feed_id, **updates)
-        if published and not debug:
+        if handled and not debug:
             self.st.prune_seen(feed_id, max(50, self.st.get_int("keep_seen")))
-        return published
+        return published, queued
 
-    async def build_post(self, entry: Entry, feed: sqlite3.Row | None = None,
-                         force_backend: "LLMClient | ClaudeClient | None" = None) -> Post:
-        """Прогоняет запись через шаблон + LLM и собирает готовое сообщение.
+    async def build_post_text(self, entry: Entry, feed: sqlite3.Row | None = None,
+                              force_backend: "LLMClient | ClaudeClient | None" = None) -> str:
+        """Прогоняет запись через шаблон + LLM — только текст, без картинок.
 
-        force_backend — см. _complete: используется /claude test и /gemini
-        test, чтобы прогнать запись именно через тестируемый бэкенд, не
-        трогая общую настройку claude_mode/gemini_mode."""
+        Вынесено из build_post отдельно ради очереди согласования
+        (_queue_for_review): в ней текст нужен сразу, а байты картинок —
+        только после одобрения (см. _image_candidates/_download_candidates) —
+        не тратить трафик на новости, которые ещё могут отклонить."""
         source = (feed["title"] if feed and feed["title"] else "") or "RSS"
         raw_values = {
             "title": entry.title,
@@ -792,20 +958,32 @@ class Publisher:
         ai_text = await self._ask_model(prompt, force_backend=force_backend)
 
         post_format = self.st.get("post_format")
-        text = _shorten(render(post_format, {**raw_values, "ai": ai_text}, escape=True))
+        return _shorten(render(post_format, {**raw_values, "ai": ai_text}, escape=True))
 
+    async def build_post(self, entry: Entry, feed: sqlite3.Row | None = None,
+                         force_backend: "LLMClient | ClaudeClient | None" = None) -> Post:
+        """Прогоняет запись через шаблон + LLM и собирает готовое сообщение.
+
+        force_backend — см. _complete: используется /claude test и /gemini
+        test, чтобы прогнать запись именно через тестируемый бэкенд, не
+        трогая общую настройку claude_mode/gemini_mode."""
+        text = await self.build_post_text(entry, feed, force_backend=force_backend)
         if self.multi_images_for(feed):
             image_url, images = await self._images_of_page(entry)
             return Post(text=text, image=image_url, images=images, link=entry.link)
         return Post(text=text, image=await self._image_of(entry), link=entry.link)
 
-    async def rebuild_post_text(self, row: sqlite3.Row, extra: str = "") -> str:
+    async def rebuild_post_text(self, row: sqlite3.Row, extra: str = "",
+                                limit: int | None = None) -> str:
         """Заново прогоняет уже опубликованную новость через модель — /regen.
 
         Источник тот же, что был при первой публикации (строка из таблицы
         posts, а не свежий запрос к ленте: заголовок мог с тех пор
         измениться на сайте, а редактируем мы историю, а не текущую версию).
         Картинки не трогаем — /regen меняет только текст.
+
+        `limit` — явный лимит длины вместо вывода по row["kind"]: строки
+        moderation (очередь согласования) такого столбца не имеют вовсе.
         """
         raw_values = {
             "title": row["title"],
@@ -822,7 +1000,8 @@ class Publisher:
         ai_text = await self._ask_model(prompt)
 
         post_format = self.st.get("post_format")
-        limit = TG_CAPTION_LIMIT if row["kind"] in ("photo", "album") else TG_LIMIT
+        if limit is None:
+            limit = TG_CAPTION_LIMIT if row["kind"] in ("photo", "album") else TG_LIMIT
         return _shorten(render(post_format, {**raw_values, "ai": ai_text}, escape=True), limit)
 
     async def set_model_tested(self, name: str) -> str | None:
@@ -1216,6 +1395,107 @@ class Publisher:
         await self.send_vk(post)
         return None
 
+    # --- очередь ручного согласования (self.moderation) --------------------
+    async def _queue_for_review(self, feed: sqlite3.Row, key: str, entry: Entry,
+                                text: str) -> int | None:
+        """Ставит готовый пост в очередь согласования вместо публикации.
+        Возвращает id новой карточки, либо None при гонке (уже стояла —
+        см. Storage.add_moderation, UNIQUE(feed_id, key))."""
+        feed_id = feed["id"]
+        multi = self.multi_images_for(feed)
+        if multi:
+            limit = max(1, min(10, self.st.get_int("max_images")))
+            candidates = await self._image_candidates(entry)
+            image, extra = (candidates[0], candidates[1:limit]) if candidates else ("", [])
+        else:
+            image, extra = await self._image_of(entry), []
+        item_id = self.st.add_moderation(
+            feed_id=feed_id, key=key, title=entry.title, summary=entry.summary,
+            link=entry.link, source=feed["title"] or "", published=entry.published,
+            text=text, image=image, extra_images="\n".join(extra), multi=multi,
+        )
+        if item_id is None:
+            return None
+        # Главное отличие от postponed: помечаем прочитанной СРАЗУ — текст
+        # уже сгенерирован моделью, повторная оценка на следующем проходе
+        # только зря потратила бы лимит и завела бы вторую карточку.
+        self.st.mark_seen(feed_id, key)
+        self.st.remove_postponed(feed_id, key)
+        self._queued.append((feed["title"] or f"лента #{feed_id}", entry.title, item_id))
+        return item_id
+
+    @staticmethod
+    def _moderation_entry(row: sqlite3.Row) -> Entry:
+        """Восстанавливает Entry из строки moderation — для _record_post
+        (дедуп между лентами сравнивает по posts, которые строятся из Entry).
+        key_parts ни на что не влияет: mark_seen уже сделан при постановке
+        в очередь, повторно эта запись не понадобится."""
+        return Entry(key_parts=(f"moderation:{row['id']}",), title=row["title"],
+                     link=row["link"], summary=row["summary"], published=row["published"],
+                     published_ts=0, image=row["image"])
+
+    async def publish_moderated(self, item_id: int, actor: str = "web") -> str | None:
+        """Одобряет и публикует карточку очереди согласования. Текст берётся
+        как есть из очереди (в т.ч. отредактированный админом) — заново
+        модель НЕ дёргаем, админ одобрял именно то, что видел.
+        Возвращает None при успехе, иначе текст ошибки."""
+        if not self.st.claim_moderation(item_id, actor, PUBLISH_CLAIM_TTL):
+            return "Эту новость уже публикует или опубликовал кто-то другой."
+        row = self.st.moderation_item(item_id)
+        if row is None:
+            return "Запись не найдена — возможно, уже обработана."
+        feed = self.st.feed(row["feed_id"])
+        image, images = row["image"], []
+        if row["multi"]:
+            urls = [u for u in [row["image"], *row["extra_images"].split("\n")] if u]
+            limit = max(1, min(10, self.st.get_int("max_images")))
+            image, images = await self._download_candidates(urls, row["link"], limit)
+        post = Post(text=row["text"], image=image, images=images, link=row["link"])
+        sent = await self._send(post.text, image=post.image, images=post.images)
+        if not sent:
+            self.st.release_moderation(item_id, "канал недоступен или не задан")
+            return "Не удалось опубликовать — канал недоступен или не задан."
+        entry = self._moderation_entry(row)
+        self._record_post(row["feed_id"], entry, feed, post, sent)
+        await self.send_vk(post)
+        self.st.delete_moderation(item_id)
+        return None
+
+    async def regen_moderated(self, item_id: int, extra: str = "") -> str | None:
+        """Перегенерировать текст карточки в очереди через ИИ — в отличие от
+        /posts/{id}/regen у уже опубликованных, пишет прямо в moderation.text
+        и не нуждается в черновике-в-памяти с TTL: карточка ещё не
+        опубликована, сохранять «случайно» нечего."""
+        row = self.st.moderation_item(item_id)
+        if row is None:
+            return "Запись не найдена — возможно, уже обработана."
+        try:
+            text = await self.rebuild_post_text(row, extra, limit=TG_LIMIT)
+        except LLMError as exc:
+            return f"Модель вернула ошибку: {exc}"
+        self.st.update_moderation_text(item_id, text)
+        return None
+
+    async def preview_moderated(self, item_id: int) -> str | None:
+        """Присылает пост из очереди согласования в личку админам «как есть»
+        — посмотреть, как он будет выглядеть в канале, до одобрения. Ничего
+        не публикует и не меняет карточку."""
+        row = self.st.moderation_item(item_id)
+        if row is None:
+            return "Запись не найдена — возможно, уже обработана."
+        if not self.admin_ids:
+            return "Нет ни одного администратора для предпросмотра."
+        image, images = row["image"], []
+        if row["multi"]:
+            urls = [u for u in [row["image"], *row["extra_images"].split("\n")] if u]
+            limit = max(1, min(10, self.st.get_int("max_images")))
+            image, images = await self._download_candidates(urls, row["link"], limit)
+        header = "👁 <b>Предпросмотр</b> — так пост будет выглядеть в канале, пока не опубликовано."
+        for admin_id in sorted(self.admin_ids):
+            await self._send(header, chat_id=admin_id)
+            await self._send(row["text"], chat_id=admin_id, image=image, images=images)
+        return None
+
     async def _complete(self, prompt: str,
                         force_backend: "LLMClient | ClaudeClient | None" = None) -> str:
         """Один запрос через активный бэкенд — с автопереключением на
@@ -1297,6 +1577,61 @@ class Publisher:
                  found[:80] or "на странице её нет")
         return found
 
+    async def _image_candidates(self, entry: Entry) -> list[str]:
+        """Адреса картинок-кандидатов со страницы новости, БЕЗ скачивания
+        байт — общая первая половина _images_of_page, вынесена отдельно ради
+        очереди согласования (_queue_for_review): там до одобрения нужны
+        только адреса (см. _download_candidates — скачивание происходит
+        отдельно, только когда/если новость реально публикуется)."""
+        if self.st.get("images") != "1" or not entry.link:
+            return []
+        limit = max(1, min(10, self.st.get_int("max_images")))
+        # Кандидатов берём с запасом сверх limit: часть ссылок не скачается
+        # (сайт не ответил, оказалось не картинкой, CDN отдал 403) — без
+        # запаса такие неудачи оставили бы пост с картинками меньше, чем
+        # настроено, хотя на странице их хватало с избытком.
+        pool = limit + IMAGE_DOWNLOAD_CONCURRENCY
+        candidates = [entry.image] if entry.image else []
+        seen_keys = {image_dedup_key(u) for u in candidates}
+        for u in await page_images(entry.link, limit=pool):
+            key = image_dedup_key(u)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            candidates.append(u)
+        return candidates
+
+    @staticmethod
+    async def _download_candidates(candidates: list[str], referer: str, limit: int
+                                   ) -> tuple[str, list[tuple[bytes, str]]]:
+        """Скачивает картинки-кандидаты пачками, возвращает адрес первой
+        (для VK, см. ниже) и байты успешно скачанных, не больше limit."""
+        out: list[tuple[bytes, str]] = []
+        first_url = ""
+        # Качаем пачками по IMAGE_DOWNLOAD_CONCURRENCY штук параллельно, а не
+        # все сразу и не строго по одной: параллель внутри пачки ощутимо
+        # быстрее последовательной загрузки, а остановка сразу по достижении
+        # limit не тратит трафик на кандидатов, которые уже не понадобятся.
+        for i in range(0, len(candidates), IMAGE_DOWNLOAD_CONCURRENCY):
+            if len(out) >= limit:
+                break
+            batch = candidates[i:i + IMAGE_DOWNLOAD_CONCURRENCY]
+            # return_exceptions=True: одна оборвавшаяся закачка (например,
+            # CancelledError при остановке бота) не должна валить остальные
+            # параллельные закачки этой же пачки и прерывать обработку записи.
+            results = await asyncio.gather(
+                *(download_image(url, referer=referer) for url in batch),
+                return_exceptions=True,
+            )
+            for url, downloaded in zip(batch, results):
+                if downloaded is None or isinstance(downloaded, BaseException):
+                    log.info("картинка не скачалась, пропускаю: %s", url[:100])
+                    continue
+                out.append(downloaded)
+                if not first_url:
+                    first_url = url
+        return first_url, out[:limit]
+
     async def _images_of_page(self, entry: Entry) -> tuple[str, list[tuple[bytes, str]]]:
         """Несколько картинок со страницы новости — режим «несколько картинок»
         включается для конкретной ленты (/feedimages <id> on), работает при
@@ -1312,48 +1647,11 @@ class Publisher:
         if self.st.get("images") != "1" or not entry.link:
             return "", []
         limit = max(1, min(10, self.st.get_int("max_images")))
-        # Кандидатов берём с запасом сверх limit: часть ссылок не скачается
-        # (сайт не ответил, оказалось не картинкой, CDN отдал 403) — без
-        # запаса такие неудачи оставили бы пост с картинками меньше, чем
-        # настроено, хотя на странице их хватало с избытком.
-        pool = limit + IMAGE_DOWNLOAD_CONCURRENCY
-        candidates = [entry.image] if entry.image else []
-        seen_keys = {image_dedup_key(u) for u in candidates}
-        for u in await page_images(entry.link, limit=pool):
-            key = image_dedup_key(u)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            candidates.append(u)
+        candidates = await self._image_candidates(entry)
+        return await self._download_candidates(candidates, entry.link, limit)
 
-        out: list[tuple[bytes, str]] = []
-        first_url = ""
-        # Качаем пачками по IMAGE_DOWNLOAD_CONCURRENCY штук параллельно, а не
-        # все сразу и не строго по одной: параллель внутри пачки ощутимо
-        # быстрее последовательной загрузки, а остановка сразу по достижении
-        # limit не тратит трафик на кандидатов, которые уже не понадобятся.
-        for i in range(0, len(candidates), IMAGE_DOWNLOAD_CONCURRENCY):
-            if len(out) >= limit:
-                break
-            batch = candidates[i:i + IMAGE_DOWNLOAD_CONCURRENCY]
-            # return_exceptions=True: одна оборвавшаяся закачка (например,
-            # CancelledError при остановке бота) не должна валить остальные
-            # параллельные закачки этой же пачки и прерывать обработку записи.
-            results = await asyncio.gather(
-                *(download_image(url, referer=entry.link) for url in batch),
-                return_exceptions=True,
-            )
-            for url, downloaded in zip(batch, results):
-                if downloaded is None or isinstance(downloaded, BaseException):
-                    log.info("картинка не скачалась, пропускаю: %s", url[:100])
-                    continue
-                out.append(downloaded)
-                if not first_url:
-                    first_url = url
-        return first_url, out[:limit]
-
-    async def _fallback_post(self, entry: Entry, feed: sqlite3.Row | None) -> Post:
-        """Если LLM недоступна — публикуем аккуратную заготовку без обработки."""
+    def _fallback_text(self, entry: Entry, feed: sqlite3.Row | None) -> str:
+        """Если LLM недоступна — аккуратная заготовка без обработки, только текст."""
         source = (feed["title"] if feed and feed["title"] else "") or "RSS"
         summary = (entry.summary or "")[:600]
         values = {
@@ -1364,7 +1662,10 @@ class Publisher:
             "published": entry.published,
             "ai": summary,
         }
-        text = _shorten(render(self.st.get("post_format"), values, escape=True))
+        return _shorten(render(self.st.get("post_format"), values, escape=True))
+
+    async def _fallback_post(self, entry: Entry, feed: sqlite3.Row | None) -> Post:
+        text = self._fallback_text(entry, feed)
         if self.multi_images_for(feed):
             image_url, images = await self._images_of_page(entry)
             return Post(text=text, image=image_url, images=images, link=entry.link)
