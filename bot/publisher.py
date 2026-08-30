@@ -459,7 +459,10 @@ class Publisher:
         try:
             sizes = self.st.maintain(
                 max(50, self.st.get_int("keep_seen")),
-                keep_moderation_days=max(1, self.st.get_int("moderation_keep_days")),
+                # 0 — «без ограничения» (см. prune_moderation), а не пол в 1
+                # день: тот пол превращал 0, введённый как «выключить»,
+                # в самую агрессивную настройку из возможных.
+                keep_moderation_days=self.st.get_int("moderation_keep_days"),
             )
         except Exception:
             log.exception("уборка в базе не удалась")
@@ -568,18 +571,18 @@ class Publisher:
     async def _report_dupes(self) -> None:
         """Сообщить админам про новости, отложенные как похожие на уже
         опубликованные — они не в канале, а в очереди на ручной разбор
-        (веб-панель, раздел «Ленты»), на случай если совпадение ложное."""
+        (веб-панель, раздел «Публикация»), на случай если совпадение ложное."""
         if not self.admin_ids:
             return
         lines = [f"🔁 Похоже на дубли: {len(self._postponed_dupes)} — не "
-                 f"опубликовано, ждёт разбора в веб-панели («Ленты»).", ""]
+                 f"опубликовано, ждёт разбора в веб-панели («Публикация»).", ""]
         for feed_id, title, matched_post_id, score in self._postponed_dupes[:5]:
             feed = self.st.feed(feed_id)
             feed_title = (feed["title"] if feed else "") or f"лента #{feed_id}"
             lines.append(f"· {html.escape(feed_title[:30])}: {html.escape(title[:60])} "
                          f"— похоже на пост #{matched_post_id} ({score:.0%})")
         lines += ["", "Совпадение ложное — новость просто интересная, а не "
-                  "дубль? Откройте «Ленты» в веб-панели и опубликуйте вручную."]
+                  "дубль? Откройте «Публикация» в веб-панели и опубликуйте вручную."]
         text = "\n".join(lines)
         for admin_id in sorted(self.admin_ids):
             try:
@@ -677,7 +680,7 @@ class Publisher:
         lines = [f"🖐 На согласование: {len(self._queued)} (в очереди всего {total})", ""]
         for feed_title, title, _item_id in self._queued[:5]:
             lines.append(f"· {html.escape(feed_title[:30])}: {html.escape(title[:60])}")
-        lines += ["", "Открыть очередь — /queue или веб-панель, раздел «Согласование»."]
+        lines += ["", "Открыть очередь — /queue или веб-панель, раздел «Публикация»."]
         text = "\n".join(lines)
         kb = None
         if self.panel_url:
@@ -835,7 +838,10 @@ class Publisher:
             backfill = max(0, self.st.get_int("backfill"))
             keep = fresh[len(fresh) - backfill:] if backfill else []
             skipped = fresh[: len(fresh) - len(keep)]
-            if skipped:
+            # Отладка не меняет состояние (см. _drop_stale) — та же причина:
+            # без этой проверки первый /debug on на новой ленте пометил бы
+            # архив прочитанным навсегда, хотя ничего реально не публиковал.
+            if skipped and not debug:
                 self.st.mark_seen(feed_id, [k for k, _ in skipped])
             log.info("лента #%s: первый опрос, пропущено %s записей", feed_id, len(skipped))
             return keep
@@ -1115,8 +1121,13 @@ class Publisher:
         stale = [(k, e) for k, e in fresh if e.published_ts and e.published_ts < cutoff]
         if not stale:
             return fresh
-        # Помечаем прочитанными, иначе они будут всплывать каждый проход.
-        self.st.mark_seen(feed_id, [k for k, _ in stale])
+        # Помечаем прочитанными, иначе они будут всплывать каждый проход —
+        # кроме отладки: та обязана не менять состояние вообще (см.
+        # комментарий про moderation_now в _process_feed), а без этой
+        # проверки устаревшие записи оставались бы помеченными прочитанными
+        # НАВСЕГДА только от того, что их когда-то показали в /debug on.
+        if not self.debug:
+            self.st.mark_seen(feed_id, [k for k, _ in stale])
         oldest = max((time.time() - e.published_ts) / 86400 for _, e in stale)
         log.info("лента #%s: пропущено %s записей старше %s дней "
                  "(самой старой %.0f дн): %s", feed_id, len(stale), max_age,
@@ -1139,7 +1150,9 @@ class Publisher:
         keep_n = max(1, self.st.get_int("backfill"))
         keep = fresh[len(fresh) - keep_n:]
         dropped = fresh[: len(fresh) - keep_n]
-        self.st.mark_seen(feed_id, [k for k, _ in dropped])
+        # Отладка не меняет состояние (см. _drop_stale) — та же причина.
+        if not self.debug:
+            self.st.mark_seen(feed_id, [k for k, _ in dropped])
         log.warning("лента #%s: разом %s новых записей — похоже, выдача "
                     "сбилась. Публикую %s свежих, остальные помечаю "
                     "прочитанными", feed_id, len(fresh), len(keep))
@@ -1317,8 +1330,16 @@ class Publisher:
         Разные источники часто пишут об одном и том же анонсе своими
         словами, а точное совпадение ссылки/guid (is_seen) такое не ловит.
         Найденный дубль не публикуется сам — уходит в очередь на ручной
-        разбор (веб-панель, раздел «Ленты»): можно опубликовать, если
+        разбор (веб-панель, раздел «Публикация»): можно опубликовать, если
         совпадение ложное, или удалить, если дубль настоящий.
+
+        В отладке (self.debug) найденный дубль по-прежнему не попадает в
+        keep (превью показывает то же, что ушло бы в канал по-настоящему —
+        а дубль туда не идёт и в обычном режиме), но mark_seen/
+        add_dedup_candidate не вызываются: отладка обязана не менять
+        состояние вообще (см. комментарий в _process_feed), иначе запись
+        осталась бы отмеченной прочитанной и рядом появилась бы настоящая
+        карточка в очереди дублей просто от факта открытия /debug on.
         """
         if self.st.get("dedup_enabled") != "1" or not fresh:
             return fresh
@@ -1367,13 +1388,14 @@ class Publisher:
                 log.info("лента #%s: %r — похоже на дубль другой записи из этой же "
                          "пачки, откладываю на следующий проход", feed_id, entry.title[:80])
                 continue
-            self.st.mark_seen(feed_id, key)
-            self.st.add_dedup_candidate(
-                feed_id=feed_id, title=entry.title, summary=entry.summary,
-                link=entry.link, source=feed["title"] or "", published=entry.published,
-                image=entry.image, matched_post_id=post_id, score=score,
-            )
-            self._postponed_dupes.append((feed_id, entry.title, post_id, score))
+            if not self.debug:
+                self.st.mark_seen(feed_id, key)
+                self.st.add_dedup_candidate(
+                    feed_id=feed_id, title=entry.title, summary=entry.summary,
+                    link=entry.link, source=feed["title"] or "", published=entry.published,
+                    image=entry.image, matched_post_id=post_id, score=score,
+                )
+                self._postponed_dupes.append((feed_id, entry.title, post_id, score))
         if len(keep) < len(fresh):
             log.info("лента #%s: похоже на дубль — %s записей отправлено на "
                      "ручной разбор", feed_id, len(fresh) - len(keep))
@@ -1381,7 +1403,7 @@ class Publisher:
 
     async def publish_now(self, entry: Entry, feed: sqlite3.Row | None) -> str | None:
         """Публикует запись немедленно, в обход обычного цикла — для дублей,
-        которые админ решил опубликовать вручную (веб-панель, раздел «Ленты»).
+        которые админ решил опубликовать вручную (веб-панель, раздел «Публикация»).
 
         Если включено ручное согласование — не публикует напрямую, а ставит
         в очередь на согласование (см. _queue_for_review): «опубликовать
@@ -1437,7 +1459,7 @@ class Publisher:
 
     async def retry_postponed(self, item_id: int) -> str | None:
         """Повторная попытка одной записи из очереди «Отложенные» (веб-панель,
-        раздел «Ленты») — не дожидаясь следующего автоматического цикла.
+        раздел «Публикация») — не дожидаясь следующего автоматического цикла.
 
         Если включено ручное согласование — успешный результат идёт не в
         канал напрямую, а в очередь на согласование (см. _queue_for_review):
@@ -1876,20 +1898,32 @@ class Publisher:
         Как и publish_now/retry_postponed — при отладке (/debug) целиком
         отказывает, а не тихо шлёт в реальный канал мимо неё: отладка
         обещает не трогать канал НИЧЕМ, пока включена.
+
+        Как и они же — защищена от двойного клика/повторной отправки формы
+        (веб-панель рендерит результат прямо в ответ на POST, а не редиректит,
+        так что F5/pull-to-refresh на этой странице повторяет ту же
+        отправку): без лока текст ушёл бы в канал и VK дважды.
         Возвращает None при полном успехе, иначе текст ошибки."""
         if self.debug:
             return ("Сейчас включена отладка (/debug) — рассылка отсюда выключена, "
                      "чтобы не уйти в канал мимо неё по ошибке. Выключите отладку "
                      "(/debug off) и повторите.")
-        sent = await self._send(text)
-        if not sent:
-            return "Не удалось опубликовать — канал недоступен или не задан."
-        if not self.vk_on:
+        lock_key = f"broadcast:{text}"
+        if lock_key in self._manual_publish_locks:
+            return "Уже отправляется — подождите и обновите страницу."
+        self._manual_publish_locks.add(lock_key)
+        try:
+            sent = await self._send(text)
+            if not sent:
+                return "Не удалось опубликовать — канал недоступен или не задан."
+            if not self.vk_on:
+                return None
+            ok_vk = await self.send_vk(Post(text=text))
+            if not ok_vk:
+                return "В канал ушло, а в VK — не получилось (подробности в логе)."
             return None
-        ok_vk = await self.send_vk(Post(text=text))
-        if not ok_vk:
-            return "В канал ушло, а в VK — не получилось (подробности в логе)."
-        return None
+        finally:
+            self._manual_publish_locks.discard(lock_key)
 
     async def _send_debug(self, post: Post, feed: sqlite3.Row) -> bool:
         """Отладка: показываем пост админам в личке вместо канала."""
@@ -1919,6 +1953,19 @@ class Publisher:
             return LinkPreviewOptions(url=image, is_disabled=False,
                                       prefer_large_media=True, show_above_text=True)
         return LinkPreviewOptions(is_disabled=self.st.get("disable_preview") == "1")
+
+    def _mark_blocked(self, target: int | str) -> None:
+        """Взводит self._blocked — run_once обрывает весь проход по лентам,
+        как только он взведён (не тратить лимит модели на новости, которые
+        всё равно некуда доставить). Взводить только за настоящий канал:
+        _send(..., chat_id=admin_id) шлёт личные уведомления (превью в
+        отладке, «Предпросмотр» карточки) на СОВСЕМ другой чат — админа,
+        который, например, ни разу не писал боту (см. предупреждение в
+        main.py при простановке кнопки меню). Раньше отказ ЛИЧНОГО сообщения
+        одному конкретному админу обрывал обработку всех остальных лент в
+        этом проходе, хотя с каналом всё было в порядке."""
+        if target == self.channel:
+            self._blocked = True
 
     async def _send(self, text: str, chat_id: int | str | None = None,
                     image: str = "", images: list[tuple[bytes, str]] | None = None
@@ -1991,7 +2038,7 @@ class Publisher:
             except TelegramBadRequest as exc:
                 if not self._is_markup_error(exc):
                     log.error("не удалось отправить в %s: %s", target, exc)
-                    self._blocked = True
+                    self._mark_blocked(target)
                     return None
                 # Разметку Telegram не принял (обычно из-за /setformat).
                 # Публикуем текстом, иначе новость зависнет и будет
@@ -2001,7 +2048,7 @@ class Publisher:
                 return await self._send_plain(strip_html(text), target)
             except TelegramAPIError as exc:
                 log.error("не удалось отправить в %s: %s", target, exc)
-                self._blocked = True
+                self._mark_blocked(target)
                 return None
         log.error("не удалось отправить в %s — повторяющиеся сетевые ошибки; "
                   "новость останется непрочитанной и будет обработана заново "
@@ -2041,7 +2088,7 @@ class Publisher:
                     return None
                 if self._is_delivery_error(exc):
                     log.error("не удалось отправить в %s: %s", target, exc)
-                    self._blocked = True
+                    self._mark_blocked(target)
                     return None
                 log.warning("Telegram не принял картинку %s (%s) — публикую "
                             "пост без фото", label, exc)
@@ -2082,7 +2129,7 @@ class Publisher:
             except TelegramBadRequest as exc:
                 if self._is_delivery_error(exc):
                     log.error("не удалось отправить в %s: %s", target, exc)
-                    self._blocked = True
+                    self._mark_blocked(target)
                     return None
                 log.warning("Telegram не принял альбом (%s) — пробую иначе", exc)
                 return None

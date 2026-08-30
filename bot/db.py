@@ -93,8 +93,8 @@ CREATE INDEX IF NOT EXISTS idx_posts_posted ON posts (posted_at DESC);
 
 -- Новости, похожие на уже опубликованный пост (с другой ленты или под
 -- другим guid этой же) — не публикуются сами, ждут ручного разбора в
--- веб-панели (раздел «Ленты»): посмотреть и опубликовать, если совпадение
--- ложное, или удалить, если дубль настоящий. См. Publisher._drop_duplicates.
+-- веб-панели (раздел «Публикация»): посмотреть и опубликовать, если
+-- совпадение ложное, или удалить, если дубль настоящий. См. Publisher._drop_duplicates.
 CREATE TABLE IF NOT EXISTS dedup_candidates (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     feed_id         INTEGER,
@@ -936,14 +936,20 @@ class Storage:
             self._conn.execute("DELETE FROM moderation WHERE id = ?", (item_id,))
             self._conn.commit()
 
-    def restore_moderation(self, row: sqlite3.Row) -> None:
+    def restore_moderation(self, row: sqlite3.Row) -> bool:
         """Возвращает только что отклонённую карточку — «Отменить» во
         флеше (см. web.py). Вставляет с тем же id, что был: столбец
         AUTOINCREMENT не мешает явной вставке конкретного, ещё не занятого
         значения — иначе ссылка «Отменить», уже отрисованная в ответе на
-        предыдущий запрос, вела бы в карточку с другим номером."""
+        предыдущий запрос, вела бы в карточку с другим номером.
+
+        OR IGNORE — на случай, если за окно UNDO_TTL лента успела поставить
+        ту же новость в очередь заново (UNIQUE(feed_id, key)): тогда вставка
+        молча не происходит, а без проверки rowcount queue_undo сказал бы
+        «Восстановлено» и отправил бы на несуществующую (для этого id)
+        карточку — 404. Возвращаем, состоялась ли вставка на самом деле."""
         with self._lock:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "INSERT OR IGNORE INTO moderation (id, feed_id, key, title, summary, link, "
                 "source, published, text, image, extra_images, multi, status, claimed_at, "
                 "claimed_by, error, queued_at, edited_at, scheduled_at) "
@@ -953,6 +959,7 @@ class Storage:
                  row["multi"], row["queued_at"], row["edited_at"], row["scheduled_at"]),
             )
             self._conn.commit()
+            return cur.rowcount > 0
 
     def count_moderation(self) -> int:
         with self._lock:
@@ -969,6 +976,13 @@ class Storage:
         посты, молча выбрасывать их нельзя, поэтому возвращаем число
         удалённых, чтобы вызывающий код мог о них сообщить админам.
 
+        keep_days <= 0 — автоотклонение выключено вовсе (та же конвенция,
+        что у moderation_max_queue/moderation_remind_hours рядом в панели:
+        0 значит «без ограничения», а не «прямо сейчас»). Раньше вызывающий
+        код подстраховывался через max(1, ...), из-за чего 0, введённый с
+        намерением выключить автоочистку, на деле включал самый агрессивный
+        режим — отклонение уже на следующие сутки.
+
         Не трогаем status='publishing' (claim_moderation держит захват на
         всё время реальной отправки — снести строку прямо во время неё
         значило бы потерять и результат, и саму карточку из очереди, если
@@ -977,6 +991,8 @@ class Storage:
         (scheduled_at не пуст — админ явно решил их судьбу на конкретное
         время; удалить их раньше этого времени значило бы тихо отменить
         решение админа без единого уведомления)."""
+        if keep_days <= 0:
+            return 0
         cutoff = int(time.time() - keep_days * 86400)
         with self._lock:
             cur = self._conn.execute(

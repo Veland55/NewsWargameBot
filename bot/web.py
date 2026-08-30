@@ -95,7 +95,7 @@ MODERATION_LIMIT_FIELDS: list[tuple[str, str, str, str]] = [
     ("moderation_remind_hours", "Напомнить через", "ч",
      "Если самая старая карточка ждёт дольше — пришлём напоминание. 0 — не напоминать"),
     ("moderation_keep_days", "Автоотклонение через", "дней",
-     "Карточки, которые никто не разобрал столько дней, отклоняются сами"),
+     "Карточки, которые никто не разобрал столько дней, отклоняются сами. 0 — без ограничения"),
 ]
 # Дедупликация раньше настраивалась только командой /set — веб-панель
 # показывала результат (очередь дублей), но не сами настройки. По
@@ -1616,6 +1616,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                                      format_draft=text)
         problem = html_problem(text)
         if problem:
+            # html_problem возвращает текст с уже экранированными &lt;/&gt;
+            # (рассчитан на прямую вставку в HTML-сообщение Telegram, см.
+            # handlers.py) — здесь он идёт во flash, который _layout ещё раз
+            # прогоняет через _e(), и без unescape тут получалось бы двойное
+            # экранирование: на экране буквально "&lt;marquee&gt;" вместо "<marquee>".
+            problem = html_mod.unescape(problem)
             return await content_get(request, f"Разметка не годится: {problem}", "err", format_draft=text)
         app["st"].set("post_format", text)
         return await content_get(request, "Формат сохранён.")
@@ -1830,21 +1836,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         st: Storage = app["st"]
         turning_on = st.get("moderation") != "1"
         st.set("moderation", "1" if turning_on else "0")
-        if turning_on:
-            pending = st.count_moderation()
-            flash = ("✅ Согласование включено. Новости больше не публикуются сами — "
-                    "собираются в очереди ниже. Уже опубликованное не трогается.")
-            if pending:
-                flash += f" В очереди уже есть {pending} карточек с прошлого раза."
-        else:
-            pending = st.count_moderation()
-            flash = "✅ Согласование выключено, публикую в канал автоматически."
-            if pending:
-                flash += (f" В очереди осталось {pending} карточек — сами они не уйдут "
-                         f"(кроме уже поставленных на конкретное время — те опубликуются "
-                         f"по расписанию независимо от этой настройки), разберите "
-                         f"остальное вручную ниже.")
-        return await queue_get(request, flash)
+        # Редирект, не прямой рендер — см. комментарий у modflash в queue_get:
+        # F5 на POST-ответе иначе переключал бы тумблер обратно молча.
+        return _redirect(f"/queue?modflash={'on' if turning_on else 'off'}")
 
     async def settings_vk(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -1994,6 +1988,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                                      flash_kind="err")
         problem = html_problem(text)
         if problem:
+            # html_problem возвращает текст с уже экранированными &lt;/&gt;
+            # (рассчитан на прямую вставку в HTML-сообщение Telegram, см.
+            # handlers.py) — здесь он идёт во flash, который _layout ещё раз
+            # прогоняет через _e(), и без unescape тут получалось бы двойное
+            # экранирование: на экране буквально "&lt;marquee&gt;" вместо "<marquee>".
+            problem = html_mod.unescape(problem)
             return await post_detail(request, draft=text, flash=f"Разметка не годится: {problem}", flash_kind="err")
 
         err = await _apply_edit(app["bot"], row, text)
@@ -2287,6 +2287,32 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             except ValueError:
                 page = 1
         page_field = f'<input type="hidden" name="page" value="{page}">' if page > 1 else ""
+        # Флип-тумблеры (согласование/дедупликация) редиректят сюда вместо
+        # прямого рендера — иначе F5/pull-to-refresh на этой же странице
+        # повторял бы сам POST и переключал настройку туда-обратно молча
+        # (ровно как /pause и /debug: их тумблеры по той же причине тоже
+        # редиректят, не рендерят). Текст флеша по свежему состоянию (после
+        # переключения) собираем здесь же, а не теряем его вовсе.
+        if not flash:
+            if request.query.get("modflash") == "on":
+                pending = st.count_moderation()
+                flash = ("✅ Согласование включено. Новости больше не публикуются сами — "
+                        "собираются в очереди ниже. Уже опубликованное не трогается.")
+                if pending:
+                    flash += f" В очереди уже есть {pending} карточек с прошлого раза."
+            elif request.query.get("modflash") == "off":
+                pending = st.count_moderation()
+                flash = "✅ Согласование выключено, публикую в канал автоматически."
+                if pending:
+                    flash += (f" В очереди осталось {pending} карточек — сами они не уйдут "
+                             f"(кроме уже поставленных на конкретное время — те опубликуются "
+                             f"по расписанию независимо от этой настройки), разберите "
+                             f"остальное вручную ниже.")
+            elif request.query.get("dedupflash") == "on":
+                flash = ("✅ Дедупликация включена — похожие на уже опубликованные новости с "
+                        "других лент пойдут в «Дубли между лентами» вместо канала.")
+            elif request.query.get("dedupflash") == "off":
+                flash = "✅ Дедупликация выключена — новости не сверяются на схожесть."
         total = st.count_moderation()
         pages = max(1, -(-total // QUEUE_PER_PAGE))
         page = min(page, pages)
@@ -2439,7 +2465,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                                         "отклонена или её взял в работу другой администратор).")
         # ?page= — с какой страницы списка открыли карточку, чтобы кнопки
         # ниже (и «‹ Публикация») вернули туда же, а не всегда на первую.
-        page = page or request.query.get("page", "")
+        # _query_page — только цифры: значение уходит в разметку (href,
+        # action, JSON для BackButton) без экранирования ниже.
+        page = page or _query_page(request)
         back_href = f"/queue?page={page}" if page else "/queue"
         page_field = f'<input type="hidden" name="page" value="{_e(page)}">' if page else ""
         if draft is None and request.query.get("regen") == "1":
@@ -2496,7 +2524,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                         f"картинка станет превью-ссылкой над ним.")
 
         body = f"""
-        <div><a href="{back_href}" class="back-link">‹ Публикация</a></div>
+        <div><a href="{_e(back_href)}" class="back-link">‹ Публикация</a></div>
         <h2 class="page-heading after-back">На согласовании #{row['id']}</h2>
         <div class="card">
           <div class="line"><b>{_e(row['title'])}</b></div>
@@ -2525,7 +2553,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </form>
         </div>
         <div class="card">
-          <form method="post" action="/queue/{row['id']}/regen?page={page}">{csrf_field(request)}
+          <form method="post" action="/queue/{row['id']}/regen?page={_e(page)}">{csrf_field(request)}
             <label>Перегенерировать через ИИ из исходной новости</label>
             <p class="field-hint" style="margin:0 0 8px;">Пожелание необязательно. Заменит текст выше —
               несохранённые правки в поле пропадут.</p>
@@ -2601,6 +2629,16 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         v = str(request["form"].get("page", "")).strip()
         return v if v.isdigit() else ""
 
+    def _query_page(request: web.Request) -> str:
+        """То же самое, но из query (?page=) в queue_detail/queue_regen —
+        значение оттуда попадает в разметку без экранирования (back_href в
+        href=, action= формы регенерации, json.dumps для BackButton), в
+        отличие от _form_page, чьи значения всегда идут через _e() в
+        hidden-поле. Только цифры закрывают инъекцию в любом из трёх
+        контекстов сразу, надёжнее точечного экранирования каждого."""
+        v = str(request.query.get("page", "")).strip()
+        return v if v.isdigit() else ""
+
     def _refuse_if_publishing(row: sqlite3.Row) -> str | None:
         """claim_moderation переводит карточку в status='publishing' на время
         publish_moderated (ручной клик или расписание) — claim там атомарный
@@ -2635,6 +2673,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                                       flash_kind="err")
         problem = html_problem(text)
         if problem:
+            # html_problem возвращает текст с уже экранированными &lt;/&gt;
+            # (рассчитан на прямую вставку в HTML-сообщение Telegram, см.
+            # handlers.py) — здесь он идёт во flash, который _layout ещё раз
+            # прогоняет через _e(), и без unescape тут получалось бы двойное
+            # экранирование: на экране буквально "&lt;marquee&gt;" вместо "<marquee>".
+            problem = html_mod.unescape(problem)
             return await queue_detail(request, draft=text, page=page,
                                       flash=f"Разметка не годится: {problem}", flash_kind="err")
         st.update_moderation_text(item_id, text)
@@ -2661,8 +2705,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                                                f"не опубликовано.", flash_kind="err")
             problem = html_problem(text)
             if problem:
+                # См. комментарий про unescape в queue_save — тот же html_problem.
                 return await queue_detail(request, draft=text, page=page,
-                                          flash=f"Разметка не годится: {problem}", flash_kind="err")
+                                          flash=f"Разметка не годится: {html_mod.unescape(problem)}",
+                                          flash_kind="err")
             st.update_moderation_text(item_id, text)
         # До публикации — после неё строки уже не будет, искать в ней «следующую» поздно.
         next_id = st.moderation_neighbor(item_id)
@@ -2714,7 +2760,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         st: Storage = app["st"]
         pub: Publisher = app["publisher"]
         item_id = int(request.match_info["id"])
-        page = request.query.get("page", "")
+        page = _query_page(request)
         row = st.moderation_item(item_id)
         if row is not None:
             guard = _refuse_if_publishing(row)
@@ -2812,6 +2858,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                                    flash_kind="err")
         problem = html_problem(text)
         if problem:
+            # html_problem возвращает текст с уже экранированными &lt;/&gt;
+            # (рассчитан на прямую вставку в HTML-сообщение Telegram, см.
+            # handlers.py) — здесь он идёт во flash, который _layout ещё раз
+            # прогоняет через _e(), и без unescape тут получалось бы двойное
+            # экранирование: на экране буквально "&lt;marquee&gt;" вместо "<marquee>".
+            problem = html_mod.unescape(problem)
             return await queue_get(request, broadcast_draft=text,
                                    flash=f"Разметка не годится: {problem}", flash_kind="err")
         error = await pub.broadcast(text)
@@ -2843,10 +2895,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         st: Storage = app["st"]
         turning_on = st.get("dedup_enabled") != "1"
         st.set("dedup_enabled", "1" if turning_on else "0")
-        flash = ("✅ Дедупликация включена — похожие на уже опубликованные новости с других "
-                "лент пойдут в «Дубли между лентами» вместо канала."
-                if turning_on else "✅ Дедупликация выключена — новости не сверяются на схожесть.")
-        return await queue_get(request, flash=flash)
+        # Редирект — см. modflash в queue_get: та же причина (F5 на прямом
+        # рендере POST-ответа переключал бы тумблер обратно молча).
+        return _redirect(f"/queue?dedupflash={'on' if turning_on else 'off'}")
 
     async def queue_dedup_settings(request: web.Request) -> web.Response:
         """Окно сравнения и порог схожести (DEDUP_FIELDS) — раньше задавались
@@ -2894,7 +2945,14 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if was_overdue:
             row = dict(row)
             row["scheduled_at"] = None
-        st.restore_moderation(row)
+        if not st.restore_moderation(row):
+            # UNIQUE(feed_id, key) конфликт — лента успела поставить ту же
+            # новость в очередь заново за время окна UNDO_TTL. Восстановить
+            # эту КОНКРЕТНУЮ карточку уже нельзя, но по факту нужный админу
+            # результат (новость снова в очереди) уже есть — под другим id.
+            return await queue_get(request, flash="Не восстановлено — эта новость уже "
+                                              "вернулась в очередь заново (со свежей лентой).",
+                                   flash_kind="err", page_override=int(page) if page else None)
         flash = "Восстановлено."
         if was_overdue:
             flash += " План публикации снят — время уже прошло, требуется новое решение."

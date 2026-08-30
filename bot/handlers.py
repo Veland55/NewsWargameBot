@@ -743,6 +743,10 @@ async def cmd_checknow(message: Message, st: Storage, publisher: Publisher) -> N
         hint = ("\n\nНовых новостей нет. Отладка показывает только непрочитанные — "
                 "чтобы посмотреть на конкретной новости, используйте "
                 "<code>/test &lt;id&gt;</code>.")
+    if stats.get("blocked"):
+        hint += ("\n\n⛔ Канал недоступен (или не задан) — проход прерван раньше, "
+                "не все ленты успели обработаться. Подробности в журнале, "
+                "проверьте /setchannel.")
     await _reply(message, f"Готово. Лент: {stats['feeds']}, {verb}: "
                           f"{stats['published']}{tail}{hint}")
 
