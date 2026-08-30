@@ -43,7 +43,7 @@ HELP = """<b>RSS → ИИ → канал</b>
 <b>Сайты без RSS-ленты</b>
 /addsite &lt;url&gt; [часть адреса статей] — добавить сайт, новые статьи находятся
 через веб-поиск, а не разбором ленты (нужен SERPER_API_KEY в .env — см.
-SETUP.md). Удобнее через веб-панель, раздел «Ленты» → «Сайты без RSS».
+SETUP.md). Удобнее через веб-панель, раздел «Источники» → «Сайты без RSS».
 Управление такое же, как у обычных
 лент — /list, /pause, /del и т.д.
 
@@ -86,7 +86,7 @@ SETUP.md). Удобнее через веб-панель, раздел «Лен�
 
 Несколько картинок альбомом вместо одной (до 10, работает при любом режиме — обычном, Claude, Gemini) — настройка отдельной ленты, не общая: <code>/feedimages &lt;id&gt; on</code>, сколько штук — <code>/set max_images 6</code> (общее для всех). Вернуть как раньше — <code>/feedimages &lt;id&gt; off</code>
 
-Новость, похожая на уже опубликованную с другой ленты, сама в канал не уходит — ждёт разбора: <code>/duplicates</code> (посмотреть картинки, опубликовать или удалить — удобнее в веб-панели, раздел «Ленты»). Выключить: <code>/set dedup_enabled 0</code>
+Новость, похожая на уже опубликованную с другой ленты, сама в канал не уходит — ждёт разбора: <code>/duplicates</code> (посмотреть картинки, опубликовать или удалить, настроить окно сравнения и порог схожести — удобнее в веб-панели, раздел «Публикация»). Выключить: <code>/set dedup_enabled 0</code>
 
 <b>Настройки</b>
 /status — состояние бота
@@ -1474,7 +1474,7 @@ async def cmd_usage(message: Message, st: Storage, publisher: Publisher) -> None
 @router.message(Command("duplicates"))
 async def cmd_duplicates(message: Message, st: Storage) -> None:
     """Список читать можно и тут, а смотреть картинки, публиковать или
-    удалять — удобнее в веб-панели, раздел «Ленты», там же вся карточка."""
+    удалять — удобнее в веб-панели, раздел «Публикация», там же вся карточка."""
     rows = st.dedup_candidates(10)
     if not rows:
         await _reply(message, "Дублей на разбор нет.")
@@ -1484,7 +1484,7 @@ async def cmd_duplicates(message: Message, st: Storage) -> None:
         lines.append(f"· {_e(r['title'][:80])}\n"
                      f"  {_e(r['source'] or 'без ленты')} · похоже на пост #{r['matched_post_id']} "
                      f"({r['score']:.0%})")
-    lines.append("\nПосмотреть картинки, опубликовать или удалить — в веб-панели, раздел «Ленты».")
+    lines.append("\nПосмотреть картинки, опубликовать или удалить — в веб-панели, раздел «Публикация».")
     await _reply(message, "\n".join(lines))
 
 
@@ -1534,7 +1534,7 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
         + (f"Несколько картинок: у {multi_feeds} из {len(feeds)} лент — /feedimages <id>\n"
            if multi_feeds else "")
         + (f"На согласовании: {queue_n} — /queue или веб-панель\n" if queue_n else "")
-        + (f"Отложено (модель отказала): {postponed} — веб-панель, «Ленты»\n" if postponed else "")
+        + (f"Отложено (модель отказала): {postponed} — веб-панель, «Публикация»\n" if postponed else "")
         + (f"Дублей на разбор: {dupes} — /duplicates или веб-панель\n" if dupes else "")
         + f"Модель: <code>{_e(llm.model)}</code>\n"
         f"Endpoint: <code>{_e(llm.endpoint)}</code>\n"

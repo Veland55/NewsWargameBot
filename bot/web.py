@@ -53,8 +53,12 @@ SETTINGS_EDITABLE = (
     "interval", "max_per_cycle", "post_delay", "backfill",
     "max_age_days", "flood_guard", "keep_seen",
     "alert_thresholds", "free_daily_limit", "max_images",
-    "moderation_max_queue", "moderation_remind_hours", "moderation_keep_days",
 )
+# moderation_max_queue/moderation_remind_hours/moderation_keep_days — не тут:
+# по замечанию UX-аудита переехали со страницы «Настройки» на «Публикация»
+# (queue_settings ниже, форма прямо в queue_get) — рядом с самой очередью и
+# тумблером, которые они ограничивают, а не в общей форме «Параметры
+# публикации» вперемешку с интервалом опроса лент и защитой от сбоев.
 SETTINGS_TOGGLES = ("require_russian", "disable_preview", "images", "og_image")
 
 # (заголовок группы, [(ключ, короткая подпись, единица, подсказка), ...]) —
@@ -79,16 +83,26 @@ GENERAL_GROUPS: list[tuple[str, list[tuple[str, str, str, str]]]] = [
         ("free_daily_limit", "Суточный лимит", "запросов", "0 — определить автоматически по модели"),
     ]),
     ("Картинки", [
-        ("max_images", "Картинок в альбом", "1-10", "Сколько скачивать за раз лентам с «несколькими картинками» — включается у каждой ленты отдельно, на «Лентах»"),
+        ("max_images", "Картинок в альбом", "1-10", "Сколько скачивать за раз лентам с «несколькими картинками» — включается у каждой ленты отдельно, на «Источниках»"),
     ]),
-    ("Ручное согласование", [
-        ("moderation_max_queue", "Потолок очереди", "карточек",
-         "Больше — новые новости не обрабатываются, пока не разберёте текущие. 0 — без ограничения"),
-        ("moderation_remind_hours", "Напомнить через", "ч",
-         "Если самая старая карточка ждёт дольше — пришлём напоминание. 0 — не напоминать"),
-        ("moderation_keep_days", "Автоотклонение через", "дней",
-         "Карточки, которые никто не разобрал столько дней, отклоняются сами"),
-    ]),
+]
+# (ключ, короткая подпись, единица, подсказка) для трёх лимитов очереди
+# согласования — та же форма поля, что у GENERAL_GROUPS выше, но рендерятся
+# и сохраняются отдельно (см. queue_settings) прямо на странице «Публикация».
+MODERATION_LIMIT_FIELDS: list[tuple[str, str, str, str]] = [
+    ("moderation_max_queue", "Потолок очереди", "карточек",
+     "Больше — новые новости не обрабатываются, пока не разберёте текущие. 0 — без ограничения"),
+    ("moderation_remind_hours", "Напомнить через", "ч",
+     "Если самая старая карточка ждёт дольше — пришлём напоминание. 0 — не напоминать"),
+    ("moderation_keep_days", "Автоотклонение через", "дней",
+     "Карточки, которые никто не разобрал столько дней, отклоняются сами"),
+]
+# Дедупликация раньше настраивалась только командой /set — веб-панель
+# показывала результат (очередь дублей), но не сами настройки. По
+# замечанию UX-аудита — тоже на «Публикация», рядом с очередью дублей.
+DEDUP_FIELDS: list[tuple[str, str, str, str]] = [
+    ("dedup_window_days", "Сравнивать за", "дней", "За сколько последних дней сравнивать с уже опубликованным"),
+    ("dedup_threshold", "Порог схожести", "%", "Заголовок+описание совпадают настолько — считаем дублем"),
 ]
 
 # ключ → (подпись, короткая подсказка) — для SETTINGS_TOGGLES.
@@ -139,6 +153,27 @@ def verify_telegram_init_data(init_data: str, bot_token: str) -> dict | None:
 
 def _e(text: object) -> str:
     return html_mod.escape(str(text if text is not None else ""))
+
+
+def _settings_field(st: "Storage", prefill: dict[str, str], key: str, label: str,
+                    unit: str, hint: str) -> str:
+    """Одно текстовое поле-число настроек — общая разметка для формы
+    «Параметры публикации» (/settings) и лимитов очереди на /queue
+    (queue_settings): те переехали со страницы «Настройки» ближе к самой
+    очереди, но верстать поле с нуля второй раз незачем.
+
+    title=hint — на широком экране .field-hint обрезается в одну строку
+    (иначе разнобой в высоте подсказок раздувает раздел по вертикали),
+    полный текст всплывает по наведению. for=/id= — без них скринридер
+    объявляет поле безымянным. prefill — то, что админ только что ввёл (при
+    ошибке валидации в ОДНОМ поле форма иначе перерисовывалась бы
+    значениями из БД, молча стирая правки во всех остальных полях того же
+    сохранения)."""
+    field_id = f"field-{_e(key)}"
+    value = prefill.get(key, st.get(key))
+    return (f'<div class="field"><label for="{field_id}">{_e(label)} <span class="unit">({_e(unit)})</span></label>'
+            f'<input type="text" id="{field_id}" name="{_e(key)}" value="{_e(value)}">'
+            f'<div class="field-hint" title="{_e(hint)}">{_e(hint)}</div></div>')
 
 
 def _rows_for(text: str, min_rows: int = 6, max_rows: int = 22) -> int:
@@ -630,9 +665,9 @@ a.list-item:hover { background: var(--card-hover); }
   /* Промпт и формат — сознательно парная пара карточек рядом; тянем их до
      одной высоты, чтобы кнопки под ними не разъезжались на разных уровнях. */
   .content-grid { grid-template-columns: 1fr 1fr; align-items: stretch; }
-  /* auto-fit, не жёсткие 1fr 1fr: карточек в этом блоке то 4, то 5 (появилось
-     «Согласование») — при нечётном числе жёсткая сетка оставляла бы половину
-     последней строки пустой; auto-fit сам решает, сколько влезает в ряд. */
+  /* auto-fit, не жёсткие 1fr 1fr: карточек в блоке не всегда чётное число —
+     при нечётном жёсткая сетка оставляла бы половину последней строки
+     пустой; auto-fit сам решает, сколько влезает в ряд. */
   .settings-columns { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
   .content-grid > div { display: flex; flex-direction: column; }
   .content-grid .card { display: flex; flex-direction: column; flex: 1; }
@@ -753,7 +788,7 @@ function tgConfirmSubmit(form, message) {
 # поля одной и той же настройки «как ИИ обрабатывает новость».
 NAV_ITEMS = [
     ("/", "📊", "Статус"),
-    ("/feeds", "📰", "Ленты"),
+    ("/feeds", "📰", "Источники"),
     ("/queue", "🖐", "Публикация"),
     ("/content", "📝", "Контент"),
     ("/settings", "⚙️", "Настройки"),
@@ -1123,11 +1158,11 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                                           f'style="text-decoration:none; background:var(--purple-dim); '
                                           f'color:var(--purple);">{queue_n} ждут ›</a>'))
         if postponed:
-            stats.append(("Отложенные", f'<a href="/feeds#postponed" class="pill off" '
+            stats.append(("Отложенные", f'<a href="/queue#postponed" class="pill off" '
                                         f'style="text-decoration:none;">{postponed} ждут — '
                                         f'модель отказала ›</a>'))
         if dupes:
-            stats.append(("Дубли", f'<a href="/feeds#duplicates" class="pill warn" style="text-decoration:none;">{dupes} на разбор ›</a>'))
+            stats.append(("Дубли", f'<a href="/queue#duplicates" class="pill warn" style="text-decoration:none;">{dupes} на разбор ›</a>'))
         stat_html = "".join(
             f'<div class="stat-card"><div class="stat-label">{_e(k)}</div>'
             f'<div class="stat-value">{v}</div></div>' for k, v in stats
@@ -1168,10 +1203,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
     # --- ленты ---------------------------------------------------------------
     def _dupes_section_html(st: "Storage") -> str:
-        """Дубли между лентами показываются здесь же, на «Лентах» — это тоже
-        решение по выдаче лент, а не отдельная самостоятельная сущность.
-        Пусто — секция не рендерится вовсе, чтобы не мозолить глаза, когда
-        разбирать нечего (как бейдж на дашборде)."""
+        """Список найденных дублей — рендерится на «Публикация» (queue_get),
+        рядом с настройками дедупликации: это решение «публиковать или нет»,
+        а не управление источниками лент (было на «Ленты»/«Источники» —
+        перенесено по замечанию UX-аудита). Пусто — секция не рендерится
+        вовсе, чтобы не мозолить глаза, когда разбирать нечего (как бейдж на
+        дашборде)."""
         dupes = st.dedup_candidates(50)
         if not dupes:
             return ""
@@ -1201,7 +1238,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
               </div>
             </div>"""
         return f"""
-        <h2 id="duplicates">Дубли <span class="muted" style="font-weight:400;">({total})</span></h2>
+        <h4 style="margin:14px 0 6px;">Найденные дубли <span class="muted" style="font-weight:400;">({total})</span></h4>
         <div class="section-hint">Похожи на уже опубликованные с другой ленты — не в канале, ждут решения.</div>
         <div class="list">{items}</div>
         {more_note}
@@ -1278,8 +1315,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                         rss_prefill: dict[str, str] | None = None,
                         search_prefill: dict[str, str] | None = None) -> web.Response:
         st: Storage = app["st"]
-        dupes_html = _dupes_section_html(st)
-        postponed_html = _postponed_section_html(st)
         rows = st.feeds()
         rss_rows = [f for f in rows if f["kind"] != "search"]
         search_rows = [f for f in rows if f["kind"] == "search"]
@@ -1308,8 +1343,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         search_prefill = search_prefill or {}
 
         body = f"""
-        {postponed_html}
-        {dupes_html}
         <h2>Ленты <span class="muted" style="font-weight:400;">({len(rss_rows)})</span></h2>
         <details {"open" if rss_prefill else ""}>
           <summary class="disclosure">Добавить ленту</summary>
@@ -1504,6 +1537,13 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         st: Storage = app["st"]
         template_text = template_draft if template_draft is not None else st.get("template")
         format_text = format_draft if format_draft is not None else st.get("post_format")
+        toggles_html = "".join(
+            f'<label class="toggle-row">'
+            f'<input type="checkbox" name="{k}" value="1" {"checked" if st.get(k)=="1" else ""}>'
+            f'<span><span class="toggle-title">{_e(title)}</span><br>'
+            f'<span class="muted">{_e(hint)}</span></span></label>'
+            for k, (title, hint) in TOGGLE_LABELS.items()
+        )
         body = f"""
         <h2 class="page-heading">Контент</h2>
         <div class="content-grid">
@@ -1541,6 +1581,16 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         </div>
         </div>
         </div>
+
+        <h2>Обработка</h2>
+        <div class="section-hint">Как именно ИИ обрабатывает новость — рядом с промптом и форматом,
+          которые определяют то же самое.</div>
+        <div class="card">
+          <form method="post" action="/content/toggles">{csrf_field(request)}
+            <div class="toggle-grid">{toggles_html}</div>
+            <div class="card-actions"><button class="primary" type="submit">Сохранить</button></div>
+          </form>
+        </div>
         """
         return web.Response(text=_layout("Контент", body, flash, flash_kind, active="/content", wide=True), content_type="text/html")
 
@@ -1574,38 +1624,31 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         app["st"].set("post_format", DEFAULTS["post_format"])
         return _redirect("/content")
 
+    async def content_toggles_post(request: web.Request) -> web.Response:
+        """Переехали из /settings (карточка «Параметры публикации») сюда по
+        замечанию UX-аудита: require_russian/images/og_image/disable_preview
+        — про то же самое, что промпт и формат поста (как ИИ обрабатывает
+        новость), а не про интервалы опроса или лимиты API. Раньше эти
+        чекбоксы жили в форме settings_general вперемешку с числовыми
+        полями лент — теперь у них своя форма и свой обработчик."""
+        st: Storage = app["st"]
+        form = request["form"]
+        for k in SETTINGS_TOGGLES:
+            st.set(k, "1" if form.get(k) == "1" else "0")
+        return await content_get(request, "Сохранено.")
+
     # --- настройки -------------------------------------------------------
     async def settings_get(request: web.Request, flash: str = "", flash_kind: str = "ok",
                            prefill: dict[str, str] | None = None) -> web.Response:
         st: Storage = app["st"]
         pub: Publisher = app["publisher"]
         prefill = prefill or {}
-
-        def field(key: str, label: str, unit: str, hint: str) -> str:
-            # title=hint — на широком экране .field-hint обрезается в одну
-            # строку (иначе разнобой в высоте подсказок раздувает раздел
-            # «Настройки» по вертикали), полный текст всплывает по наведению.
-            # for=/id= — без них скринридер объявляет поле безымянным.
-            # prefill — то, что админ только что ввёл (при ошибке валидации
-            # в ОДНОМ поле форма иначе перерисовывалась бы значениями из БД,
-            # молча стирая правки во всех остальных полях того же сохранения).
-            field_id = f"field-{_e(key)}"
-            value = prefill.get(key, st.get(key))
-            return (f'<div class="field"><label for="{field_id}">{_e(label)} <span class="unit">({_e(unit)})</span></label>'
-                    f'<input type="text" id="{field_id}" name="{_e(key)}" value="{_e(value)}">'
-                    f'<div class="field-hint" title="{_e(hint)}">{_e(hint)}</div></div>')
+        field = lambda key, label, unit, hint: _settings_field(st, prefill, key, label, unit, hint)
 
         groups_html = "".join(
             f'<div class="settings-group"><h3>{_e(group)}</h3><div class="field-row">'
             + "".join(field(k, label, unit, hint) for k, label, unit, hint in fields) + "</div></div>"
             for group, fields in GENERAL_GROUPS
-        )
-        toggles_html = "".join(
-            f'<label class="toggle-row">'
-            f'<input type="checkbox" name="{k}" value="1" {"checked" if st.get(k)=="1" else ""}>'
-            f'<span><span class="toggle-title">{_e(title)}</span><br>'
-            f'<span class="muted">{_e(hint)}</span></span></label>'
-            for k, (title, hint) in TOGGLE_LABELS.items()
         )
 
         current_mode = "claude" if pub.claude_mode else "gemini" if pub.gemini_mode else "normal"
@@ -1674,8 +1717,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         <div class="card">
           <form method="post" action="/settings/general">{csrf_field(request)}
             <div class="field-groups">{groups_html}</div>
-            <h3 style="margin-top:14px;">Поведение</h3>
-            <div class="toggle-grid">{toggles_html}</div>
             <div class="card-actions"><button class="primary" type="submit">Сохранить</button></div>
           </form>
         </div>
@@ -1690,22 +1731,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             <div class="card-actions">
               <button class="{'' if pub.debug else 'primary'}" type="submit">
                 {'Выключить' if pub.debug else 'Включить отладку'}</button>
-            </div>
-          </form>
-        </div>
-        </div>
-
-        <div>
-        <h2>Согласование</h2>
-        <div class="card">
-          <div class="line">Сейчас: <span class="pill {'on' if pub.moderation else 'neutral'}">{'включено' if pub.moderation else 'выключено'}</span></div>
-          <p class="muted">Готовые посты не публикуются сами — ждут одобрения в
-            <a href="/queue">очереди</a>, кроме отложенных на конкретное время: те
-            публикуются сами по расписанию, даже на паузе. {'В отладке не действует.' if pub.debug else ''}</p>
-          <form method="post" action="/settings/moderation">{csrf_field(request)}
-            <div class="card-actions">
-              <button class="{'' if pub.moderation else 'primary'}" type="submit">
-                {'Выключить' if pub.moderation else 'Включить согласование'}</button>
             </div>
           </form>
         </div>
@@ -1788,8 +1813,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             to_set[k] = v
         for k, v in to_set.items():
             st.set(k, v)
-        for k in SETTINGS_TOGGLES:
-            st.set(k, "1" if form.get(k) == "1" else "0")
         return await settings_get(request, "Настройки сохранены.")
 
     async def settings_debug(request: web.Request) -> web.Response:
@@ -1798,14 +1821,19 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         return _redirect("/settings")
 
     async def settings_moderation(request: web.Request) -> web.Response:
+        """Раньше жил в /settings — переехал управляться прямо со страницы
+        «Публикация» (см. queue_get): по замечанию UX-аудита, тумблер
+        «Согласование» и его лимиты были раскиданы по /settings, пока сама
+        очередь и её ежедневное использование — на /queue, так что
+        флеш-сообщения тут же сами себя поправляли текстом «см. «Публикация»
+        в меню». Теперь тумблер и лимиты живут там же, где очередь."""
         st: Storage = app["st"]
         turning_on = st.get("moderation") != "1"
         st.set("moderation", "1" if turning_on else "0")
         if turning_on:
             pending = st.count_moderation()
             flash = ("✅ Согласование включено. Новости больше не публикуются сами — "
-                    "собираются в очереди («Публикация» в меню). Уже опубликованное "
-                    "не трогается.")
+                    "собираются в очереди ниже. Уже опубликованное не трогается.")
             if pending:
                 flash += f" В очереди уже есть {pending} карточек с прошлого раза."
         else:
@@ -1815,8 +1843,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                 flash += (f" В очереди осталось {pending} карточек — сами они не уйдут "
                          f"(кроме уже поставленных на конкретное время — те опубликуются "
                          f"по расписанию независимо от этой настройки), разберите "
-                         f"остальное вручную («Публикация» в меню).")
-        return await settings_get(request, flash)
+                         f"остальное вручную ниже.")
+        return await queue_get(request, flash)
 
     async def settings_vk(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -2059,7 +2087,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                      'отладка (/debug) — публикация отсюда сейчас откажет, выключите отладку.</p>'
                      if pub.debug else "")
         body = f"""
-        <div><a href="/feeds#duplicates" class="back-link">‹ Ленты</a></div>
+        <div><a href="/queue#duplicates" class="back-link">‹ Публикация</a></div>
         <h2 class="page-heading after-back">Дубль #{row['id']}</h2>
         <div class="card">
           <div class="line"><b>{_e(row['title'])}</b></div>
@@ -2080,7 +2108,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </div>
         </div>
         """
-        return web.Response(text=_layout(f"Дубль #{row['id']}", body, active="/feeds"), content_type="text/html")
+        return web.Response(text=_layout(f"Дубль #{row['id']}", body, active="/queue"), content_type="text/html")
 
     async def duplicate_publish(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -2092,7 +2120,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         feed = st.feed(row["feed_id"]) if row["feed_id"] else None
         error = await pub.publish_now(_dedup_entry(row), feed)
         if error:
-            return await feeds_get(request, flash=error, flash_kind="err")
+            return await queue_get(request, flash=error, flash_kind="err")
         # В обеих ветках: успех publish_now — либо реальная публикация,
         # либо (при включённом согласовании) постановка в очередь на него,
         # но в обоих случаях эта запись здесь, в очереди дублей, больше не
@@ -2103,16 +2131,16 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         # при включённой отладке ещё до публикации, и мы бы уже вернулись
         # выше по error.
         if pub.moderation and feed is not None:
-            return await feeds_get(request, flash="Не дубль — поставлено на согласование "
-                                                  "(«Публикация» в меню), а не сразу в канал: "
+            return await queue_get(request, flash="Не дубль — поставлено на согласование "
+                                                  "выше на этой же странице, а не сразу в канал: "
                                                   "включён режим согласования.")
-        return await feeds_get(request, flash="Опубликовано.")
+        return await queue_get(request, flash="Опубликовано.")
 
     async def duplicate_delete(request: web.Request) -> web.Response:
         st: Storage = app["st"]
         cid = int(request.match_info["id"])
         st.delete_dedup_candidate(cid)
-        return await feeds_get(request, flash="Убрано из очереди.")
+        return await queue_get(request, flash="Убрано из очереди.")
 
     # --- отложенные из-за отказа ИИ ----------------------------------------
     async def postponed_detail(request: web.Request) -> web.Response:
@@ -2134,7 +2162,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                      'модель ответит, новость уйдёт на согласование, а не сразу в канал.</p>'
                      if pub.moderation else "")
         body = f"""
-        <div><a href="/feeds#postponed" class="back-link">‹ Ленты</a></div>
+        <div><a href="/queue#postponed" class="back-link">‹ Публикация</a></div>
         <h2 class="page-heading after-back">Отложено #{row['id']}</h2>
         <div class="card">
           <div class="line"><b>{_e(row['title'])}</b></div>
@@ -2159,7 +2187,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </div>
         </div>
         """
-        return web.Response(text=_layout(f"Отложено #{row['id']}", body, active="/feeds"), content_type="text/html")
+        return web.Response(text=_layout(f"Отложено #{row['id']}", body, active="/queue"), content_type="text/html")
 
     async def postponed_retry(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -2169,13 +2197,13 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         feed = st.feed(row["feed_id"]) if row is not None else None
         error = await pub.retry_postponed(pid)
         if error:
-            return await feeds_get(request, flash=error, flash_kind="err")
+            return await queue_get(request, flash=error, flash_kind="err")
         # pub.debug тут гарантированно False — см. комментарий в duplicate_publish.
         if pub.moderation and feed is not None:
-            return await feeds_get(request, flash="Модель справилась — новость поставлена на "
-                                                  "согласование («Публикация» в меню), а не сразу "
-                                                  "в канал: включён режим согласования.")
-        return await feeds_get(request, flash="Опубликовано.")
+            return await queue_get(request, flash="Модель справилась — новость поставлена на "
+                                                  "согласование выше на этой же странице, а не "
+                                                  "сразу в канал: включён режим согласования.")
+        return await queue_get(request, flash="Опубликовано.")
 
     async def postponed_delete(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -2187,7 +2215,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             # админ только что явно сказал «не публиковать».
             st.mark_seen(row["feed_id"], row["key"])
             st.delete_postponed(pid)
-        return await feeds_get(request, flash="Отклонено — публиковаться не будет.")
+        return await queue_get(request, flash="Отклонено — публиковаться не будет.")
 
     # --- очередь ручного согласования (self.moderation) ---------------------
     QUEUE_PER_PAGE = 20
@@ -2247,7 +2275,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
     async def queue_get(request: web.Request, flash: str = "", flash_kind: str = "ok",
                         page_override: int | None = None, flash_action: str = "",
-                        broadcast_draft: str = "") -> web.Response:
+                        broadcast_draft: str = "", limits_prefill: dict[str, str] | None = None,
+                        dedup_prefill: dict[str, str] | None = None) -> web.Response:
         st: Storage = app["st"]
         pub: Publisher = app["publisher"]
         if page_override is not None:
@@ -2257,6 +2286,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                 page = max(1, int(request.query.get("page", "1")))
             except ValueError:
                 page = 1
+        page_field = f'<input type="hidden" name="page" value="{page}">' if page > 1 else ""
         total = st.count_moderation()
         pages = max(1, -(-total // QUEUE_PER_PAGE))
         page = min(page, pages)
@@ -2277,20 +2307,20 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if not total:
             hint = ("" if pub.moderation else
                    "<div class='section-hint'>Режим выключен, новости публикуются сами — включить "
-                   "можно в Настройках. Когда очередь появится, карточки будут ждать здесь.</div>")
+                   "можно ниже. Когда очередь появится, карточки будут ждать здесь.</div>")
         elif pub.moderation:
             hint = ("<div class='section-hint'>Новости не уходят в канал, пока вы их не одобрите "
                     "здесь — откройте карточку, чтобы отредактировать, опубликовать или отклонить.</div>")
         else:
             hint = ("<div class='section-hint'>Согласование сейчас выключено — новые новости "
                    "публикуются автоматически. Здесь то, что накопилось раньше — само не уйдёт, "
-                   "разберите вручную или включите режим обратно в Настройках.</div>")
+                   "разберите вручную или включите режим обратно ниже.</div>")
         targets = [pub.channel or "канал не задан"]
         if pub.vk_on:
             targets.append(f"сообщество VK {pub.vk_group}")
         broadcast_card = f"""
+        <h3 class="page-heading" id="broadcast" style="margin-top:22px;">📢 Сообщение во все каналы</h3>
         <div class="card">
-          <h3 style="margin:0 0 6px;">📢 Сообщение во все каналы</h3>
           <p class="muted" style="margin:0 0 10px;">Уйдёт сразу как есть, без очереди и правок —
             в {_e(", ".join(targets))}.</p>
           <form method="post" action="/queue/broadcast"
@@ -2306,14 +2336,89 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </form>
         </div>
         """
+        # Лимиты очереди — раньше часть общей формы «Параметры публикации» в
+        # /settings (MODERATION_LIMIT_FIELDS), переехали сюда по замечанию
+        # UX-аудита: тумблер и его же лимиты в разных разделах панели
+        # заставляли settings_moderation объяснять пользователю, где искать
+        # саму очередь, текстом флеша — теперь всё управление рядом с тем,
+        # чем оно управляет.
+        limit_fields_html = "".join(
+            _settings_field(st, limits_prefill or {}, k, label, unit, hint)
+            for k, label, unit, hint in MODERATION_LIMIT_FIELDS
+        )
+        settings_details = f"""
+        <details style="margin-bottom:16px;">
+          <summary class="disclosure">⚙️ Настройки очереди
+            <span class="pill {'on' if pub.moderation else 'neutral'}" style="margin-left:6px;">
+              {'согласование включено' if pub.moderation else 'согласование выключено'}</span></summary>
+          <div class="card" style="margin-top:10px;">
+            <p class="muted" style="margin:0 0 10px;">Готовые посты не публикуются сами — ждут
+              одобрения здесь, кроме отложенных на конкретное время: те публикуются сами по
+              расписанию, даже на паузе. {'В отладке не действует.' if pub.debug else ''}</p>
+            <form method="post" action="/settings/moderation">{csrf_field(request)}
+              <div class="card-actions" style="margin-bottom:14px;">
+                <button class="{'' if pub.moderation else 'primary'}" type="submit">
+                  {'Выключить согласование' if pub.moderation else 'Включить согласование'}</button>
+              </div>
+            </form>
+            <hr class="sep">
+            <form method="post" action="/queue/settings">{csrf_field(request)}{page_field}
+              <div class="field-row">{limit_fields_html}</div>
+              <div class="card-actions"><button class="primary" type="submit">Сохранить лимиты</button></div>
+            </form>
+          </div>
+        </details>
+        """
+        dupes_html = _dupes_section_html(st)
+        postponed_html = _postponed_section_html(st)
+        dedup_on = st.get("dedup_enabled") == "1"
+        dedup_fields_html = "".join(
+            _settings_field(st, dedup_prefill or {}, k, label, unit, hint)
+            for k, label, unit, hint in DEDUP_FIELDS
+        )
+        dedup_settings_html = f"""
+        <h3 class="page-heading" id="duplicates" style="margin-top:22px;">Дубли между лентами</h3>
+        <details style="margin-bottom:10px;">
+          <summary class="disclosure">⚙️ Настройки дедупликации
+            <span class="pill {'on' if dedup_on else 'neutral'}" style="margin-left:6px;">
+              {'включена' if dedup_on else 'выключена'}</span></summary>
+          <div class="card" style="margin-top:10px;">
+            <p class="muted" style="margin:0 0 10px;">Новость, похожая на уже опубликованную с другой
+              ленты (или ждущую согласования выше), сама в канал не уходит — ждёт разбора ниже.</p>
+            <form method="post" action="/queue/dedup-toggle">{csrf_field(request)}
+              <div class="card-actions" style="margin-bottom:14px;">
+                <button class="{'' if dedup_on else 'primary'}" type="submit">
+                  {'Выключить дедупликацию' if dedup_on else 'Включить дедупликацию'}</button>
+              </div>
+            </form>
+            <hr class="sep">
+            <form method="post" action="/queue/dedup-settings">{csrf_field(request)}{page_field}
+              <div class="field-row">{dedup_fields_html}</div>
+              <div class="card-actions"><button class="primary" type="submit">Сохранить</button></div>
+            </form>
+          </div>
+        </details>
+        """
+        quick_nav_links = ['<a class="pill" style="text-decoration:none;" href="#queue-list">Очередь</a>']
+        if postponed_html:
+            quick_nav_links.append('<a class="pill" style="text-decoration:none;" href="#postponed">Отложенные</a>')
+        quick_nav_links.append('<a class="pill" style="text-decoration:none;" href="#duplicates">Дубли</a>')
+        quick_nav_links.append('<a class="pill" style="text-decoration:none;" href="#broadcast">Объявление</a>')
+        quick_nav = (f'<div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px;">'
+                    f'{"".join(quick_nav_links)}</div>')
         body = f"""
         <h2 class="page-heading">Публикация</h2>
-        {broadcast_card}
-        <h3 class="page-heading" style="margin-top:22px;">Очередь на согласование
+        {quick_nav}
+        {settings_details}
+        <h3 class="page-heading" id="queue-list">Очередь на согласование
           <span class="muted" style="font-weight:400;">({total})</span></h3>
         {hint}
         <div class="list">{items}</div>
         {pager}
+        {postponed_html}
+        {dedup_settings_html}
+        {dupes_html}
+        {broadcast_card}
         """
         return web.Response(text=_layout("Публикация", body, flash, flash_kind, active="/queue",
                                          flash_action=flash_action),
@@ -2714,6 +2819,56 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             return await queue_get(request, broadcast_draft=text, flash=error, flash_kind="err")
         return await queue_get(request, flash="Отправлено во все подключённые каналы.")
 
+    async def queue_settings(request: web.Request) -> web.Response:
+        """Лимиты очереди согласования (MODERATION_LIMIT_FIELDS) — отдельный
+        обработчик, не общий /settings/general: тот при КАЖДОЙ отправке
+        безусловно перезаписывает все SETTINGS_TOGGLES по тому, что пришло в
+        форме (checkbox отсутствует в form = «выключено» — это HTML, а не
+        баг), приняв этот укороченный набор полей, тихо выключил бы
+        require_russian/images/disable_preview/og_image заодно."""
+        st: Storage = app["st"]
+        page = _form_page(request)
+        prefill = {k: str(request["form"].get(k, "")).strip() for k, *_ in MODERATION_LIMIT_FIELDS}
+        for k, label, _unit, _hint in MODERATION_LIMIT_FIELDS:
+            if not _ascii_digits(prefill[k]):
+                return await queue_get(request, page_override=int(page) if page else None,
+                                       limits_prefill=prefill, flash_kind="err",
+                                       flash=f"«{label}» должно быть числом.")
+        for k, v in prefill.items():
+            st.set(k, v)
+        return await queue_get(request, page_override=int(page) if page else None,
+                               flash="Лимиты сохранены.")
+
+    async def queue_dedup_toggle(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        turning_on = st.get("dedup_enabled") != "1"
+        st.set("dedup_enabled", "1" if turning_on else "0")
+        flash = ("✅ Дедупликация включена — похожие на уже опубликованные новости с других "
+                "лент пойдут в «Дубли между лентами» вместо канала."
+                if turning_on else "✅ Дедупликация выключена — новости не сверяются на схожесть.")
+        return await queue_get(request, flash=flash)
+
+    async def queue_dedup_settings(request: web.Request) -> web.Response:
+        """Окно сравнения и порог схожести (DEDUP_FIELDS) — раньше задавались
+        только командой /set, в панели была видна лишь очередь-результат.
+        Отдельный обработчик по той же причине, что и queue_settings —
+        нечего разделять форму со SETTINGS_TOGGLES."""
+        st: Storage = app["st"]
+        page = _form_page(request)
+        prefill = {k: str(request["form"].get(k, "")).strip() for k, *_ in DEDUP_FIELDS}
+        if not _ascii_digits(prefill["dedup_window_days"]) or int(prefill["dedup_window_days"]) < 1:
+            return await queue_get(request, page_override=int(page) if page else None,
+                                   dedup_prefill=prefill, flash_kind="err",
+                                   flash="«Сравнивать за» — целое число дней, не меньше 1.")
+        if not _ascii_digits(prefill["dedup_threshold"]) or not (1 <= int(prefill["dedup_threshold"]) <= 100):
+            return await queue_get(request, page_override=int(page) if page else None,
+                                   dedup_prefill=prefill, flash_kind="err",
+                                   flash="«Порог схожести» — число от 1 до 100.")
+        for k, v in prefill.items():
+            st.set(k, v)
+        return await queue_get(request, page_override=int(page) if page else None,
+                               flash="Настройки дедупликации сохранены.")
+
     async def queue_undo(request: web.Request) -> web.Response:
         """Возвращает последнюю отклонённую карточку — см. queue_reject.
         Работает только в окне UNDO_TTL и только для самого недавнего
@@ -2766,6 +2921,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/content/prompt/reset", content_prompt_reset)
     app.router.add_post("/content/format", content_format_post)
     app.router.add_post("/content/format/reset", content_format_reset)
+    app.router.add_post("/content/toggles", content_toggles_post)
     app.router.add_get("/settings", settings_get)
     app.router.add_post("/settings/channel", settings_channel)
     app.router.add_post("/settings/general", settings_general)
@@ -2795,6 +2951,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/queue/{id}/preview", queue_preview)
     app.router.add_post("/queue/undo", queue_undo)
     app.router.add_post("/queue/broadcast", queue_broadcast)
+    app.router.add_post("/queue/settings", queue_settings)
+    app.router.add_post("/queue/dedup-toggle", queue_dedup_toggle)
+    app.router.add_post("/queue/dedup-settings", queue_dedup_settings)
 
     return app
 
