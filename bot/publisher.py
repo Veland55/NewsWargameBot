@@ -467,7 +467,15 @@ class Publisher:
         прочитанными, и одни и те же посты приходили бы в личку каждый цикл.
         """
         stats = {"feeds": 0, "published": 0, "queued": 0, "errors": 0, "vk": 0,
-                 "postponed": 0, "debug": int(self.debug)}
+                 "postponed": 0, "scheduled": 0, "debug": int(self.debug)}
+        # До проверки паузы/отладки и независимо от них: расписание — такое
+        # же явное решение админа, как клик «Опубликовать» (которому тоже
+        # не мешают пауза/отладка, см. publish_moderated), а не часть
+        # автоматического конвейера, который они призваны останавливать.
+        try:
+            stats["scheduled"] = await self.run_scheduled_publishes()
+        except Exception:
+            log.exception("сбой при публикации карточек по расписанию")
         if self.st.get("paused") == "1":
             log.info("публикация на паузе — пропускаем проход")
             return stats
@@ -1460,6 +1468,23 @@ class Publisher:
         await self.send_vk(post)
         self.st.delete_moderation(item_id)
         return None
+
+    async def run_scheduled_publishes(self) -> int:
+        """Публикует карточки очереди согласования, для которых наступило
+        время, заданное админом («Сегодня/Завтра» + время на карточке, см.
+        веб-панель). Вызывается из run_once — до проверки паузы/отладки
+        и на каждом проходе (включая /checknow), поэтому расписание
+        соблюдается с точностью до интервала опроса, не только раз в сутки.
+        Возвращает число реально опубликованных."""
+        due_ids = self.st.moderation_due_ids(int(time.time()))
+        published = 0
+        for item_id in due_ids:
+            error = await self.publish_moderated(item_id, actor="scheduled")
+            if error:
+                log.warning("отложенная публикация карточки #%s не удалась: %s", item_id, error)
+            else:
+                published += 1
+        return published
 
     async def regen_moderated(self, item_id: int, extra: str = "") -> str | None:
         """Перегенерировать текст карточки в очереди через ИИ — в отличие от

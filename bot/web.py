@@ -23,6 +23,7 @@ import logging
 import secrets
 import sqlite3
 import time
+from datetime import datetime, timedelta
 from typing import Awaitable, Callable
 from urllib.parse import parse_qsl, quote, urlsplit
 
@@ -2161,6 +2162,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             badges += ' <span class="pill off">ошибка публикации</span>'
         if r["edited_at"]:
             badges += ' <span class="pill neutral">ред.</span>'
+        if r["scheduled_at"]:
+            sched = time.strftime("%d.%m %H:%M", time.localtime(r["scheduled_at"]))
+            badges += f' <span class="pill" style="background:var(--purple-dim); color:var(--purple);">🕒 {sched}</span>'
         # Заголовок исходной новости из ленты — ориентир в списке; но
         # публикуется сгенерированный текст (r["text"]), который отличается
         # и без которого непонятно, что реально готово уйти в канал.
@@ -2279,6 +2283,19 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                       'делает другой администратор. Кнопки ниже разблокируются, если публикация '
                       'оборвалась и не завершилась за несколько минут.</div>' if publishing else "")
         disabled = "disabled" if publishing else ""
+        scheduled_html = ""
+        schedule_time_value = "12:00"
+        if row["scheduled_at"]:
+            schedule_time_value = time.strftime("%H:%M", time.localtime(row["scheduled_at"]))
+            scheduled_html = (
+                f'<div class="muted" style="color:var(--purple); margin-top:6px;">'
+                f'🕒 Запланировано на {time.strftime("%d.%m %H:%M", time.localtime(row["scheduled_at"]))} '
+                f'— опубликуется само.</div>')
+        unschedule_form = (
+            f'<form method="post" action="/queue/{row["id"]}/unschedule" style="margin-top:8px;">'
+            f'{csrf_field(request)}{page_field}'
+            f'<button type="submit" class="link-btn" {disabled}>Отменить план</button></form>'
+            if row["scheduled_at"] else "")
 
         urls = [u for u in [row["image"], *row["extra_images"].split("\n")] if u]
         gallery = ""
@@ -2312,6 +2329,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             <a href="{_safe_href(row['link'])}" target="_blank" rel="noopener">исходная новость</a></div>
           {error_html}
           {status_html}
+          {scheduled_html}
           {gallery}
           <details style="margin-top:10px;">
             <summary class="disclosure">Как есть в ленте, без обработки ИИ</summary>
@@ -2341,6 +2359,22 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
               <button type="submit" {disabled}>🤖 Перегенерировать</button>
             </div>
           </form>
+        </div>
+        <div class="card">
+          <form method="post" action="/queue/{row['id']}/schedule">{csrf_field(request)}{page_field}
+            <label>Отложить публикацию</label>
+            <p class="field-hint" style="margin:0 0 8px;">Опубликуется само в выбранное время —
+              возвращаться и нажимать «Опубликовать» вручную не нужно.</p>
+            <div class="row">
+              <select name="day">
+                <option value="today">Сегодня</option>
+                <option value="tomorrow">Завтра</option>
+              </select>
+              <input type="time" name="time" value="{schedule_time_value}" required style="flex:1;">
+              <button type="submit" {disabled}>🕒 Запланировать</button>
+            </div>
+          </form>
+          {unschedule_form}
         </div>
         <div class="card">
           <div class="card-actions">
@@ -2483,6 +2517,54 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         suffix = f"&page={page}" if page else ""
         return _redirect(f"/queue/{item_id}?regen=1{suffix}")
 
+    def _parse_hhmm(value: str) -> tuple[int, int] | None:
+        parts = value.strip().split(":")
+        if len(parts) != 2:
+            return None
+        try:
+            hour, minute = int(parts[0]), int(parts[1])
+        except ValueError:
+            return None
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+        return hour, minute
+
+    async def queue_schedule(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        item_id = int(request.match_info["id"])
+        row = st.moderation_item(item_id)
+        if row is None:
+            raise web.HTTPNotFound(text="Запись не найдена — возможно, уже обработана")
+        page = _form_page(request)
+        hhmm = _parse_hhmm(str(request["form"].get("time", "")))
+        if hhmm is None:
+            return await queue_detail(request, flash="Укажите время в формате ЧЧ:ММ.",
+                                      flash_kind="err", page=page)
+        hour, minute = hhmm
+        day = str(request["form"].get("day", "today"))
+        # Локальное время сервера — тем же временем везде в панели подписаны
+        # даты постов/лент (time.localtime), отдельного часового пояса для
+        # планирования заводить незачем, лишняя настройка ради путаницы.
+        target_date = datetime.now().date()
+        if day == "tomorrow":
+            target_date += timedelta(days=1)
+        target_dt = datetime.combine(target_date, datetime.min.time()).replace(hour=hour, minute=minute)
+        scheduled_ts = int(target_dt.timestamp())
+        if scheduled_ts <= int(time.time()):
+            return await queue_detail(request, page=page, flash_kind="err",
+                                      flash="Это время уже прошло — выберите время позже или «Завтра».")
+        st.schedule_moderation(item_id, scheduled_ts)
+        return await queue_detail(request, page=page,
+                                  flash=f"Запланировано на {target_dt.strftime('%d.%m %H:%M')} — "
+                                       f"опубликуется само, без напоминаний.")
+
+    async def queue_unschedule(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        item_id = int(request.match_info["id"])
+        page = _form_page(request)
+        st.unschedule_moderation(item_id)
+        return await queue_detail(request, flash="План снят — карточка снова ждёт ручного решения.", page=page)
+
     async def queue_preview(request: web.Request) -> web.Response:
         pub: Publisher = app["publisher"]
         item_id = int(request.match_info["id"])
@@ -2557,6 +2639,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/queue/{id}/publish", queue_publish)
     app.router.add_post("/queue/{id}/reject", queue_reject)
     app.router.add_post("/queue/{id}/regen", queue_regen)
+    app.router.add_post("/queue/{id}/schedule", queue_schedule)
+    app.router.add_post("/queue/{id}/unschedule", queue_unschedule)
     app.router.add_post("/queue/{id}/preview", queue_preview)
     app.router.add_post("/queue/undo", queue_undo)
 

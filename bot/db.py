@@ -158,6 +158,8 @@ CREATE TABLE IF NOT EXISTS moderation (
     error        TEXT NOT NULL DEFAULT '',    -- последняя неудача публикации
     queued_at    INTEGER NOT NULL,
     edited_at    INTEGER,
+    scheduled_at INTEGER,                     -- задано админом ("Сегодня/Завтра" + время) — публикуется
+                                               -- автоматически по наступлении, см. Publisher.run_scheduled_publishes
     UNIQUE (feed_id, key)
 );
 CREATE INDEX IF NOT EXISTS idx_moderation_queued ON moderation (queued_at DESC);
@@ -275,6 +277,7 @@ class Storage:
                       ("article_path", "TEXT NOT NULL DEFAULT ''"),
                       ("listing_url", "TEXT NOT NULL DEFAULT ''")],
             "posts": [("extra_message_ids", "TEXT NOT NULL DEFAULT ''")],
+            "moderation": [("scheduled_at", "INTEGER")],
         }
         for table, columns in added.items():
             have = {
@@ -845,6 +848,34 @@ class Storage:
             )
             self._conn.commit()
 
+    def schedule_moderation(self, item_id: int, when: int) -> None:
+        """Откладывает публикацию карточки на конкретное время (веб-панель,
+        «Сегодня/Завтра» + время) — карточка остаётся в очереди, публикует
+        её автоматически Publisher.run_scheduled_publishes, когда наступит."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE moderation SET scheduled_at = ? WHERE id = ?", (when, item_id)
+            )
+            self._conn.commit()
+
+    def unschedule_moderation(self, item_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE moderation SET scheduled_at = NULL WHERE id = ?", (item_id,)
+            )
+            self._conn.commit()
+
+    def moderation_due_ids(self, before_ts: int) -> list[int]:
+        """id карточек, чьё время публикации уже наступило. status='queued'
+        исключает те, что кто-то как раз сейчас публикует вручную (см.
+        claim_moderation) — им нельзя пересечься с автопубликацией по расписанию."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM moderation WHERE scheduled_at IS NOT NULL "
+                "AND scheduled_at <= ? AND status = 'queued'", (before_ts,)
+            ).fetchall()
+            return [int(r["id"]) for r in rows]
+
     def claim_moderation(self, item_id: int, actor: str, stale_after: int) -> bool:
         """Атомарный захват карточки под публикацию одним UPDATE (как
         Storage.set_if_absent, только на строке очереди) — второй админ,
@@ -898,11 +929,11 @@ class Storage:
             self._conn.execute(
                 "INSERT OR IGNORE INTO moderation (id, feed_id, key, title, summary, link, "
                 "source, published, text, image, extra_images, multi, status, claimed_at, "
-                "claimed_by, error, queued_at, edited_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, '', '', ?, ?)",
+                "claimed_by, error, queued_at, edited_at, scheduled_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, '', '', ?, ?, ?)",
                 (row["id"], row["feed_id"], row["key"], row["title"], row["summary"], row["link"],
                  row["source"], row["published"], row["text"], row["image"], row["extra_images"],
-                 row["multi"], row["queued_at"], row["edited_at"]),
+                 row["multi"], row["queued_at"], row["edited_at"], row["scheduled_at"]),
             )
             self._conn.commit()
 
