@@ -701,7 +701,7 @@ a.list-item:hover { background: var(--card-hover); }
 # ни на что не влияет вне Telegram. ready()/expand() разворачивают на весь
 # экран, а --tg-top/--tg-bottom дают шапке отступ от родного заголовка
 # Telegram в полноэкранном режиме (см. STYLE выше).
-TG_INIT_SCRIPT = """<script src="https://telegram.org/js/telegram-web-app.js"></script>
+TG_INIT_SCRIPT = """<script src="https://telegram.org/js/telegram-web-app.js" defer></script>
 <script>
 // Разрушающие действия (удаление ленты/картинки/дубля) подтверждаются перед
 // отправкой формы. Внутри Telegram Mini App нативный window.confirm() у
@@ -717,6 +717,12 @@ function tgConfirmSubmit(form, message) {
   }
   return false;
 }
+document.addEventListener('DOMContentLoaded', function () {
+  // Обёрнуто в DOMContentLoaded, а не выполняется сразу: скрипт telegram-
+  // web-app.js above теперь defer (см. комментарий у него) — без этой
+  // обёртки код ниже читал бы window.Telegram ДО того, как тот успел бы
+  // загрузиться, и внутри настоящего Telegram Mini App тоже увидел бы
+  // undefined. DOMContentLoaded гарантированно ждёт все defer-скрипты.
 (function () {
   function cssPx(name, fallback) {
     var v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(name));
@@ -779,6 +785,7 @@ function tgConfirmSubmit(form, message) {
     tg.onEvent('viewportChanged', applyInsets);
   }
 })();
+});
 </script>"""
 
 
@@ -896,6 +903,10 @@ def _login_page(error: str = "", next_path: str = "/") -> str:
   </div>
 </main>
 <script>
+document.addEventListener('DOMContentLoaded', function () {{
+  // DOMContentLoaded, не сразу: telegram-web-app.js above теперь defer
+  // (см. TG_INIT_SCRIPT) — без этой обёртки в самом Telegram window.Telegram
+  // мог быть ещё не загружен в момент выполнения этого скрипта.
 (function () {{
   var nextPath = {json.dumps(next_path)};
   var tg = window.Telegram && window.Telegram.WebApp;
@@ -926,6 +937,7 @@ def _login_page(error: str = "", next_path: str = "/") -> str:
     }}).then(function (r) {{ finish(r.ok); }}).catch(function () {{ finish(false); }});
   }} catch (e) {{ finish(false); }}
 }})();
+}});
 </script>
 </body></html>"""
 
@@ -2588,6 +2600,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </div>
         </div>
         <script>
+        document.addEventListener('DOMContentLoaded', function () {{
+          // DOMContentLoaded — telegram-web-app.js теперь defer (см.
+          // TG_INIT_SCRIPT), без этой обёртки window.Telegram здесь мог
+          // быть ещё не загружен даже внутри настоящего Telegram.
         (function () {{
           // Родные кнопки Telegram (thumb zone внизу экрана, вне прокрутки) —
           // необязательное улучшение поверх уже рабочих кнопок на странице:
@@ -2617,6 +2633,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             }} catch (e) {{}}
           }}
         }})();
+        }});
         </script>
         """
         return web.Response(text=_layout(f"Публикация #{row['id']}", body, flash, flash_kind, active="/queue",
