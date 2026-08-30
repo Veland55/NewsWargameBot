@@ -1866,6 +1866,31 @@ class Publisher:
         self._vk_posted += 1
         return True
 
+    async def broadcast(self, text: str) -> str | None:
+        """Отправляет произвольный текст сразу во все подключённые каналы —
+        Telegram-канал и, если включено, сообщество VK. В обход всего
+        конвейера новостей (build_post, очередь согласования, дедуп, posts):
+        это не новость из ленты — своя запись, feed_id, entry для неё не
+        существуют, а вся эта инфраструктура строится вокруг записей RSS.
+
+        Как и publish_now/retry_postponed — при отладке (/debug) целиком
+        отказывает, а не тихо шлёт в реальный канал мимо неё: отладка
+        обещает не трогать канал НИЧЕМ, пока включена.
+        Возвращает None при полном успехе, иначе текст ошибки."""
+        if self.debug:
+            return ("Сейчас включена отладка (/debug) — рассылка отсюда выключена, "
+                     "чтобы не уйти в канал мимо неё по ошибке. Выключите отладку "
+                     "(/debug off) и повторите.")
+        sent = await self._send(text)
+        if not sent:
+            return "Не удалось опубликовать — канал недоступен или не задан."
+        if not self.vk_on:
+            return None
+        ok_vk = await self.send_vk(Post(text=text))
+        if not ok_vk:
+            return "В канал ушло, а в VK — не получилось (подробности в логе)."
+        return None
+
     async def _send_debug(self, post: Post, feed: sqlite3.Row) -> bool:
         """Отладка: показываем пост админам в личке вместо канала."""
         if not self.admin_ids:

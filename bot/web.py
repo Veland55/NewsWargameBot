@@ -754,7 +754,7 @@ function tgConfirmSubmit(form, message) {
 NAV_ITEMS = [
     ("/", "📊", "Статус"),
     ("/feeds", "📰", "Ленты"),
-    ("/queue", "🖐", "Очередь"),
+    ("/queue", "🖐", "Публикация"),
     ("/content", "📝", "Контент"),
     ("/settings", "⚙️", "Настройки"),
     ("/posts", "📮", "Посты"),
@@ -1119,7 +1119,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         # выключили с непустой очередью, сами карточки не публикуются (см.
         # settings_moderation), забыть про них иначе легко.
         if queue_n:
-            stats.append(("Согласование", f'<a href="/queue" class="pill" '
+            stats.append(("Публикация", f'<a href="/queue" class="pill" '
                                           f'style="text-decoration:none; background:var(--purple-dim); '
                                           f'color:var(--purple);">{queue_n} ждут ›</a>'))
         if postponed:
@@ -1804,7 +1804,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if turning_on:
             pending = st.count_moderation()
             flash = ("✅ Согласование включено. Новости больше не публикуются сами — "
-                    "собираются в очереди («Согласование» в меню). Уже опубликованное "
+                    "собираются в очереди («Публикация» в меню). Уже опубликованное "
                     "не трогается.")
             if pending:
                 flash += f" В очереди уже есть {pending} карточек с прошлого раза."
@@ -1815,7 +1815,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                 flash += (f" В очереди осталось {pending} карточек — сами они не уйдут "
                          f"(кроме уже поставленных на конкретное время — те опубликуются "
                          f"по расписанию независимо от этой настройки), разберите "
-                         f"остальное вручную («Согласование» в меню).")
+                         f"остальное вручную («Публикация» в меню).")
         return await settings_get(request, flash)
 
     async def settings_vk(request: web.Request) -> web.Response:
@@ -2104,7 +2104,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         # выше по error.
         if pub.moderation and feed is not None:
             return await feeds_get(request, flash="Не дубль — поставлено на согласование "
-                                                  "(«Согласование» в меню), а не сразу в канал: "
+                                                  "(«Публикация» в меню), а не сразу в канал: "
                                                   "включён режим согласования.")
         return await feeds_get(request, flash="Опубликовано.")
 
@@ -2173,7 +2173,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         # pub.debug тут гарантированно False — см. комментарий в duplicate_publish.
         if pub.moderation and feed is not None:
             return await feeds_get(request, flash="Модель справилась — новость поставлена на "
-                                                  "согласование («Согласование» в меню), а не сразу "
+                                                  "согласование («Публикация» в меню), а не сразу "
                                                   "в канал: включён режим согласования.")
         return await feeds_get(request, flash="Опубликовано.")
 
@@ -2246,7 +2246,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                f'<button type="submit" class="undo-btn">Отменить</button></form>')
 
     async def queue_get(request: web.Request, flash: str = "", flash_kind: str = "ok",
-                        page_override: int | None = None, flash_action: str = "") -> web.Response:
+                        page_override: int | None = None, flash_action: str = "",
+                        broadcast_draft: str = "") -> web.Response:
         st: Storage = app["st"]
         pub: Publisher = app["publisher"]
         if page_override is not None:
@@ -2284,13 +2285,37 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             hint = ("<div class='section-hint'>Согласование сейчас выключено — новые новости "
                    "публикуются автоматически. Здесь то, что накопилось раньше — само не уйдёт, "
                    "разберите вручную или включите режим обратно в Настройках.</div>")
+        targets = [pub.channel or "канал не задан"]
+        if pub.vk_on:
+            targets.append(f"сообщество VK {pub.vk_group}")
+        broadcast_card = f"""
+        <div class="card">
+          <h3 style="margin:0 0 6px;">📢 Сообщение во все каналы</h3>
+          <p class="muted" style="margin:0 0 10px;">Уйдёт сразу как есть, без очереди и правок —
+            в {_e(", ".join(targets))}.</p>
+          <form method="post" action="/queue/broadcast"
+                onsubmit="return tgConfirmSubmit(this, 'Отправить это сообщение сразу во все подключённые каналы?')">
+            {csrf_field(request)}
+            <textarea name="text" rows="{_rows_for(broadcast_draft, min_rows=3, max_rows=10)}"
+                      maxlength="{TG_LIMIT}"
+                      placeholder="Текст объявления, не новость из ленты — например, «сегодня без вечернего дайджеста»...">{_e(broadcast_draft)}</textarea>
+            <div class="muted" style="margin:4px 0 10px;">Лимит: {TG_LIMIT} символов.</div>
+            <div class="card-actions">
+              <button class="primary" type="submit">Отправить</button>
+            </div>
+          </form>
+        </div>
+        """
         body = f"""
-        <h2 class="page-heading">Согласование <span class="muted" style="font-weight:400;">({total})</span></h2>
+        <h2 class="page-heading">Публикация</h2>
+        {broadcast_card}
+        <h3 class="page-heading" style="margin-top:22px;">Очередь на согласование
+          <span class="muted" style="font-weight:400;">({total})</span></h3>
         {hint}
         <div class="list">{items}</div>
         {pager}
         """
-        return web.Response(text=_layout("Согласование", body, flash, flash_kind, active="/queue",
+        return web.Response(text=_layout("Публикация", body, flash, flash_kind, active="/queue",
                                          flash_action=flash_action),
                             content_type="text/html")
 
@@ -2308,7 +2333,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             raise web.HTTPNotFound(text="Запись не найдена — возможно, уже обработана (опубликована, "
                                         "отклонена или её взял в работу другой администратор).")
         # ?page= — с какой страницы списка открыли карточку, чтобы кнопки
-        # ниже (и «‹ Согласование») вернули туда же, а не всегда на первую.
+        # ниже (и «‹ Публикация») вернули туда же, а не всегда на первую.
         page = page or request.query.get("page", "")
         back_href = f"/queue?page={page}" if page else "/queue"
         page_field = f'<input type="hidden" name="page" value="{_e(page)}">' if page else ""
@@ -2366,7 +2391,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                         f"картинка станет превью-ссылкой над ним.")
 
         body = f"""
-        <div><a href="{back_href}" class="back-link">‹ Согласование</a></div>
+        <div><a href="{back_href}" class="back-link">‹ Публикация</a></div>
         <h2 class="page-heading after-back">На согласовании #{row['id']}</h2>
         <div class="card">
           <div class="line"><b>{_e(row['title'])}</b></div>
@@ -2461,7 +2486,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         }})();
         </script>
         """
-        return web.Response(text=_layout(f"Согласование #{row['id']}", body, flash, flash_kind, active="/queue",
+        return web.Response(text=_layout(f"Публикация #{row['id']}", body, flash, flash_kind, active="/queue",
                                          flash_action=flash_action),
                             content_type="text/html")
 
@@ -2667,6 +2692,28 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         return await queue_detail(request, flash="Отправлено в личку — если панель открыта как Mini App, "
                                                   "сверните её, чтобы увидеть сообщение.", page=page)
 
+    async def queue_broadcast(request: web.Request) -> web.Response:
+        """Произвольное объявление админа сразу во все подключённые каналы —
+        не новость из ленты, поэтому в обход всего конвейера (build_post,
+        очередь согласования, дедуп, posts): нет ни исходной записи ленты,
+        ни feed_id, под которые рассчитана эта инфраструктура."""
+        pub: Publisher = app["publisher"]
+        text = str(request["form"].get("text", "")).strip()
+        if not text:
+            return await queue_get(request, flash="Пустой текст не отправлен.", flash_kind="err")
+        if tg_len(text) > TG_LIMIT:
+            return await queue_get(request, broadcast_draft=text,
+                                   flash=f"Текст длиннее лимита ({tg_len(text)} из {TG_LIMIT}) — не отправлено.",
+                                   flash_kind="err")
+        problem = html_problem(text)
+        if problem:
+            return await queue_get(request, broadcast_draft=text,
+                                   flash=f"Разметка не годится: {problem}", flash_kind="err")
+        error = await pub.broadcast(text)
+        if error:
+            return await queue_get(request, broadcast_draft=text, flash=error, flash_kind="err")
+        return await queue_get(request, flash="Отправлено во все подключённые каналы.")
+
     async def queue_undo(request: web.Request) -> web.Response:
         """Возвращает последнюю отклонённую карточку — см. queue_reject.
         Работает только в окне UNDO_TTL и только для самого недавнего
@@ -2747,6 +2794,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/queue/{id}/unschedule", queue_unschedule)
     app.router.add_post("/queue/{id}/preview", queue_preview)
     app.router.add_post("/queue/undo", queue_undo)
+    app.router.add_post("/queue/broadcast", queue_broadcast)
 
     return app
 
