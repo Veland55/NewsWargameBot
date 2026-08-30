@@ -36,10 +36,15 @@ ELLIPSIS = "…"
 MAINTENANCE_EVERY = 6 * 3600   # уборка в базе, секунды
 ALERT_EVERY = 3600             # как часто напоминать об отложенных новостях
 # Захват карточки очереди согласования под публикацию (claim_moderation)
-# "протухает" через столько секунд — запас на скачивание альбома и ретраи
-# _send (до 3 попыток с задержками). Не наткнуться на dead lock, если
-# процесс упал между отправкой и удалением карточки из очереди.
-PUBLISH_CLAIM_TTL = 180
+# "протухает" через столько секунд — запас на скачивание альбома (до 10
+# картинок) и ретраи _send (до 3 попыток с задержками), с учётом медленной
+# сети до Telegram. Раньше было 180 — этого впритык хватает при обычной
+# скорости, но при заметно просевшей сети/большом альбоме claim мог истечь
+# ДО завершения ещё идущей отправки, и повторный клик (или следующий
+# scheduled-проход) захватил бы карточку по новой, отправив дубль. Не
+# наткнуться на dead lock, если процесс упал между отправкой и удалением
+# карточки из очереди.
+PUBLISH_CLAIM_TTL = 600
 RU_ATTEMPTS = 2                # попыток добиться от модели русского текста
 # Сколько картинок для одной новости качать параллельно (см. _images_of_page).
 # Сайт-источник и его CDN — общие: слишком широкий веер бьёт по ним не хуже,
@@ -1321,6 +1326,18 @@ class Publisher:
         days = max(1, self.st.get_int("dedup_window_days"))
         since = int(time.time() - days * 86400)
         candidates = list(self.st.recent_posts(since))
+        # Очередь согласования (если включена) — тоже кандидаты, с id=None,
+        # той же семантикой, что и kept_in_batch ниже: карточка ещё не
+        # реальный пост (matched_post_id сослаться некуда), совпадение просто
+        # откладывает запись на следующий проход, не публикуя её вторично.
+        # Раньше дедуп сверялся только с уже ОПУБЛИКОВАННЫМИ постами — та же
+        # новость с другой ленты, пока первая ещё только ждёт согласования
+        # (не обязательно секунды — модерация может стоять часами), дедуп не
+        # ловил вовсе, и она либо второй раз вставала на согласование, либо
+        # (без согласования) уходила в канал дублем.
+        if self.moderation:
+            candidates += [{"id": None, "title": r["title"], "summary": r["summary"]}
+                          for r in self.st.moderation_titles()]
         keep: list[tuple[str, Entry]] = []
         # Записи, уже принятые в этом же проходе, тоже кандидаты на дубль —
         # иначе две похожие записи, разом пришедшие с одной ленты за один
@@ -1505,6 +1522,17 @@ class Publisher:
             text=text, image=image, extra_images="\n".join(extra), multi=multi,
         )
         if item_id is None:
+            # Гонка (уже стояла с тем же feed_id+key) — но раньше здесь просто
+            # выходили, НЕ помечая прочитанной. Обычно это неважно: запись и
+            # так уже помечена прочитанной с первой постановки в очередь.
+            # Но prune_seen чистит старые отметки по времени отдельно от
+            # moderation_keep_days — если карточка провисела в очереди дольше
+            # окна prune_seen (админ надолго забыл про неё), запись «протухает»
+            # в seen, следующий опрос ленты видит её снова как новую, тратит
+            # вызов модели заново и снова упирается в этот же UNIQUE-конфликт
+            # — и так каждый проход, пока карточку не разберут. Помечаем
+            # прочитанной здесь тоже, чтобы разорвать этот цикл.
+            self.st.mark_seen(feed_id, key)
             return None
         # Главное отличие от postponed: помечаем прочитанной СРАЗУ — текст
         # уже сгенерирован моделью, повторная оценка на следующем проходе
@@ -1560,13 +1588,49 @@ class Publisher:
         Возвращает число реально опубликованных."""
         due_ids = self.st.moderation_due_ids(int(time.time()))
         published = 0
+        failed: list[tuple[int, str]] = []
         for item_id in due_ids:
             error = await self.publish_moderated(item_id, actor="scheduled")
             if error:
                 log.warning("отложенная публикация карточки #%s не удалась: %s", item_id, error)
+                failed.append((item_id, error))
             else:
                 published += 1
+        if failed:
+            # Раньше только в journalctl — админ узнавал о провале отложенной
+            # публикации, только если сам догадался открыть очередь: карточка
+            # остаётся в 'queued' с прошедшим scheduled_at, но НИКАК не
+            # напоминает о себе (пока не наступит следующий _check_moderation_
+            # reminder по общим правилам очереди, что может быть часами позже).
+            await self._report_scheduled_publish_failed(failed)
         return published
+
+    async def _report_scheduled_publish_failed(self, failed: list[tuple[int, str]]) -> None:
+        """Троттлинг как у _report_queue_overflow: постоянная ошибка (канал
+        недоступен) иначе повторялась бы на каждом проходе опроса и
+        заваливала бы админа сообщениями чаще, чем раз в ALERT_EVERY."""
+        if not self.admin_ids:
+            return
+        now = int(time.time())
+        try:
+            last = int(self.st.get("scheduled_fail_alert_at") or 0)
+        except ValueError:
+            last = 0
+        if now - last < ALERT_EVERY:
+            return
+        self.st.set("scheduled_fail_alert_at", now)
+        lines = [f"• #{item_id} — {error}" for item_id, error in failed[:10]]
+        more = f"\n…и ещё {len(failed) - 10}" if len(failed) > 10 else ""
+        text = (f"⚠️ Не удалось опубликовать по расписанию {len(failed)} карточек — "
+               f"остались в очереди согласования, план снят автоматически не будет "
+               f"(попробуют снова на следующем проходе, если ошибка временная):\n"
+               + "\n".join(lines) + more)
+        for admin_id in sorted(self.admin_ids):
+            try:
+                await self.bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML")
+            except TelegramAPIError as exc:
+                log.warning("не удалось сообщить админу %s о провале отложенной публикации: %s",
+                            admin_id, exc)
 
     async def regen_moderated(self, item_id: int, extra: str = "") -> str | None:
         """Перегенерировать текст карточки в очереди через ИИ — в отличие от

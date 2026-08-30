@@ -453,6 +453,13 @@ class Storage:
             self._conn.execute("DELETE FROM seen WHERE feed_id = ?", (feed_id,))
             self._conn.execute("DELETE FROM postponed WHERE feed_id = ?", (feed_id,))
             self._conn.execute("DELETE FROM moderation WHERE feed_id = ?", (feed_id,))
+            # Раньше не чистили — не только мусор в очереди дублей навсегда,
+            # но и постоянная дыра в согласовании: publish_now у дубля с
+            # feed_id уже удалённой ленты публикует НАПРЯМУЮ (moderation.
+            # feed_id без реальной ленты не имеет смысла, см. publish_now),
+            # так что несписанный дубль удалённой ленты насовсем обходил бы
+            # согласование при каждом клике «опубликовать всё же».
+            self._conn.execute("DELETE FROM dedup_candidates WHERE feed_id = ?", (feed_id,))
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -684,6 +691,16 @@ class Storage:
             return self._conn.execute(
                 "SELECT id, title, summary FROM posts WHERE posted_at >= ?", (since_ts,)
             ).fetchall()
+
+    def moderation_titles(self) -> list[sqlite3.Row]:
+        """title/summary ВСЕХ карточек в очереди согласования (независимо от
+        страницы) — не только уже опубликованные посты, но и ждущие решения
+        админа, тоже база для сравнения на схожесть (см. dedup): без этого
+        одна и та же новость с другой ленты, пришедшая, пока первая ещё
+        только ждёт согласования (а не опубликована), дедупом не ловилась —
+        могла уйти в канал или повторно встать в очередь параллельно с ней."""
+        with self._lock:
+            return self._conn.execute("SELECT title, summary FROM moderation").fetchall()
 
     # --- дубли между лентами (/duplicates в веб-панели) --------------------
     def add_dedup_candidate(self, *, feed_id: int | None, title: str, summary: str,
@@ -950,10 +967,23 @@ class Storage:
     def prune_moderation(self, keep_days: int = 14) -> int:
         """В отличие от prune_postponed/prune_dedup_candidates — это ГОТОВЫЕ
         посты, молча выбрасывать их нельзя, поэтому возвращаем число
-        удалённых, чтобы вызывающий код мог о них сообщить админам."""
+        удалённых, чтобы вызывающий код мог о них сообщить админам.
+
+        Не трогаем status='publishing' (claim_moderation держит захват на
+        всё время реальной отправки — снести строку прямо во время неё
+        значило бы потерять и результат, и саму карточку из очереди, если
+        отправка провалится: release_moderation вернул бы её в 'queued',
+        обновляя уже удалённую запись, — молча в никуда) и запланированные
+        (scheduled_at не пуст — админ явно решил их судьбу на конкретное
+        время; удалить их раньше этого времени значило бы тихо отменить
+        решение админа без единого уведомления)."""
         cutoff = int(time.time() - keep_days * 86400)
         with self._lock:
-            cur = self._conn.execute("DELETE FROM moderation WHERE queued_at < ?", (cutoff,))
+            cur = self._conn.execute(
+                "DELETE FROM moderation WHERE queued_at < ? "
+                "AND status != 'publishing' AND scheduled_at IS NULL",
+                (cutoff,),
+            )
             self._conn.commit()
             return cur.rowcount
 

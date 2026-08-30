@@ -928,12 +928,15 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     # время создания): если админ так и не сохранил и не открыл пост заново,
     # запись иначе осталась бы в памяти процесса навсегда — см. REGEN_DRAFT_TTL.
     app["regen_drafts"]: dict[int, tuple[str, float]] = {}
-    # Последняя отклонённая карточка очереди согласования — для «Отменить»
-    # во флеше вместо confirm()-диалога на каждое отклонение (см.
-    # queue_reject/queue_undo). Один слот, не словарь: «отменить» имеет
-    # смысл только для самого недавнего действия, более ранние уже не
-    # актуальны, а хранить историю ради этого незачем.
-    app["undo_stash"]: tuple[dict, float] | None = None
+    # Последняя отклонённая карточка очереди согласования на сессию — для
+    # «Отменить» во флеше вместо confirm()-диалога на каждое отклонение (см.
+    # queue_reject/queue_undo). Словарь по токену сессии, не один общий
+    # слот: иначе «Отменить» у одного залогиненного админа могло вернуть
+    # отклонение, сделанное другим — оба работают с одной и той же общей
+    # панелью без разграничения личности (см. WebAuth). Внутри одной
+    # сессии — по-прежнему только самое недавнее действие, более ранние
+    # не актуальны.
+    app["undo_stash"]: dict[str, tuple[dict, float]] = {}
     # SameSite=Lax (без Secure) — обычный браузер по прямому https/http-адресу.
     # SameSite=None+Secure — когда панель открыта как Telegram Mini App
     # (WEB_PANEL_PUBLIC_URL задан, Telegram требует https для WebApp URL):
@@ -1697,7 +1700,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         <div class="card">
           <div class="line">Сейчас: <span class="pill {'on' if pub.moderation else 'neutral'}">{'включено' if pub.moderation else 'выключено'}</span></div>
           <p class="muted">Готовые посты не публикуются сами — ждут одобрения в
-            <a href="/queue">очереди</a>. {'В отладке не действует.' if pub.debug else ''}</p>
+            <a href="/queue">очереди</a>, кроме отложенных на конкретное время: те
+            публикуются сами по расписанию, даже на паузе. {'В отладке не действует.' if pub.debug else ''}</p>
           <form method="post" action="/settings/moderation">{csrf_field(request)}
             <div class="card-actions">
               <button class="{'' if pub.moderation else 'primary'}" type="submit">
@@ -1808,8 +1812,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             pending = st.count_moderation()
             flash = "✅ Согласование выключено, публикую в канал автоматически."
             if pending:
-                flash += (f" В очереди осталось {pending} карточек — сами они не уйдут, "
-                         f"разберите вручную («Согласование» в меню).")
+                flash += (f" В очереди осталось {pending} карточек — сами они не уйдут "
+                         f"(кроме уже поставленных на конкретное время — те опубликуются "
+                         f"по расписанию независимо от этой настройки), разберите "
+                         f"остальное вручную («Согласование» в меню).")
         return await settings_get(request, flash)
 
     async def settings_vk(request: web.Request) -> web.Response:
@@ -2551,10 +2557,21 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         next_id = st.moderation_neighbor(item_id) if row is not None else None
         if row is not None:
             # На отмену — «Отменить» во флеше вместо confirm()-диалога на
-            # каждое отклонение (см. queue_undo). Один слот в памяти, не
-            # персистентно: окно всего UNDO_TTL секунд, переживать рестарт
-            # процесса ему незачем.
-            app["undo_stash"] = (dict(row), time.time())
+            # каждое отклонение (см. queue_undo). В памяти, не персистентно:
+            # окно всего UNDO_TTL секунд, переживать рестарт процесса ему
+            # незачем. Раньше был один слот на всю панель — «Отменить» у
+            # одного админа могло тихо вернуть отклонение ДРУГОГО админа
+            # (два человека работают с очередью параллельно). Стэш по
+            # токену сессии — свой слот каждому залогиненному, без общей
+            # системы личностей (см. WebAuth: пароль один на всех, разбирать
+            # пользователей никогда не требовалось ни для чего другого).
+            token = request.cookies.get(SESSION_COOKIE)
+            if token:
+                stash: dict[str, tuple[dict, float]] = app["undo_stash"]
+                now = time.time()
+                for k in [k for k, (_, ts) in stash.items() if now - ts > UNDO_TTL]:
+                    stash.pop(k, None)
+                stash[token] = (dict(row), now)
             st.delete_moderation(item_id)
         if next_id is not None:
             return await queue_detail(request, item_id_override=next_id, page=page,
@@ -2653,21 +2670,33 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     async def queue_undo(request: web.Request) -> web.Response:
         """Возвращает последнюю отклонённую карточку — см. queue_reject.
         Работает только в окне UNDO_TTL и только для самого недавнего
-        отклонения; более раннее уже не отменить (стэш — один слот)."""
+        отклонения ЭТОЙ ЖЕ сессии; более раннее и чужие уже не отменить."""
         st: Storage = app["st"]
-        stash = app["undo_stash"]
+        token = request.cookies.get(SESSION_COOKIE)
+        stash = app["undo_stash"].pop(token, None) if token else None
         page = _form_page(request)
         if stash is None:
             return await queue_get(request, flash="Отменять уже нечего.", flash_kind="err",
                                    page_override=int(page) if page else None)
         row, stashed_at = stash
-        app["undo_stash"] = None
         if time.time() - stashed_at > UNDO_TTL:
             return await queue_get(request, flash="Слишком поздно — карточка уже удалена насовсем.",
                                    flash_kind="err", page_override=int(page) if page else None)
+        # Если карточка была отклонена уже ПОСЛЕ запланированного времени
+        # публикации (или отмена случилась настолько близко к границе TTL,
+        # что план успел протухнуть) — восстанавливать с этим scheduled_at
+        # нельзя: run_scheduled_publishes на следующем же проходе опубликует
+        # её немедленно, без единого шанса на повторный ручной разбор,
+        # хотя admin ожидает увидеть карточку снова в обычной очереди.
+        was_overdue = bool(row.get("scheduled_at")) and row["scheduled_at"] <= int(time.time())
+        if was_overdue:
+            row = dict(row)
+            row["scheduled_at"] = None
         st.restore_moderation(row)
-        return await queue_detail(request, item_id_override=row["id"], page=page,
-                                  flash="Восстановлено.")
+        flash = "Восстановлено."
+        if was_overdue:
+            flash += " План публикации снят — время уже прошло, требуется новое решение."
+        return await queue_detail(request, item_id_override=row["id"], page=page, flash=flash)
 
     app.router.add_get("/login", login_get)
     app.router.add_post("/login", login_post)
