@@ -322,6 +322,12 @@ class Publisher:
         # исправить (нет прав, канал не найден). Тогда дальше в этом проходе
         # посты не генерируем — иначе лимит модели уходит на недоставляемое.
         self._blocked = False
+        # Защита от двойного клика/повторной отправки формы для publish_now
+        # и retry_postponed — у них, в отличие от согласования, нет claim в
+        # БД (нечего claim'ить: строка не в очереди согласования, а в
+        # dedup_candidates/postponed). Обычный set с проверкой-и-добавлением
+        # без await между ними безопасен под GIL одного процесса.
+        self._manual_publish_locks: set[str] = set()
 
     # --- публичный API ---------------------------------------------------
     @property
@@ -1368,28 +1374,49 @@ class Publisher:
         неизвестен (лента-источник дубля уже удалена) — у moderation.feed_id
         нет смысла без реальной ленты, а это достаточно редкий случай, чтобы
         не усложнять ради него схему таблицы.
+
+        Если включена отладка (/debug) — действие целиком отключено: раньше
+        `not self.debug` в условии moderation_now означало, что при
+        одновременно включённых отладке и согласовании функция тихо уходила
+        в ветку прямой публикации — то есть ПРЯМО В КАНАЛ, а не в личку и не
+        в очередь, вопреки обоим режимам разом. Отдельная ветка «превью в
+        личку вместо канала», как у обычного цикла (_send_debug), сюда не
+        подходит: она рассчитана на непрочитанные записи основного цикла, а
+        здесь запись уже помечена прочитанной/удалена из очереди дублей —
+        то есть надо не превью показать, а именно ничего не публиковать.
         Возвращает None при успехе, иначе текст ошибки.
         """
-        moderation_now = self.moderation and not self.debug and feed is not None
+        if self.debug:
+            return ("Сейчас включена отладка (/debug) — публикация отсюда выключена, "
+                     "чтобы не уйти в канал мимо неё по ошибке. Выключите отладку "
+                     "(/debug off) и повторите.")
+        lock_key = f"dedup:{entry_key(*entry.key_parts)}"
+        if lock_key in self._manual_publish_locks:
+            return "Уже публикуется — подождите и обновите страницу."
+        self._manual_publish_locks.add(lock_key)
         try:
+            moderation_now = self.moderation and feed is not None
+            try:
+                if moderation_now:
+                    text = await self.build_post_text(entry, feed)
+                else:
+                    post = await self.build_post(entry, feed)
+            except LLMError as exc:
+                return f"Модель вернула ошибку: {exc}"
             if moderation_now:
-                text = await self.build_post_text(entry, feed)
-            else:
-                post = await self.build_post(entry, feed)
-        except LLMError as exc:
-            return f"Модель вернула ошибку: {exc}"
-        if moderation_now:
-            key = entry_key(*entry.key_parts)
-            item_id = await self._queue_for_review(feed, key, entry, text)
-            if item_id is None:
-                return "Уже в очереди согласования — обновите страницу."
+                key = entry_key(*entry.key_parts)
+                item_id = await self._queue_for_review(feed, key, entry, text)
+                if item_id is None:
+                    return "Уже в очереди согласования — обновите страницу."
+                return None
+            sent = await self._send(post.text, image=post.image, images=post.images)
+            if not sent:
+                return "Не удалось опубликовать — канал недоступен или не задан."
+            self._record_post(feed["id"] if feed else None, entry, feed, post, sent)
+            await self.send_vk(post)
             return None
-        sent = await self._send(post.text, image=post.image, images=post.images)
-        if not sent:
-            return "Не удалось опубликовать — канал недоступен или не задан."
-        self._record_post(feed["id"] if feed else None, entry, feed, post, sent)
-        await self.send_vk(post)
-        return None
+        finally:
+            self._manual_publish_locks.discard(lock_key)
 
     async def retry_postponed(self, item_id: int) -> str | None:
         """Повторная попытка одной записи из очереди «Отложенные» (веб-панель,
@@ -1403,44 +1430,60 @@ class Publisher:
         из-за чего одобренная модель после смены (например, /setmodel
         сразу после отказа) публиковала новость в канал мимо очереди.
 
+        Если включена отладка (/debug) — действие целиком отключено (см.
+        подробное объяснение в publish_now — та же причина: раньше
+        одновременно включённые отладка и согласование тихо публиковали
+        прямо в канал, обходя оба режима).
+
         Возвращает None при успехе, иначе текст ошибки — запись остаётся в
         очереди с обновлённым счётчиком попыток."""
-        row = self.st.postponed_item(item_id)
-        if row is None:
-            return "Запись не найдена — возможно, уже обработана."
-        feed_id, key = row["feed_id"], row["key"]
-        feed = self.st.feed(feed_id)
-        entry = Entry(key_parts=(key,), title=row["title"], link=row["link"],
-                      summary=row["summary"], published=row["published"], published_ts=0,
-                      image=row["image"])
-        moderation_now = self.moderation and not self.debug and feed is not None
+        if self.debug:
+            return ("Сейчас включена отладка (/debug) — публикация отсюда выключена, "
+                     "чтобы не уйти в канал мимо неё по ошибке. Выключите отладку "
+                     "(/debug off) и повторите.")
+        lock_key = f"postponed:{item_id}"
+        if lock_key in self._manual_publish_locks:
+            return "Уже публикуется — подождите и обновите страницу."
+        self._manual_publish_locks.add(lock_key)
         try:
+            row = self.st.postponed_item(item_id)
+            if row is None:
+                return "Запись не найдена — возможно, уже обработана."
+            feed_id, key = row["feed_id"], row["key"]
+            feed = self.st.feed(feed_id)
+            entry = Entry(key_parts=(key,), title=row["title"], link=row["link"],
+                          summary=row["summary"], published=row["published"], published_ts=0,
+                          image=row["image"])
+            moderation_now = self.moderation and feed is not None
+            try:
+                if moderation_now:
+                    text = await self.build_post_text(entry, feed)
+                else:
+                    post = await self.build_post(entry, feed)
+            except LLMError as exc:
+                self.st.add_postponed(
+                    feed_id=feed_id, key=key, title=row["title"], summary=row["summary"],
+                    link=row["link"], published=row["published"], image=row["image"],
+                    error=str(exc),
+                )
+                return f"Модель снова отказала: {exc}"
             if moderation_now:
-                text = await self.build_post_text(entry, feed)
-            else:
-                post = await self.build_post(entry, feed)
-        except LLMError as exc:
-            self.st.add_postponed(
-                feed_id=feed_id, key=key, title=row["title"], summary=row["summary"],
-                link=row["link"], published=row["published"], image=row["image"],
-                error=str(exc),
-            )
-            return f"Модель снова отказала: {exc}"
-        if moderation_now:
-            # _queue_for_review сам делает mark_seen/remove_postponed —
-            # отдельно здесь их вызывать не нужно.
-            new_item_id = await self._queue_for_review(feed, key, entry, text)
-            if new_item_id is None:
-                return "Уже в очереди согласования — обновите страницу."
+                # _queue_for_review сам делает mark_seen/remove_postponed —
+                # отдельно здесь их вызывать не нужно.
+                new_item_id = await self._queue_for_review(feed, key, entry, text)
+                if new_item_id is None:
+                    return "Уже в очереди согласования — обновите страницу."
+                return None
+            sent = await self._send(post.text, image=post.image, images=post.images)
+            if not sent:
+                return "Не удалось опубликовать — канал недоступен или не задан."
+            self.st.mark_seen(feed_id, key)
+            self.st.remove_postponed(feed_id, key)
+            self._record_post(feed_id, entry, feed, post, sent)
+            await self.send_vk(post)
             return None
-        sent = await self._send(post.text, image=post.image, images=post.images)
-        if not sent:
-            return "Не удалось опубликовать — канал недоступен или не задан."
-        self.st.mark_seen(feed_id, key)
-        self.st.remove_postponed(feed_id, key)
-        self._record_post(feed_id, entry, feed, post, sent)
-        await self.send_vk(post)
-        return None
+        finally:
+            self._manual_publish_locks.discard(lock_key)
 
     # --- очередь ручного согласования (self.moderation) --------------------
     async def _queue_for_review(self, feed: sqlite3.Row, key: str, entry: Entry,

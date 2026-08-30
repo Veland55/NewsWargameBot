@@ -2049,6 +2049,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                       if row["image"] and _is_http_url(row["image"]) else "")
         publish_label = ("✅ Обработать (пойдёт на согласование)" if pub.moderation and not pub.debug
                          else "✅ Опубликовать всё же")
+        debug_hint = ('<p class="field-hint" style="margin:6px 0 0; color:var(--red);">Включена '
+                     'отладка (/debug) — публикация отсюда сейчас откажет, выключите отладку.</p>'
+                     if pub.debug else "")
         body = f"""
         <div><a href="/feeds#duplicates" class="back-link">‹ Ленты</a></div>
         <h2 class="page-heading after-back">Дубль #{row['id']}</h2>
@@ -2061,6 +2064,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           <hr class="sep">
           <div class="field-hint" style="margin:0 0 6px;">Как есть в ленте, без обработки ИИ:</div>
           <pre class="post">{_e(row['summary'] or '(пусто)')}</pre>
+          {debug_hint}
           <div class="card-actions">
             <form method="post" action="/duplicates/{row['id']}/publish">{csrf_field(request)}
               <button class="primary" type="submit">{publish_label}</button></form>
@@ -2089,7 +2093,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         # актуальна — оставлять её значило бы предлагать разобрать ту же
         # новость ещё раз.
         st.delete_dedup_candidate(cid)
-        if pub.moderation and not pub.debug and feed is not None:
+        # pub.debug тут гарантированно False: publish_now отказывает ошибкой
+        # при включённой отладке ещё до публикации, и мы бы уже вернулись
+        # выше по error.
+        if pub.moderation and feed is not None:
             return await feeds_get(request, flash="Не дубль — поставлено на согласование "
                                                   "(«Согласование» в меню), а не сразу в канал: "
                                                   "включён режим согласования.")
@@ -2114,9 +2121,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         image_html = (f'<img src="{_safe_href(row["image"])}" alt="" '
                       f'style="max-width:100%; border-radius:10px; margin-top:10px;">'
                       if row["image"] and _is_http_url(row["image"]) else "")
-        retry_hint = ('<p class="field-hint" style="margin:6px 0 0;">Включено согласование — если '
+        retry_hint = ('<p class="field-hint" style="margin:6px 0 0; color:var(--red);">Включена '
+                     'отладка (/debug) — повтор отсюда сейчас откажет, выключите отладку.</p>'
+                     if pub.debug else
+                     '<p class="field-hint" style="margin:6px 0 0;">Включено согласование — если '
                      'модель ответит, новость уйдёт на согласование, а не сразу в канал.</p>'
-                     if pub.moderation and not pub.debug else "")
+                     if pub.moderation else "")
         body = f"""
         <div><a href="/feeds#postponed" class="back-link">‹ Ленты</a></div>
         <h2 class="page-heading after-back">Отложено #{row['id']}</h2>
@@ -2154,7 +2164,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         error = await pub.retry_postponed(pid)
         if error:
             return await feeds_get(request, flash=error, flash_kind="err")
-        if pub.moderation and not pub.debug and feed is not None:
+        # pub.debug тут гарантированно False — см. комментарий в duplicate_publish.
+        if pub.moderation and feed is not None:
             return await feeds_get(request, flash="Модель справилась — новость поставлена на "
                                                   "согласование («Согласование» в меню), а не сразу "
                                                   "в канал: включён режим согласования.")
@@ -2215,9 +2226,11 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             <form method="post" action="/queue/{r['id']}/publish"
                   onsubmit="return tgConfirmSubmit(this, 'Опубликовать в канал прямо сейчас?')">
               {csrf_field(request)}{page_field}
-              <button class="icon" type="submit" title="Опубликовать" aria-label="Опубликовать">✅</button></form>
+              <button class="icon" type="submit" title="Опубликовать" aria-label="Опубликовать"
+                {'disabled' if r['status'] == 'publishing' else ''}>✅</button></form>
             <form method="post" action="/queue/{r['id']}/reject">{csrf_field(request)}{page_field}
-              <button class="icon" type="submit" title="Отклонить" aria-label="Отклонить">🚫</button></form>
+              <button class="icon" type="submit" title="Отклонить" aria-label="Отклонить"
+                {'disabled' if r['status'] == 'publishing' else ''}>🚫</button></form>
           </div>
         </div>"""
 
@@ -2452,6 +2465,21 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         v = str(request["form"].get("page", "")).strip()
         return v if v.isdigit() else ""
 
+    def _refuse_if_publishing(row: sqlite3.Row) -> str | None:
+        """claim_moderation переводит карточку в status='publishing' на время
+        publish_moderated (ручной клик или расписание) — claim там атомарный
+        (UPDATE ... WHERE status='queued' ...), но эта проверка на других
+        действиях (отклонить/сохранить/перегенерировать/перепланировать)
+        отсутствовала: правило «карточку, которую сейчас публикуют, трогать
+        нельзя» было реализовано только для повторной публикации. Без него
+        админ мог отклонить карточку ровно в момент, когда run_scheduled_
+        publishes или другой админ её уже отправляет в канал — в панели
+        было бы «Отклонено», а в канале реальный пост, и «Отменить» после
+        такого отклонения создал бы в канале дубль."""
+        if row["status"] == "publishing":
+            return "Карточка сейчас публикуется — подождите несколько секунд и обновите страницу."
+        return None
+
     async def queue_save(request: web.Request) -> web.Response:
         st: Storage = app["st"]
         item_id = int(request.match_info["id"])
@@ -2459,6 +2487,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if row is None:
             raise web.HTTPNotFound(text="Запись не найдена — возможно, уже обработана")
         page = _form_page(request)
+        guard = _refuse_if_publishing(row)
+        if guard:
+            return await queue_detail(request, flash=guard, flash_kind="err", page=page)
         text = str(request["form"].get("text", "")).strip()
         if not text:
             return await queue_detail(request, flash="Пустой текст не сохранён.", flash_kind="err", page=page)
@@ -2513,6 +2544,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         item_id = int(request.match_info["id"])
         page = _form_page(request)
         row = st.moderation_item(item_id)
+        if row is not None:
+            guard = _refuse_if_publishing(row)
+            if guard:
+                return await queue_detail(request, flash=guard, flash_kind="err", page=page)
         next_id = st.moderation_neighbor(item_id) if row is not None else None
         if row is not None:
             # На отмену — «Отменить» во флеше вместо confirm()-диалога на
@@ -2529,9 +2564,15 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                                flash_action=_undo_flash_action(request, page))
 
     async def queue_regen(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
         pub: Publisher = app["publisher"]
         item_id = int(request.match_info["id"])
         page = request.query.get("page", "")
+        row = st.moderation_item(item_id)
+        if row is not None:
+            guard = _refuse_if_publishing(row)
+            if guard:
+                return await queue_detail(request, flash=guard, flash_kind="err", page=page)
         extra = str(request["form"].get("extra", "")).strip()
         error = await pub.regen_moderated(item_id, extra)
         if error:
@@ -2562,6 +2603,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if row is None:
             raise web.HTTPNotFound(text="Запись не найдена — возможно, уже обработана")
         page = _form_page(request)
+        guard = _refuse_if_publishing(row)
+        if guard:
+            return await queue_detail(request, flash=guard, flash_kind="err", page=page)
         hhmm = _parse_hhmm(str(request["form"].get("time", "")))
         if hhmm is None:
             return await queue_detail(request, flash="Укажите время в формате ЧЧ:ММ.",
@@ -2588,6 +2632,11 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         st: Storage = app["st"]
         item_id = int(request.match_info["id"])
         page = _form_page(request)
+        row = st.moderation_item(item_id)
+        if row is not None:
+            guard = _refuse_if_publishing(row)
+            if guard:
+                return await queue_detail(request, flash=guard, flash_kind="err", page=page)
         st.unschedule_moderation(item_id)
         return await queue_detail(request, flash="План снят — карточка снова ждёт ручного решения.", page=page)
 
