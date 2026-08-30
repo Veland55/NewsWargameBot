@@ -2035,6 +2035,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
     async def duplicate_detail(request: web.Request) -> web.Response:
         st: Storage = app["st"]
+        pub: Publisher = app["publisher"]
         cid = int(request.match_info["id"])
         row = st.dedup_candidate(cid)
         if row is None:
@@ -2046,6 +2047,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         image_html = (f'<img src="{_safe_href(row["image"])}" alt="" '
                       f'style="max-width:100%; border-radius:10px; margin-top:10px;">'
                       if row["image"] and _is_http_url(row["image"]) else "")
+        publish_label = ("✅ Обработать (пойдёт на согласование)" if pub.moderation and not pub.debug
+                         else "✅ Опубликовать всё же")
         body = f"""
         <div><a href="/feeds#duplicates" class="back-link">‹ Ленты</a></div>
         <h2 class="page-heading after-back">Дубль #{row['id']}</h2>
@@ -2060,7 +2063,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           <pre class="post">{_e(row['summary'] or '(пусто)')}</pre>
           <div class="card-actions">
             <form method="post" action="/duplicates/{row['id']}/publish">{csrf_field(request)}
-              <button class="primary" type="submit">✅ Опубликовать всё же</button></form>
+              <button class="primary" type="submit">{publish_label}</button></form>
             <form method="post" action="/duplicates/{row['id']}/delete"
                   onsubmit="return tgConfirmSubmit(this, 'Удалить из очереди? Новость останется неопубликованной.')">{csrf_field(request)}
               <button class="link-btn" type="submit">Удалить, это правда дубль</button></form>
@@ -2080,7 +2083,16 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         error = await pub.publish_now(_dedup_entry(row), feed)
         if error:
             return await feeds_get(request, flash=error, flash_kind="err")
+        # В обеих ветках: успех publish_now — либо реальная публикация,
+        # либо (при включённом согласовании) постановка в очередь на него,
+        # но в обоих случаях эта запись здесь, в очереди дублей, больше не
+        # актуальна — оставлять её значило бы предлагать разобрать ту же
+        # новость ещё раз.
         st.delete_dedup_candidate(cid)
+        if pub.moderation and not pub.debug and feed is not None:
+            return await feeds_get(request, flash="Не дубль — поставлено на согласование "
+                                                  "(«Согласование» в меню), а не сразу в канал: "
+                                                  "включён режим согласования.")
         return await feeds_get(request, flash="Опубликовано.")
 
     async def duplicate_delete(request: web.Request) -> web.Response:
@@ -2092,6 +2104,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     # --- отложенные из-за отказа ИИ ----------------------------------------
     async def postponed_detail(request: web.Request) -> web.Response:
         st: Storage = app["st"]
+        pub: Publisher = app["publisher"]
         pid = int(request.match_info["id"])
         row = st.postponed_item(pid)
         if row is None:
@@ -2101,6 +2114,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         image_html = (f'<img src="{_safe_href(row["image"])}" alt="" '
                       f'style="max-width:100%; border-radius:10px; margin-top:10px;">'
                       if row["image"] and _is_http_url(row["image"]) else "")
+        retry_hint = ('<p class="field-hint" style="margin:6px 0 0;">Включено согласование — если '
+                     'модель ответит, новость уйдёт на согласование, а не сразу в канал.</p>'
+                     if pub.moderation and not pub.debug else "")
         body = f"""
         <div><a href="/feeds#postponed" class="back-link">‹ Ленты</a></div>
         <h2 class="page-heading after-back">Отложено #{row['id']}</h2>
@@ -2118,6 +2134,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           <div class="card-actions">
             <form method="post" action="/postponed/{row['id']}/retry">{csrf_field(request)}
               <button class="primary" type="submit">🔄 Повторить сейчас</button></form>
+          </div>
+          {retry_hint}
+          <div class="card-actions" style="margin-top:0;">
             <form method="post" action="/postponed/{row['id']}/delete"
                   onsubmit="return tgConfirmSubmit(this, 'Отказаться от публикации? Новость больше не будет предложена.')">{csrf_field(request)}
               <button class="link-btn" type="submit">Не публиковать</button></form>
@@ -2127,11 +2146,18 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         return web.Response(text=_layout(f"Отложено #{row['id']}", body, active="/feeds"), content_type="text/html")
 
     async def postponed_retry(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
         pub: Publisher = app["publisher"]
         pid = int(request.match_info["id"])
+        row = st.postponed_item(pid)
+        feed = st.feed(row["feed_id"]) if row is not None else None
         error = await pub.retry_postponed(pid)
         if error:
             return await feeds_get(request, flash=error, flash_kind="err")
+        if pub.moderation and not pub.debug and feed is not None:
+            return await feeds_get(request, flash="Модель справилась — новость поставлена на "
+                                                  "согласование («Согласование» в меню), а не сразу "
+                                                  "в канал: включён режим согласования.")
         return await feeds_get(request, flash="Опубликовано.")
 
     async def postponed_delete(request: web.Request) -> web.Response:

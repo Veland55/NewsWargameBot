@@ -1359,12 +1359,31 @@ class Publisher:
     async def publish_now(self, entry: Entry, feed: sqlite3.Row | None) -> str | None:
         """Публикует запись немедленно, в обход обычного цикла — для дублей,
         которые админ решил опубликовать вручную (веб-панель, раздел «Ленты»).
+
+        Если включено ручное согласование — не публикует напрямую, а ставит
+        в очередь на согласование (см. _queue_for_review): «опубликовать
+        всё же» у дубля значит «совпадение ложное, обработай как обычную
+        новость», а не «пропусти согласование», которое админ явно включил
+        для всех новостей разом. Публикует напрямую только если feed
+        неизвестен (лента-источник дубля уже удалена) — у moderation.feed_id
+        нет смысла без реальной ленты, а это достаточно редкий случай, чтобы
+        не усложнять ради него схему таблицы.
         Возвращает None при успехе, иначе текст ошибки.
         """
+        moderation_now = self.moderation and not self.debug and feed is not None
         try:
-            post = await self.build_post(entry, feed)
+            if moderation_now:
+                text = await self.build_post_text(entry, feed)
+            else:
+                post = await self.build_post(entry, feed)
         except LLMError as exc:
             return f"Модель вернула ошибку: {exc}"
+        if moderation_now:
+            key = entry_key(*entry.key_parts)
+            item_id = await self._queue_for_review(feed, key, entry, text)
+            if item_id is None:
+                return "Уже в очереди согласования — обновите страницу."
+            return None
         sent = await self._send(post.text, image=post.image, images=post.images)
         if not sent:
             return "Не удалось опубликовать — канал недоступен или не задан."
@@ -1375,6 +1394,15 @@ class Publisher:
     async def retry_postponed(self, item_id: int) -> str | None:
         """Повторная попытка одной записи из очереди «Отложенные» (веб-панель,
         раздел «Ленты») — не дожидаясь следующего автоматического цикла.
+
+        Если включено ручное согласование — успешный результат идёт не в
+        канал напрямую, а в очередь на согласование (см. _queue_for_review):
+        "Повторить сейчас" на карточке отказа модели означает "обработай
+        новость ещё раз", а не "и обойди согласование, которое включено
+        для всех новостей". Раньше эта функция всегда публиковала напрямую,
+        из-за чего одобренная модель после смены (например, /setmodel
+        сразу после отказа) публиковала новость в канал мимо очереди.
+
         Возвращает None при успехе, иначе текст ошибки — запись остаётся в
         очереди с обновлённым счётчиком попыток."""
         row = self.st.postponed_item(item_id)
@@ -1385,8 +1413,12 @@ class Publisher:
         entry = Entry(key_parts=(key,), title=row["title"], link=row["link"],
                       summary=row["summary"], published=row["published"], published_ts=0,
                       image=row["image"])
+        moderation_now = self.moderation and not self.debug and feed is not None
         try:
-            post = await self.build_post(entry, feed)
+            if moderation_now:
+                text = await self.build_post_text(entry, feed)
+            else:
+                post = await self.build_post(entry, feed)
         except LLMError as exc:
             self.st.add_postponed(
                 feed_id=feed_id, key=key, title=row["title"], summary=row["summary"],
@@ -1394,6 +1426,13 @@ class Publisher:
                 error=str(exc),
             )
             return f"Модель снова отказала: {exc}"
+        if moderation_now:
+            # _queue_for_review сам делает mark_seen/remove_postponed —
+            # отдельно здесь их вызывать не нужно.
+            new_item_id = await self._queue_for_review(feed, key, entry, text)
+            if new_item_id is None:
+                return "Уже в очереди согласования — обновите страницу."
+            return None
         sent = await self._send(post.text, image=post.image, images=post.images)
         if not sent:
             return "Не удалось опубликовать — канал недоступен или не задан."
