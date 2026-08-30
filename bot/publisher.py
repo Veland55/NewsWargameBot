@@ -773,11 +773,11 @@ class Publisher:
         if result.error:
             log.warning("лента #%s: %s", feed_id, result.error)
             self.st.update_feed(feed_id, last_check=now, last_error=result.error[:300])
-            return 0
+            return 0, 0
 
         if result.not_modified:
             self.st.update_feed(feed_id, last_check=now, last_error=None)
-            return 0
+            return 0, 0
 
         updates: dict[str, object] = {"last_check": now, "last_error": None}
         if not debug:
