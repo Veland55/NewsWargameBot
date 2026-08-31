@@ -711,7 +711,17 @@ TG_INIT_SCRIPT = """<script src="https://telegram.org/js/telegram-web-app.js" de
 function tgConfirmSubmit(form, message) {
   var tg = window.Telegram && window.Telegram.WebApp;
   if (tg && tg.showConfirm) {
-    tg.showConfirm(message, function (ok) { if (ok) form.submit(); });
+    // showConfirm асинхронный — обычный window.confirm() ниже блокирует JS
+    // целиком, пока открыт (фоновому обновлению просто нечем выполниться),
+    // а этот — нет: пока админ думает, таймер автообновления мог бы
+    // подменить <main> под диалогом и отсоединить "form" от документа от
+    // закрытия. __confirmOpen — сигнал автообновлению пропустить тик,
+    // пока ответ не получен.
+    window.__confirmOpen = true;
+    tg.showConfirm(message, function (ok) {
+      window.__confirmOpen = false;
+      if (ok) form.submit();
+    });
   } else if (window.confirm(message)) {
     form.submit();
   }
@@ -719,38 +729,87 @@ function tgConfirmSubmit(form, message) {
 }
 // Фоновое обновление данных на странице без ручного F5 — вся панель это
 // набор страниц с полной перезагрузкой, а не SPA, так что «обновить» здесь
-// значит: периодически перезапросить текущий URL и подменить только
-// содержимое <main>, не трогая шапку/меню и не теряя место прокрутки.
-// isDirty() — если в каком-то поле есть несохранённые правки (значение
-// отличается от того, что реально отрисовал сервер), тик просто
-// пропускается: иначе черновик текста поста или несохранённая настройка
+// значит: периодически перезапросить актуальный GET-адрес текущей страницы
+// и подменить только содержимое <main>, не трогая шапку/меню и не теряя
+// место прокрутки.
+//
+// window.__refreshUrl — многие POST-обработчики (сохранить черновик,
+// перепланировать, сохранить настройки и т.п.) рендерят HTML прямо в
+// ответ на POST, а не редиректят (PRG) — адрес в браузере после такого
+// сохранения остаётся на POST-only маршруте вида /queue/5/save, который на
+// GET отдаёт 405. Без этой переменной автообновление там просто умирало
+// бы навсегда после первого сохранения — ровно там, где админ и проводит
+// больше всего времени. Каждая страница знает свой настоящий GET-адрес
+// сама (см. refresh_path в _layout) и явно его прописывает; location.href
+// — только запасной вариант для страниц, которые его не задали.
+//
+// isDirty() — если где-то есть несохранённые правки (текст/чекбокс/радио/
+// выбор в select отличается от того, что реально отрисовал сервер), тик
+// пропускается целиком: иначе черновик поста или несохранённая настройка
 // молча стёрлись бы свежими данными с сервера у админа из-под рук.
 window.__autoRefreshStart = function (intervalMs) {
   function isDirty() {
-    var els = document.querySelectorAll('main input, main textarea');
+    var els = document.querySelectorAll('main input, main textarea, main select');
     for (var i = 0; i < els.length; i++) {
       var el = els[i];
-      if (el.type === 'hidden' || el.type === 'submit' || el.type === 'button'
-          || el.type === 'checkbox' || el.type === 'radio') continue;
+      if (el.tagName === 'SELECT') {
+        for (var j = 0; j < el.options.length; j++) {
+          if (el.options[j].selected !== el.options[j].defaultSelected) return true;
+        }
+        continue;
+      }
+      if (el.type === 'hidden' || el.type === 'submit' || el.type === 'button') continue;
+      if (el.type === 'checkbox' || el.type === 'radio') {
+        if (el.checked !== el.defaultChecked) return true;
+        continue;
+      }
       if (el.value !== el.defaultValue) return true;
     }
     return false;
   }
+  var inFlight = false;
   function tick() {
-    if (document.visibilityState !== 'visible' || isDirty()) return;
+    // window.__confirmOpen — выставляется в tgConfirmSubmit на время
+    // showConfirm()/confirm(): диалог асинхронный, а обработчик «Да» держит
+    // в замыкании конкретный DOM-элемент формы — подмени фон <main> под
+    // диалогом, и клик «Да» отправит уже отсоединённую от документа форму,
+    // молча ничего не сделав.
+    if (document.visibilityState !== 'visible' || isDirty() || window.__confirmOpen || inFlight) return;
     var mainEl = document.querySelector('main');
     if (!mainEl) return;
-    fetch(location.href, {credentials: 'same-origin'}).then(function (r) {
+    inFlight = true;
+    fetch(window.__refreshUrl || location.href, {credentials: 'same-origin'}).then(function (r) {
+      // Сессия истекла — auth_middleware редиректит на /login, fetch сам
+      // проследует за редиректом и вернёт 200 с HTML страницы входа. У неё
+      // тоже есть корневой <main> — если вклеить его как есть, посреди
+      // панели вдруг возникнет форма пароля без единого пояснения, а её
+      // собственный скрипт (автовход/фокус) через innerHTML не выполнится.
+      // Правильная реакция — обычная полная перезагрузка, не подмена.
+      if (r.redirected && new URL(r.url).pathname === '/login') { location.reload(); return null; }
       return r.ok ? r.text() : null;
     }).then(function (html) {
       // Проверяем ещё раз перед подменой — пока шёл запрос, могли начать печатать.
-      if (!html || isDirty()) return;
+      if (!html || isDirty() || window.__confirmOpen) return;
       var freshMain = new DOMParser().parseFromString(html, 'text/html').querySelector('main');
       if (!freshMain) return;
+      // Раскрытые <details> (настройки очереди/дедупликации, «как есть в
+      // ленте» и т.п.) и прокрутка — иначе каждый тик схлопывал бы то, что
+      // админ только что открыл почитать, и дёргал бы страницу к началу.
+      // По индексу, не по id — не у всех <details> он есть, а порядок между
+      // соседними тиками практически всегда тот же.
+      var openIdx = [];
+      var oldDetails = mainEl.querySelectorAll('details');
+      for (var k = 0; k < oldDetails.length; k++) { if (oldDetails[k].open) openIdx.push(k); }
+      var scrollY = window.scrollY;
       mainEl.innerHTML = freshMain.innerHTML;
+      var newDetails = mainEl.querySelectorAll('details');
+      for (var m = 0; m < openIdx.length; m++) {
+        if (newDetails[openIdx[m]]) newDetails[openIdx[m]].open = true;
+      }
+      window.scrollTo(0, scrollY);
       if (window.autosizeTextareas) window.autosizeTextareas();
       if (window.__pageInit) window.__pageInit();
-    }).catch(function () {});
+    }).catch(function () {}).then(function () { inFlight = false; });
   }
   setInterval(tick, intervalMs);
 };
@@ -850,7 +909,12 @@ async def _usage_body(pub: "Publisher") -> str:
     # показывался счётчик обычного LLM, даже когда реально работал Gemini
     # или Claude, и их расход нигде не отражался вообще.
     backend = pub.backend_key
-    info = await pub.quota.snapshot(backend, force=True)
+    # force=False — берём кэш ключа (KEY_CACHE_TTL, см. quota.py), не бьём
+    # OpenRouter живым запросом на каждый рендер. Раньше это был один запрос
+    # на ручное открытие «Статуса»; с фоновым автообновлением страницы
+    # (см. __autoRefreshStart) force=True означало бы реальный внешний
+    # HTTP-запрос каждые 20 секунд, пока вкладка просто открыта.
+    info = await pub.quota.snapshot(backend, force=False)
     rows = [
         ("Запросов сегодня", f"{info.requests}" + (f" из {info.request_limit} ({info.request_pct:.0f}%)" if info.request_limit else "")),
         ("Токены", f"{info.tokens_in} вход / {info.tokens_out} выход"),
@@ -872,7 +936,7 @@ async def _usage_body(pub: "Publisher") -> str:
 
 
 def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok", active: str = "",
-           wide: bool = False, flash_action: str = "") -> str:
+           wide: bool = False, flash_action: str = "", refresh_path: str | None = None) -> str:
     # flash_action — готовый HTML (например, форма «Отменить»), не текст:
     # вызывающий код сам решает, что туда положить, поэтому не экранируем,
     # в отличие от flash. Пусто по умолчанию — большинство флешей его не используют.
@@ -908,6 +972,7 @@ def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok", acti
 </div>
 <nav class="bottom-nav">{nav_html}</nav>
 <script>document.addEventListener('DOMContentLoaded', function () {{
+  {f"window.__refreshUrl = {json.dumps(refresh_path)};" if refresh_path else ""}
   if (window.__autoRefreshStart) window.__autoRefreshStart(20000);
 }});</script>
 </body></html>"""
@@ -1241,7 +1306,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         <div class="stat-grid">{stat_html}</div>
         """
         body += await _usage_body(pub)
-        return web.Response(text=_layout("Статус", body, flash, flash_kind, active="/", wide=True), content_type="text/html")
+        return web.Response(text=_layout("Статус", body, flash, flash_kind, active="/", wide=True,
+                                         refresh_path="/"), content_type="text/html")
 
     async def pause_post(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -1438,7 +1504,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         </details>
         <div class="list list-grid" style="margin-top:10px;">{search_list}</div>
         """
-        return web.Response(text=_layout("Ленты", body, flash, flash_kind, active="/feeds"), content_type="text/html")
+        return web.Response(text=_layout("Ленты", body, flash, flash_kind, active="/feeds",
+                                         refresh_path="/feeds"), content_type="text/html")
 
     async def feeds_add(request: web.Request) -> web.Response:
         form = request["form"]
@@ -1556,7 +1623,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </details>
         </div>
         """
-        return web.Response(text=_layout(f"Промпт ленты #{feed_id}", body, flash, flash_kind, active="/feeds"),
+        return web.Response(text=_layout(f"Промпт ленты #{feed_id}", body, flash, flash_kind, active="/feeds",
+                                         refresh_path=f"/feeds/{feed_id}/template"),
                             content_type="text/html")
 
     async def feed_template_post(request: web.Request) -> web.Response:
@@ -1647,7 +1715,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </form>
         </div>
         """
-        return web.Response(text=_layout("Контент", body, flash, flash_kind, active="/content", wide=True), content_type="text/html")
+        return web.Response(text=_layout("Контент", body, flash, flash_kind, active="/content", wide=True,
+                                         refresh_path="/content"), content_type="text/html")
 
     async def content_prompt_post(request: web.Request) -> web.Response:
         text = str(request["form"].get("text", "")).strip()
@@ -1818,7 +1887,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         </div>
         </div>
         """
-        return web.Response(text=_layout("Настройки", body, flash, flash_kind, active="/settings", wide=True), content_type="text/html")
+        return web.Response(text=_layout("Настройки", body, flash, flash_kind, active="/settings", wide=True,
+                                         refresh_path="/settings"), content_type="text/html")
 
     async def settings_channel(request: web.Request) -> web.Response:
         target = str(request["form"].get("channel", "")).strip()
@@ -1954,7 +2024,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         body = (f"<h2 class='page-heading'>Последние посты "
                f"<span class='muted' style='font-weight:400;'>(до 30)</span></h2>"
                f"<div class='list'>{list_html}</div>")
-        return web.Response(text=_layout("Посты", body, active="/posts"), content_type="text/html")
+        return web.Response(text=_layout("Посты", body, active="/posts", refresh_path="/posts"), content_type="text/html")
 
     async def post_detail(request: web.Request, draft: str | None = None,
                           flash: str = "", flash_kind: str = "ok") -> web.Response:
@@ -2025,7 +2095,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </form>
         </div>
         """
-        return web.Response(text=_layout(f"Пост #{row['id']}", body, flash, flash_kind, active="/posts"), content_type="text/html")
+        return web.Response(text=_layout(f"Пост #{row['id']}", body, flash, flash_kind, active="/posts",
+                                         refresh_path=f"/posts/{row['id']}"), content_type="text/html")
 
     async def post_save(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -2502,7 +2573,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         {broadcast_card}
         """
         return web.Response(text=_layout("Публикация", body, flash, flash_kind, active="/queue",
-                                         flash_action=flash_action),
+                                         flash_action=flash_action,
+                                         refresh_path=f"/queue?page={page}" if page > 1 else "/queue"),
                             content_type="text/html")
 
     async def queue_detail(request: web.Request, draft: str | None = None,
@@ -2543,8 +2615,16 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         disabled = "disabled" if publishing else ""
         scheduled_html = ""
         schedule_time_value = "12:00"
+        schedule_day_value = "today"
         if row["scheduled_at"]:
             schedule_time_value = time.strftime("%H:%M", time.localtime(row["scheduled_at"]))
+            # День выбора раньше всегда рисовался как «Сегодня», даже когда
+            # карточка на самом деле стояла на завтра — попытка чуть
+            # поправить время (например, ошибиться в минутах и переотправить)
+            # молча переносила план на сегодня вместо завтра.
+            scheduled_date = datetime.fromtimestamp(row["scheduled_at"]).date()
+            if scheduled_date > datetime.now().date():
+                schedule_day_value = "tomorrow"
             scheduled_html = (
                 f'<div class="muted" style="color:var(--purple); margin-top:6px;">'
                 f'🕒 Запланировано на {time.strftime("%d.%m %H:%M", time.localtime(row["scheduled_at"]))} '
@@ -2625,8 +2705,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             вместе с планом, отдельно нажимать «Сохранить черновик» не нужно.</p>
           <div class="row">
             <select name="day" form="queue-publish-form">
-              <option value="today">Сегодня</option>
-              <option value="tomorrow">Завтра</option>
+              <option value="today" {"selected" if schedule_day_value == "today" else ""}>Сегодня</option>
+              <option value="tomorrow" {"selected" if schedule_day_value == "tomorrow" else ""}>Завтра</option>
             </select>
             <input type="time" name="time" value="{schedule_time_value}" required style="flex:1;"
                    form="queue-publish-form">
@@ -2655,7 +2735,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         window.__pageInit = function () {{
           var tg = window.Telegram && window.Telegram.WebApp;
           if (!tg) return;
-          var publishing = {json.dumps(publishing)};
           try {{
             if (tg.BackButton) {{
               if (window.__backBtnHandler) {{ try {{ tg.BackButton.offClick(window.__backBtnHandler); }} catch (e) {{}} }}
@@ -2665,6 +2744,14 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             }}
           }} catch (e) {{}}
           var form = document.getElementById('queue-publish-form');
+          // Читаем "публикуется ли" из самой свежей разметки (disabled на
+          // кнопке), а не из переменной, вшитой в момент первого рендера —
+          // после фонового обновления <main> этот <script> не выполняется
+          // заново (innerHTML не исполняет script), только __pageInit —
+          // застывшее значение развело бы MainButton с реальным состоянием
+          // карточки (например, когда её начинает публиковать планировщик).
+          var publishBtn = form && form.querySelector('button.primary');
+          var publishing = !publishBtn || publishBtn.disabled;
           if (tg.MainButton) {{
             if (window.__mainBtnHandler) {{ try {{ tg.MainButton.offClick(window.__mainBtnHandler); }} catch (e) {{}} }}
             if (!publishing && form) {{
@@ -2692,7 +2779,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         </script>
         """
         return web.Response(text=_layout(f"Публикация #{row['id']}", body, flash, flash_kind, active="/queue",
-                                         flash_action=flash_action),
+                                         flash_action=flash_action,
+                                         refresh_path=f"/queue/{row['id']}?page={page}" if page
+                                                     else f"/queue/{row['id']}"),
                             content_type="text/html")
 
     def _form_page(request: web.Request) -> str:
