@@ -2576,19 +2576,20 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </form>
         </div>
         <div class="card">
-          <form method="post" action="/queue/{row['id']}/schedule">{csrf_field(request)}{page_field}
-            <label>Отложить публикацию</label>
-            <p class="field-hint" style="margin:0 0 8px;">Опубликуется само в выбранное время —
-              возвращаться и нажимать «Опубликовать» вручную не нужно.</p>
-            <div class="row">
-              <select name="day">
-                <option value="today">Сегодня</option>
-                <option value="tomorrow">Завтра</option>
-              </select>
-              <input type="time" name="time" value="{schedule_time_value}" required style="flex:1;">
-              <button type="submit" {disabled}>🕒 Запланировать</button>
-            </div>
-          </form>
+          <label>Отложить публикацию</label>
+          <p class="field-hint" style="margin:0 0 8px;">Опубликуется само в выбранное время —
+            возвращаться и нажимать «Опубликовать» вручную не нужно. Правки в тексте выше сохранятся
+            вместе с планом, отдельно нажимать «Сохранить черновик» не нужно.</p>
+          <div class="row">
+            <select name="day" form="queue-publish-form">
+              <option value="today">Сегодня</option>
+              <option value="tomorrow">Завтра</option>
+            </select>
+            <input type="time" name="time" value="{schedule_time_value}" required style="flex:1;"
+                   form="queue-publish-form">
+            <button type="submit" form="queue-publish-form"
+                    formaction="/queue/{row['id']}/schedule" {disabled}>🕒 Запланировать</button>
+          </div>
           {unschedule_form}
         </div>
         <div class="card">
@@ -2816,6 +2817,24 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         guard = _refuse_if_publishing(row)
         if guard:
             return await queue_detail(request, flash=guard, flash_kind="err", page=page)
+        # Поля дня/времени физически вне <form id="queue-publish-form"> (form=
+        # атрибут привязывает их к ней) — так что вместе с расписанием сюда же
+        # приходит и text из той же формы. Сохраняем правки точно как
+        # queue_publish, иначе поставить план значило бы молча потерять
+        # несохранённый черновик (ради чего это всё и делалось).
+        text = str(request["form"].get("text", "")).strip()
+        if text and text != row["text"]:
+            if tg_len(text) > TG_LIMIT:
+                return await queue_detail(request, draft=text, page=page,
+                                          flash=f"Текст длиннее лимита ({tg_len(text)} из {TG_LIMIT}) — "
+                                               f"план не поставлен.", flash_kind="err")
+            problem = html_problem(text)
+            if problem:
+                # См. комментарий про unescape в queue_save — тот же html_problem.
+                return await queue_detail(request, draft=text, page=page,
+                                          flash=f"Разметка не годится: {html_mod.unescape(problem)}",
+                                          flash_kind="err")
+            st.update_moderation_text(item_id, text)
         hhmm = _parse_hhmm(str(request["form"].get("time", "")))
         if hhmm is None:
             return await queue_detail(request, flash="Укажите время в формате ЧЧ:ММ.",
