@@ -717,6 +717,43 @@ function tgConfirmSubmit(form, message) {
   }
   return false;
 }
+// Фоновое обновление данных на странице без ручного F5 — вся панель это
+// набор страниц с полной перезагрузкой, а не SPA, так что «обновить» здесь
+// значит: периодически перезапросить текущий URL и подменить только
+// содержимое <main>, не трогая шапку/меню и не теряя место прокрутки.
+// isDirty() — если в каком-то поле есть несохранённые правки (значение
+// отличается от того, что реально отрисовал сервер), тик просто
+// пропускается: иначе черновик текста поста или несохранённая настройка
+// молча стёрлись бы свежими данными с сервера у админа из-под рук.
+window.__autoRefreshStart = function (intervalMs) {
+  function isDirty() {
+    var els = document.querySelectorAll('main input, main textarea');
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (el.type === 'hidden' || el.type === 'submit' || el.type === 'button'
+          || el.type === 'checkbox' || el.type === 'radio') continue;
+      if (el.value !== el.defaultValue) return true;
+    }
+    return false;
+  }
+  function tick() {
+    if (document.visibilityState !== 'visible' || isDirty()) return;
+    var mainEl = document.querySelector('main');
+    if (!mainEl) return;
+    fetch(location.href, {credentials: 'same-origin'}).then(function (r) {
+      return r.ok ? r.text() : null;
+    }).then(function (html) {
+      // Проверяем ещё раз перед подменой — пока шёл запрос, могли начать печатать.
+      if (!html || isDirty()) return;
+      var freshMain = new DOMParser().parseFromString(html, 'text/html').querySelector('main');
+      if (!freshMain) return;
+      mainEl.innerHTML = freshMain.innerHTML;
+      if (window.autosizeTextareas) window.autosizeTextareas();
+      if (window.__pageInit) window.__pageInit();
+    }).catch(function () {});
+  }
+  setInterval(tick, intervalMs);
+};
 document.addEventListener('DOMContentLoaded', function () {
   // Обёрнуто в DOMContentLoaded, а не выполняется сразу: скрипт telegram-
   // web-app.js above теперь defer (см. комментарий у него) — без этой
@@ -761,6 +798,9 @@ document.addEventListener('DOMContentLoaded', function () {
   }
   window.addEventListener('load', autosizeTextareas);
   window.addEventListener('resize', autosizeTextareas);
+  // Доступна снаружи IIFE — __autoRefreshStart зовёт её заново после
+  // подмены <main>, иначе новые textarea остались бы нерастянутыми.
+  window.autosizeTextareas = autosizeTextareas;
 
   var tg = window.Telegram && window.Telegram.WebApp;
   if (!tg) return;
@@ -867,6 +907,9 @@ def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok", acti
   </div>
 </div>
 <nav class="bottom-nav">{nav_html}</nav>
+<script>document.addEventListener('DOMContentLoaded', function () {{
+  if (window.__autoRefreshStart) window.__autoRefreshStart(20000);
+}});</script>
 </body></html>"""
 
 
@@ -2601,39 +2644,50 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </div>
         </div>
         <script>
-        document.addEventListener('DOMContentLoaded', function () {{
-          // DOMContentLoaded — telegram-web-app.js теперь defer (см.
-          // TG_INIT_SCRIPT), без этой обёртки window.Telegram здесь мог
-          // быть ещё не загружен даже внутри настоящего Telegram.
-        (function () {{
-          // Родные кнопки Telegram (thumb zone внизу экрана, вне прокрутки) —
-          // необязательное улучшение поверх уже рабочих кнопок на странице:
-          // сама форма и её onclick/tgConfirmSubmit остаются рабочим
-          // способом опубликовать, если у клиента нет MainButton/BackButton
-          // или сеть/версия не подтянули API. Всё в try/catch — не должно
-          // ронять страницу, если что-то из этого недоступно.
+        // window.__pageInit, не разовая IIFE — эта карточка обновляется в
+        // фоне (см. __autoRefreshStart в TG_INIT_SCRIPT), и после каждой
+        // подмены <main> байндинги нужно переставить на свежий DOM: старый
+        // "form" из закрытой переменной иначе указывал бы на уже отсоединённый
+        // от документа элемент. offClick перед повторным onClick — Telegram
+        // копит обработчики, а не заменяет: без явного снятия старого клик по
+        // MainButton через несколько обновлений страницы вызывал бы сразу все
+        // накопленные версии разом (в т.ч. на отсоединённых формах).
+        window.__pageInit = function () {{
           var tg = window.Telegram && window.Telegram.WebApp;
           if (!tg) return;
           var publishing = {json.dumps(publishing)};
           try {{
             if (tg.BackButton) {{
+              if (window.__backBtnHandler) {{ try {{ tg.BackButton.offClick(window.__backBtnHandler); }} catch (e) {{}} }}
+              window.__backBtnHandler = function () {{ location.href = {json.dumps(back_href)}; }};
               tg.BackButton.show();
-              tg.BackButton.onClick(function () {{ location.href = {json.dumps(back_href)}; }});
+              tg.BackButton.onClick(window.__backBtnHandler);
             }}
           }} catch (e) {{}}
           var form = document.getElementById('queue-publish-form');
-          if (!publishing && tg.MainButton && form) {{
-            try {{
-              tg.MainButton.setText('✅ Опубликовать');
-              tg.MainButton.show();
-              tg.MainButton.onClick(function () {{
-                if (tg.HapticFeedback) {{ try {{ tg.HapticFeedback.notificationOccurred('success'); }} catch (e) {{}} }}
-                if (window.tgConfirmSubmit) {{ tgConfirmSubmit(form, 'Опубликовать в канал прямо сейчас?'); }}
-                else {{ form.submit(); }}
-              }});
-            }} catch (e) {{}}
+          if (tg.MainButton) {{
+            if (window.__mainBtnHandler) {{ try {{ tg.MainButton.offClick(window.__mainBtnHandler); }} catch (e) {{}} }}
+            if (!publishing && form) {{
+              try {{
+                tg.MainButton.setText('✅ Опубликовать');
+                tg.MainButton.show();
+                window.__mainBtnHandler = function () {{
+                  if (tg.HapticFeedback) {{ try {{ tg.HapticFeedback.notificationOccurred('success'); }} catch (e) {{}} }}
+                  if (window.tgConfirmSubmit) {{ tgConfirmSubmit(form, 'Опубликовать в канал прямо сейчас?'); }}
+                  else {{ form.submit(); }}
+                }};
+                tg.MainButton.onClick(window.__mainBtnHandler);
+              }} catch (e) {{}}
+            }} else {{
+              try {{ tg.MainButton.hide(); }} catch (e) {{}}
+            }}
           }}
-        }})();
+        }};
+        document.addEventListener('DOMContentLoaded', function () {{
+          // DOMContentLoaded — telegram-web-app.js теперь defer (см.
+          // TG_INIT_SCRIPT), без этой обёртки window.Telegram здесь мог
+          // быть ещё не загружен даже внутри настоящего Telegram.
+          window.__pageInit();
         }});
         </script>
         """
