@@ -300,6 +300,13 @@ body {
   padding-bottom: calc(var(--nav-h) + 14px + var(--tg-bottom));
 }
 :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+/* Без этого правила голая <a> (например «исходная новость» в карточке
+   очереди или «пост #N» у дублей) красится браузером по умолчанию в синий/
+   фиолетовый — единственное место на всей панели, где цвет не из палитры
+   темы. Подчёркивание оставляем родное (UA style) — специально ничего не
+   трогаем, местам вроде .nav-link/.pill/.back-link/.list-item это не мешает:
+   у них у всех своя более специфичная color-надпись поверх этой. */
+a { color: var(--blue-hover); }
 .shell { display: flex; min-height: 100vh; }
 /* overflow-x:hidden — сознательно тут, а не на html/body: если задан только
    overflow-x, браузер обязан «повысить» overflow-y до auto (правило
@@ -441,6 +448,11 @@ button, .btn {
 }
 button:hover, .btn:hover { background: var(--btn-hover); border-color: var(--btn-border-hover); }
 button:active, .btn:active { transform: scale(.98); }
+/* disabled= используется только в очереди согласования (карточка «публикуется»
+   блокирует ✅/🚫/сохранить/перегенерировать/запланировать, пока запись не
+   освободится) — без этого правила заблокированная кнопка выглядела как
+   обычная кликабельная, и было непонятно, почему клик ничего не делает. */
+button:disabled, .btn:disabled { opacity: .45; cursor: not-allowed; }
 button.primary { background: var(--blue); border-color: var(--blue); color: var(--on-blue); font-weight: 700; }
 button.primary:hover { background: var(--blue-hover); }
 button.danger { background: var(--red-dim); border-color: var(--red-border); color: var(--red); }
@@ -464,12 +476,18 @@ h2.page-heading.after-back { margin-top: 6px; }
 /* Прямоугольные бейджи-теги вместо скруглённых «пилюль» — читаются как
    лог-метки уровня терминала ([OK]/[WARN]), не требуя лишних символов
    в самом тексте, который приходит из Python (менять его не нужно). */
+/* Фон/цвет/рамка — база на случай, если конкретный .pill.* вариант ниже не
+   указан (например якоря быстрой навигации в шапке очереди): без этого такая
+   пилюля рисовалась вообще без заливки — просто мелкий заглавный текст без
+   вида «чипа», выбивающийся рядом с соседними цветными пилюлями того же ряда. */
 .pill { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 10.5px; font-weight: 700;
-        text-transform: uppercase; letter-spacing: .3px; }
+        text-transform: uppercase; letter-spacing: .3px; border: 1px solid var(--border);
+        background: var(--card-hover); color: var(--text-dim); }
 .pill.on { background: var(--green-dim); color: var(--green); }
 .pill.off { background: var(--red-dim); color: var(--red); }
 .pill.warn { background: var(--amber-dim); color: var(--amber); }
 .pill.neutral { background: var(--gray-dim); color: var(--gray); }
+.pill.sched { background: var(--purple-dim); color: var(--purple); }
 .flash { padding: 10px 13px; border-radius: var(--radius-sm); margin-bottom: 14px; font-size: 13.5px;
          border-left: 3px solid transparent; }
 .flash.ok { background: var(--green-dim); color: var(--green-text); border-left-color: var(--green); }
@@ -517,6 +535,16 @@ a.list-item:hover { background: var(--card-hover); }
 .list-item.actionable { position: relative; }
 .list-item-cover { position: absolute; inset: 0; z-index: 0; }
 .list-item.actionable .list-item-actions { position: relative; z-index: 1; }
+/* Акцент слева по статусу — та же идея, что border-left у .hero-card:
+   в очереди на 20 строк на экране бейджи внутри заголовка (см. badges в
+   _queue_row_html) читаются только вблизи, а полоса цвета ловится боковым
+   зрением при беглом скролле. box-shadow, не border — не сдвигает контент
+   строки на свою ширину, в отличие от обычной рамки. Приоритет в разметке
+   один на строку (ошибка важнее «публикуется», та важнее плана) — цвета
+   переиспользуют уже занятые под эти статусы var(--red)/--amber/--purple. */
+.list-item.actionable.q-error { box-shadow: inset 3px 0 0 var(--red); }
+.list-item.actionable.q-publishing { box-shadow: inset 3px 0 0 var(--amber); }
+.list-item.actionable.q-scheduled { box-shadow: inset 3px 0 0 var(--purple); }
 .dupe-thumb { width: 64px; height: 64px; border-radius: var(--radius-sm); flex-shrink: 0; }
 /* Дашборд: сетка карточек-метрик вместо списка строк «подпись: значение» —
    легче окинуть взглядом состояние бота целиком. */
@@ -1274,9 +1302,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         # выключили с непустой очередью, сами карточки не публикуются (см.
         # settings_moderation), забыть про них иначе легко.
         if queue_n:
-            stats.append(("Публикация", f'<a href="/queue" class="pill" '
-                                          f'style="text-decoration:none; background:var(--purple-dim); '
-                                          f'color:var(--purple);">{queue_n} ждут ›</a>'))
+            stats.append(("Публикация", f'<a href="/queue" class="pill sched" '
+                                          f'style="text-decoration:none;">{queue_n} ждут ›</a>'))
         if postponed:
             stats.append(("Отложенные", f'<a href="/queue#postponed" class="pill off" '
                                         f'style="text-decoration:none;">{postponed} ждут — '
@@ -2362,15 +2389,24 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                 else '<div class="dupe-thumb" style="background:var(--field-bg);"></div>')
         when = time.strftime("%d.%m %H:%M", time.localtime(r["queued_at"]))
         badges = ""
+        # Приоритет статуса для акцентной полосы слева (см. .q-error/
+        # .q-publishing/.q-scheduled в STYLE) — ошибка нужнее внимания
+        # админа, чем «просто запланировано», поэтому первый же подходящий
+        # статус и остаётся, а не переопределяется следующим ниже.
+        status_class = ""
         if r["status"] == "publishing":
             badges += ' <span class="pill warn">публикуется…</span>'
+            status_class = " q-publishing"
         if r["error"]:
             badges += ' <span class="pill off">ошибка публикации</span>'
+            status_class = " q-error"
         if r["edited_at"]:
             badges += ' <span class="pill neutral">ред.</span>'
         if r["scheduled_at"]:
             sched = time.strftime("%d.%m %H:%M", time.localtime(r["scheduled_at"]))
-            badges += f' <span class="pill" style="background:var(--purple-dim); color:var(--purple);">🕒 {sched}</span>'
+            badges += f' <span class="pill sched">🕒 {sched}</span>'
+            if not status_class:
+                status_class = " q-scheduled"
         # Заголовок исходной новости из ленты — ориентир в списке; но
         # публикуется сгенерированный текст (r["text"]), который отличается
         # и без которого непонятно, что реально готово уйти в канал.
@@ -2383,7 +2419,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         # в карточку; для отказа не спрашиваем подтверждение — есть «Отменить»
         # в флеше (см. queue_reject/queue_undo), а не для публикации — та
         # необратима, доверяем разовому tgConfirmSubmit.
-        return f"""<div class="list-item actionable">
+        return f"""<div class="list-item actionable{status_class}">
           <a href="/queue/{r['id']}?page={page}" class="list-item-cover" aria-label="Открыть #{r['id']}"></a>
           {thumb}
           <div class="list-item-info">
