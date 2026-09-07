@@ -2346,6 +2346,15 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     # --- очередь ручного согласования (self.moderation) ---------------------
     QUEUE_PER_PAGE = 20
 
+    # Метка «действие пришло из строки списка, не из карточки» — queue_publish/
+    # queue_reject после дела решают, куда вернуть админа: из карточки логично
+    # сразу открыть следующую (внимательно разбирает одну за другой), а из
+    # списка — остаться в списке (бегло щёлкает несколько очевидных подряд,
+    # не открывая карточки вовсе). Без разделения оба сценария вели бы себя
+    # как первый — щелчок по ✅ в списке уносил бы в карточку следующей
+    # новости, хотя админ ни одной карточки открывать не собирался.
+    LIST_ORIGIN_FIELD = '<input type="hidden" name="from" value="list">'
+
     def _queue_row_html(request: web.Request, r: sqlite3.Row, page: int) -> str:
         thumb = (f'<img class="dupe-thumb" src="{_safe_href(r["image"])}" alt="" '
                 f'style="object-fit:cover;">'
@@ -2385,10 +2394,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           <div class="list-item-actions">
             <form method="post" action="/queue/{r['id']}/publish"
                   onsubmit="return tgConfirmSubmit(this, 'Опубликовать в канал прямо сейчас?')">
-              {csrf_field(request)}{page_field}
+              {csrf_field(request)}{page_field}{LIST_ORIGIN_FIELD}
               <button class="icon" type="submit" title="Опубликовать" aria-label="Опубликовать"
                 {'disabled' if r['status'] == 'publishing' else ''}>✅</button></form>
-            <form method="post" action="/queue/{r['id']}/reject">{csrf_field(request)}{page_field}
+            <form method="post" action="/queue/{r['id']}/reject">{csrf_field(request)}{page_field}{LIST_ORIGIN_FIELD}
               <button class="icon" type="submit" title="Отклонить" aria-label="Отклонить"
                 {'disabled' if r['status'] == 'publishing' else ''}>🚫</button></form>
           </div>
@@ -2684,6 +2693,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                       onclick="return tgConfirmSubmit(this.form, 'Опубликовать в канал прямо сейчас?')">
                 ✅ Опубликовать</button>
               <button type="submit" formaction="/queue/{row['id']}/save" {disabled}>💾 Сохранить черновик</button>
+              <button type="submit" formaction="/queue/{row['id']}/reject" class="link-btn" {disabled}>
+                🚫 Отклонить</button>
             </div>
           </form>
         </div>
@@ -2716,12 +2727,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           {unschedule_form}
         </div>
         <div class="card">
-          <div class="card-actions">
-            <form method="post" action="/queue/{row['id']}/preview">{csrf_field(request)}{page_field}
-              <button type="submit">👁 Показать в личке</button></form>
-            <form method="post" action="/queue/{row['id']}/reject">{csrf_field(request)}{page_field}
-              <button class="link-btn" type="submit" {disabled}>🚫 Отклонить</button></form>
-          </div>
+          <form method="post" action="/queue/{row['id']}/preview">{csrf_field(request)}{page_field}
+            <button type="submit">👁 Показать в личке</button></form>
         </div>
         <script>
         // window.__pageInit, не разовая IIFE — эта карточка обновляется в
@@ -2876,11 +2883,16 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         error = await pub.publish_moderated(item_id)
         if error:
             return await queue_detail(request, flash=error, flash_kind="err", page=page)
-        if next_id is not None:
+        # from=list — щелчок по ✅ прямо в строке списка (см. LIST_ORIGIN_FIELD):
+        # админ не открывал карточку и следующую тоже открывать не просил,
+        # остаёмся в списке, чтобы можно было быстро щёлкнуть следующую
+        # очевидную строку, не тратя тап на возврат из карточки.
+        from_list = str(request["form"].get("from", "")) == "list"
+        if next_id is not None and not from_list:
             return await queue_detail(request, item_id_override=next_id, page=page,
                                       flash="Опубликовано. Следующая карточка:")
-        return await queue_get(request, flash="Опубликовано — очередь разобрана.",
-                               page_override=int(page) if page else None)
+        flash = "Опубликовано." if next_id is not None else "Опубликовано — очередь разобрана."
+        return await queue_get(request, flash=flash, page_override=int(page) if page else None)
 
     async def queue_reject(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -2910,10 +2922,14 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                     stash.pop(k, None)
                 stash[token] = (dict(row), now)
             st.delete_moderation(item_id)
-        if next_id is not None:
+        # from=list — см. комментарий в queue_publish: быстрое отклонение
+        # прямо из строки списка не должно затягивать в карточку следующей.
+        from_list = str(request["form"].get("from", "")) == "list"
+        if next_id is not None and not from_list:
             return await queue_detail(request, item_id_override=next_id, page=page,
                                       flash="Отклонено.", flash_action=_undo_flash_action(request, page))
-        return await queue_get(request, flash="Отклонено — очередь разобрана.",
+        flash = "Отклонено." if next_id is not None else "Отклонено — очередь разобрана."
+        return await queue_get(request, flash=flash,
                                page_override=int(page) if page else None,
                                flash_action=_undo_flash_action(request, page))
 
