@@ -1009,8 +1009,18 @@ def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok", acti
 def _safe_next(path: str) -> str:
     """Путь для возврата после входа — только свой же адрес. Без этого
     /login?next=https://... стал бы открытым редиректом, а голый "//evil"
-    браузер тоже понимает как переход на чужой хост."""
-    if path and path.startswith("/") and not path.startswith("//") and "://" not in path:
+    браузер тоже понимает как переход на чужой хост.
+
+    "\\" в начале — тот же самый обход: у "спецсхем" (http/https) WHATWG
+    URL-парсер (все современные браузеры) заменяет "\\" на "/" ДО разбора
+    пути, так что "/\\evil.example" браузер резолвит ровно как
+    "//evil.example" — переход на чужой хост, хотя проверка на голое "//"
+    его пропускала. Сверяем со схемой из нормализованной копии, а
+    возвращаем (если приняли) исходную строку без изменений.
+    """
+    normalized = path.replace("\\", "/")
+    if (path and path.startswith("/") and not normalized.startswith("//")
+            and "://" not in normalized):
         return path
     return "/"
 
