@@ -1883,6 +1883,12 @@ class Publisher:
         Telegram, повторно с CDN источника их не тянем.
         """
         if not self.vk_on:
+            # Сбрасываем, а не оставляем как есть — иначе последний вызов
+            # send_vk() ДЛЯ ДРУГОЙ карточки мог бы утечь в ответ на эту
+            # (last_vk_ok/last_vk_error читает api_queue_publish сразу после
+            # publish_moderated, ничего иного между вызовами не значит "ВК
+            # не при делах в этот раз").
+            self.last_vk_ok, self.last_vk_error = True, ""
             return False
         self.vk.group_id = self.vk_group
         try:
