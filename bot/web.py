@@ -1152,6 +1152,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         try:
             return await handler(request)
         except ValueError:
+            if request.path.startswith("/api/"):
+                return web.json_response({"ok": False, "error": "bad_id"}, status=400)
             return _gone_page("Не найдено", "Некорректный идентификатор в адресе.")
         except web.HTTPNotFound as exc:
             # Хендлеры делают `raise web.HTTPNotFound(text="...")` (запись уже
@@ -1179,6 +1181,16 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
     @web.middleware
     async def auth_middleware(request: web.Request, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]):
+        # /api/* — машинный клиент (десктоп-приложение синхронизации), не браузер:
+        # ни cookie-сессии, ни CSRF-токена у него нет и не может быть. Отдельная
+        # авторизация тем же паролем панели, но как Bearer-токен в заголовке —
+        # тот же секрет, тот же уровень доступа, что и у входа в саму панель.
+        if request.path.startswith("/api/"):
+            given = request.headers.get("Authorization", "")
+            token = given[7:] if given.startswith("Bearer ") else ""
+            if not password or not secrets.compare_digest(token, password):
+                return web.json_response({"error": "unauthorized"}, status=401)
+            return await handler(request)
         if request.path in PUBLIC_PATHS:
             return await handler(request)
         session = auth.verify(request.cookies.get(SESSION_COOKIE))
@@ -3253,6 +3265,131 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/queue/settings", queue_settings)
     app.router.add_post("/queue/dedup-toggle", queue_dedup_toggle)
     app.router.add_post("/queue/dedup-settings", queue_dedup_settings)
+
+    # ======================== JSON API для синхронизации с внешними клиентами ========================
+    # Отдельная авторизация (Bearer-токен = тот же WEB_PANEL_PASSWORD, см.
+    # auth_middleware) — без cookie-сессии и CSRF, рассчитано на машинного
+    # клиента (десктоп-приложение), а не на браузер. Бизнес-логика не
+    # дублируется: те же st.*/pub.* методы, что и у HTML-обработчиков выше,
+    # просто ответ в JSON вместо страницы.
+    async def api_ping(request: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "channel": pub.channel or ""})
+
+    async def api_config(request: web.Request) -> web.Response:
+        return web.json_response({
+            "telegram_bot_token": bot.token,
+            "telegram_channel_id": pub.channel or "",
+            "template": st.get("template"),
+            "post_format": st.get("post_format"),
+            "interval_minutes": st.get_int("interval"),
+            "max_per_cycle": st.get_int("max_per_cycle"),
+            "max_age_days": st.get_int("max_age_days"),
+            "llm_base_url": pub.llm.base_url,
+            "llm_api_key": pub.llm.api_key,
+            "llm_model": pub.llm.model,
+        })
+
+    async def api_feeds(request: web.Request) -> web.Response:
+        rows = st.feeds()
+        return web.json_response([
+            {
+                "id": r["id"],
+                "url": r["url"],
+                "title": r["title"],
+                "enabled": bool(r["enabled"]),
+                "template": r["template"] or "",
+            }
+            for r in rows
+        ])
+
+    async def api_queue(request: web.Request) -> web.Response:
+        rows = st.moderation_list(limit=200)
+        return web.json_response([
+            {
+                "id": r["id"],
+                "feed_id": r["feed_id"],
+                "feed_title": r["feed_title"] or "",
+                "key": r["key"],
+                "title": r["title"],
+                "summary": r["summary"],
+                "link": r["link"],
+                "source": r["source"],
+                "published": r["published"],
+                "image": r["image"],
+                "text": r["text"],
+                "status": r["status"],
+                "queued_at": r["queued_at"],
+                "scheduled_at": r["scheduled_at"],
+            }
+            for r in rows
+        ])
+
+    async def api_queue_save(request: web.Request) -> web.Response:
+        item_id = int(request.match_info["id"])
+        row = st.moderation_item(item_id)
+        if row is None:
+            return web.json_response({"ok": False, "error": "not_found"}, status=404)
+        body = await request.json()
+        text = str(body.get("text", "")).strip()
+        if not text:
+            return web.json_response({"ok": False, "error": "empty_text"}, status=400)
+        if tg_len(text) > TG_LIMIT:
+            return web.json_response({"ok": False, "error": "too_long"}, status=400)
+        problem = html_problem(text)
+        if problem:
+            return web.json_response({"ok": False, "error": "bad_markup", "detail": html_mod.unescape(problem)},
+                                     status=400)
+        st.update_moderation_text(item_id, text)
+        return web.json_response({"ok": True})
+
+    async def api_queue_publish(request: web.Request) -> web.Response:
+        item_id = int(request.match_info["id"])
+        row = st.moderation_item(item_id)
+        if row is None:
+            return web.json_response({"ok": False, "error": "not_found"}, status=404)
+        error = await pub.publish_moderated(item_id, actor="api")
+        if error:
+            return web.json_response({"ok": False, "error": error}, status=409)
+        return web.json_response({"ok": True})
+
+    async def api_queue_reject(request: web.Request) -> web.Response:
+        item_id = int(request.match_info["id"])
+        row = st.moderation_item(item_id)
+        if row is None:
+            return web.json_response({"ok": False, "error": "not_found"}, status=404)
+        guard = _refuse_if_publishing(row)
+        if guard:
+            return web.json_response({"ok": False, "error": "publishing"}, status=409)
+        st.delete_moderation(item_id)
+        return web.json_response({"ok": True})
+
+    async def api_queue_regen(request: web.Request) -> web.Response:
+        item_id = int(request.match_info["id"])
+        row = st.moderation_item(item_id)
+        if row is None:
+            return web.json_response({"ok": False, "error": "not_found"}, status=404)
+        guard = _refuse_if_publishing(row)
+        if guard:
+            return web.json_response({"ok": False, "error": "publishing"}, status=409)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        extra = str(body.get("extra", "")).strip()
+        error = await pub.regen_moderated(item_id, extra)
+        if error:
+            return web.json_response({"ok": False, "error": error}, status=409)
+        fresh = st.moderation_item(item_id)
+        return web.json_response({"ok": True, "text": fresh["text"] if fresh else ""})
+
+    app.router.add_get("/api/ping", api_ping)
+    app.router.add_get("/api/config", api_config)
+    app.router.add_get("/api/feeds", api_feeds)
+    app.router.add_get("/api/queue", api_queue)
+    app.router.add_post("/api/queue/{id}/save", api_queue_save)
+    app.router.add_post("/api/queue/{id}/publish", api_queue_publish)
+    app.router.add_post("/api/queue/{id}/reject", api_queue_reject)
+    app.router.add_post("/api/queue/{id}/regen", api_queue_regen)
 
     return app
 
