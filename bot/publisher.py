@@ -316,6 +316,16 @@ class Publisher:
         # иначе одна и та же новость успеет уйти в канал дважды.
         self._lock = asyncio.Lock()
         self._vk_posted = 0
+        # Результат последнего send_vk() — раньше publish_moderated() его не
+        # сохранял вовсе (await self.send_vk(post) без проверки результата),
+        # из-за чего ни веб-панель, ни JSON API синхронизации не могли
+        # сказать пользователю, что публикация в канал прошла, а в VK —
+        # нет (например, картинка не загрузилась из-за флуд-контроля VK).
+        # Не потокобезопасно между параллельными публикациями разных карточек,
+        # но publish_moderated и так сериализована через claim_moderation —
+        # на карточку одновременно работает только один вызов.
+        self.last_vk_ok: bool = False
+        self.last_vk_error: str = ""
         self._postponed: list[tuple[str, str]] = []
         self._postponed_flood: list[tuple[int, int]] = []
         self._postponed_dupes: list[tuple[int, str, int, float]] = []
@@ -1876,15 +1886,25 @@ class Publisher:
             return False
         self.vk.group_id = self.vk_group
         try:
-            post_id = await self.vk.post(to_plain(post.text), post.image, post.link,
-                                         images=post.images)
+            post_id, warning = await self.vk.post(to_plain(post.text), post.image, post.link,
+                                                  images=post.images)
         except VKError as exc:
             log.error("VK: пост не опубликован — %s", exc)
+            self.last_vk_ok, self.last_vk_error = False, str(exc)
             return False
-        except Exception:
+        except Exception as exc:
             log.exception("VK: непредвиденная ошибка при публикации")
+            self.last_vk_ok, self.last_vk_error = False, f"непредвиденная ошибка: {exc}"
             return False
-        log.info("VK: опубликовано wall-%s_%s", self.vk.group_id, post_id or "?")
+        # last_vk_ok=True — пост реально опубликован (не считаем это отказом,
+        # publish_moderated не должен из-за пропавшей картинки терять карточку
+        # или пытаться опубликовать повторно), last_vk_error — предупреждение
+        # для интерфейса о том, что вышло без изображения.
+        self.last_vk_ok, self.last_vk_error = True, warning
+        if warning:
+            log.warning("VK: wall-%s_%s опубликован, но %s", self.vk.group_id, post_id or "?", warning)
+        else:
+            log.info("VK: опубликовано wall-%s_%s", self.vk.group_id, post_id or "?")
         self._vk_posted += 1
         return True
 

@@ -211,8 +211,16 @@ class VKClient:
         return ""
 
     async def post(self, text: str, image: str = "", link: str = "",
-                   images: list[tuple[bytes, str]] | None = None) -> int | None:
-        """Публикует запись на стену. Возвращает id записи.
+                   images: list[tuple[bytes, str]] | None = None) -> tuple[int | None, str]:
+        """Публикует запись на стену. Возвращает (id записи, предупреждение).
+
+        Предупреждение непустое ровно тогда, когда картинка БЫЛА запрошена
+        (image/images не пусты), но запись всё равно ушла без единого
+        вложения — ни фото, ни даже карточки по ссылке (например: флуд-
+        контроль VK отклонил загрузку фото, а сам wall.post не принял ссылку
+        вложением). Раньше эта информация никуда не попадала — вызывающий
+        код (Publisher.send_vk) видел только id записи и не мог сказать
+        пользователю, что публикация ушла без картинки.
 
         `images` — уже скачанные байты нескольких картинок (режим «несколько
         картинок» ленты, см. Publisher._images_of_page): грузим их все,
@@ -246,9 +254,11 @@ class VKClient:
                 log.warning("VK: картинку загрузить не удалось (%s) — "
                             "пробую вложить ссылку; картинка: %s", exc, image[:150])
 
+        wanted_picture = bool(images) or bool(image)
         attachment = ",".join(attachments)
         if not attachment and link:
             attachment = link
+        used_attachment = attachment
 
         message = text[:VK_TEXT_LIMIT]
         try:
@@ -262,11 +272,14 @@ class VKClient:
             if not attachment or not self._is_attachment_error(exc):
                 raise
             log.warning("VK: вложение отклонено (%s) — публикую без него", exc)
+            used_attachment = ""
             resp = await self._call("wall.post", owner_id=self.owner_id,
                                     from_group=1, message=message)
 
         post_id = resp.get("post_id") if isinstance(resp, dict) else None
-        return int(post_id) if post_id else None
+        warning = ("картинка не загрузилась и вложение не принято — запись "
+                  "опубликована без изображения") if wanted_picture and not used_attachment else ""
+        return (int(post_id) if post_id else None), warning
 
     @staticmethod
     def _is_attachment_error(exc: VKError) -> bool:

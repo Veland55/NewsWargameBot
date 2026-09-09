@@ -3362,7 +3362,15 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         error = await pub.publish_moderated(item_id, actor="api")
         if error:
             return web.json_response({"ok": False, "error": error}, status=409)
-        return web.json_response({"ok": True})
+        # ok=True всегда означает "в канал ушло" — VK второстепенен (см.
+        # Publisher.send_vk), но раньше его результат нигде не попадал в
+        # ответ, и клиент не мог узнать, что VK-дубль вышел без картинки
+        # или не вышел вовсе.
+        return web.json_response({
+            "ok": True,
+            "vk_ok": pub.last_vk_ok,
+            "vk_warning": pub.last_vk_error,
+        })
 
     async def api_queue_reject(request: web.Request) -> web.Response:
         st: Storage = app["st"]
