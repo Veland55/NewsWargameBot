@@ -3273,9 +3273,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     # дублируется: те же st.*/pub.* методы, что и у HTML-обработчиков выше,
     # просто ответ в JSON вместо страницы.
     async def api_ping(request: web.Request) -> web.Response:
+        pub: Publisher = app["publisher"]
         return web.json_response({"ok": True, "channel": pub.channel or ""})
 
     async def api_config(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        pub: Publisher = app["publisher"]
         return web.json_response({
             "telegram_bot_token": bot.token,
             "telegram_channel_id": pub.channel or "",
@@ -3290,6 +3293,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         })
 
     async def api_feeds(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
         rows = st.feeds()
         return web.json_response([
             {
@@ -3303,6 +3307,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         ])
 
     async def api_queue(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
         rows = st.moderation_list(limit=200)
         return web.json_response([
             {
@@ -3325,6 +3330,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         ])
 
     async def api_queue_save(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
         item_id = int(request.match_info["id"])
         row = st.moderation_item(item_id)
         if row is None:
@@ -3343,6 +3349,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         return web.json_response({"ok": True})
 
     async def api_queue_publish(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        pub: Publisher = app["publisher"]
         item_id = int(request.match_info["id"])
         row = st.moderation_item(item_id)
         if row is None:
@@ -3353,6 +3361,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         return web.json_response({"ok": True})
 
     async def api_queue_reject(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
         item_id = int(request.match_info["id"])
         row = st.moderation_item(item_id)
         if row is None:
@@ -3364,6 +3373,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         return web.json_response({"ok": True})
 
     async def api_queue_regen(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        pub: Publisher = app["publisher"]
         item_id = int(request.match_info["id"])
         row = st.moderation_item(item_id)
         if row is None:
