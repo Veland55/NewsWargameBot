@@ -201,3 +201,68 @@ async def test_publish_moderated_missing_row_returns_error(storage: Storage):
     pub = make_publisher(storage)
     error = await pub.publish_moderated(999999, actor="web")
     assert error == "Эту новость уже публикует или опубликовал кто-то другой."
+
+
+# --- retry_postponed/publish_now: защита от повторной отправки --------------
+# См. DUPLICATE_GUARD_SECONDS в publisher.py и инцидент 30.08 в проде:
+# /postponed/1/retry дважды подряд (клиент не увидел ответ вовремя из-за
+# медленной сети) — оба вызова прошли _manual_publish_locks (первый уже
+# успел его снять к моменту второго) и отправили один и тот же пост в канал
+# дважды.
+
+def _postponed_row_id(storage: Storage, *, link: str = "https://x/1") -> int:
+    storage.add_postponed(feed_id=1, key="k", title="t", summary="s", link=link,
+                          published="", image="", error="проверка")
+    row = storage.postponed_list(limit=50)[0]
+    return row["id"]
+
+
+@pytest.mark.asyncio
+async def test_retry_postponed_skips_resend_when_already_posted(storage: Storage, monkeypatch):
+    pub = make_publisher(storage)
+    item_id = _postponed_row_id(storage, link="https://x/dup")
+    # Первая попытка уже реально опубликовала (сообщение до клиента просто
+    # не дошло вовремя) — есть свежий пост с той же ссылкой.
+    storage.add_post(feed_id=1, chat_id="@testchannel", message_id=1, kind="text",
+                     title="t", summary="s", link="https://x/dup", source="src",
+                     published="", text="пост")
+    send_mock = AsyncMock(return_value=fake_message())
+    monkeypatch.setattr(pub, "_send", send_mock)
+
+    error = await pub.retry_postponed(item_id)
+
+    assert error is None
+    send_mock.assert_not_called()
+    assert storage.postponed_item(item_id) is None  # разобрана, не висит дальше
+
+
+@pytest.mark.asyncio
+async def test_retry_postponed_sends_when_nothing_posted_yet(storage: Storage, monkeypatch):
+    pub = make_publisher(storage)
+    item_id = _postponed_row_id(storage, link="https://x/fresh")
+    send_mock = AsyncMock(return_value=fake_message())
+    monkeypatch.setattr(pub, "_send", send_mock)
+    monkeypatch.setattr(pub, "build_post", AsyncMock(return_value=SimpleNamespace(
+        text="пост", image="", images=[], link="https://x/fresh")))
+
+    error = await pub.retry_postponed(item_id)
+
+    assert error is None
+    send_mock.assert_awaited_once()
+    assert storage.postponed_item(item_id) is None
+
+
+@pytest.mark.asyncio
+async def test_publish_now_skips_resend_when_already_posted(storage: Storage, monkeypatch):
+    pub = make_publisher(storage)
+    storage.add_post(feed_id=1, chat_id="@testchannel", message_id=1, kind="text",
+                     title="t", summary="s", link="https://x/dup2", source="src",
+                     published="", text="пост")
+    entry = make_entry(link="https://x/dup2")
+    send_mock = AsyncMock(return_value=fake_message())
+    monkeypatch.setattr(pub, "_send", send_mock)
+
+    error = await pub.publish_now(entry, feed=None)
+
+    assert error is None
+    send_mock.assert_not_called()

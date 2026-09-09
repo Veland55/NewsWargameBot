@@ -45,6 +45,18 @@ ALERT_EVERY = 3600             # как часто напоминать об о�
 # наткнуться на dead lock, если процесс упал между отправкой и удалением
 # карточки из очереди.
 PUBLISH_CLAIM_TTL = 600
+# publish_now/retry_postponed защищены только _manual_publish_locks —
+# in-memory set, который снимается сразу по завершении ЭТОГО вызова, а не
+# по факту доставки ответа клиенту. Медленная сеть (мобильный интернет,
+# встроенный браузер Telegram) может доставить ответ настолько позже, что
+# пользователь успевает нажать «Повторить» ещё раз уже ПОСЛЕ того, как первый
+# вызов всё отправил и лок снял — новый вызов такой лок не поймает, потому что
+# он уже свободен. Отсюда и завелся настоящий дубль в канале (см. журнал
+# 30.08, /postponed/1/retry дважды подряд). Единственная проверка, которая
+# переживает такое — обращение не к in-memory локу, а к уже РЕАЛЬНО
+# опубликованным постам: если эта же ссылка попала в posts за последние
+# столько секунд, значит первая попытка дошла, а это — тот самый повтор.
+DUPLICATE_GUARD_SECONDS = 600
 RU_ATTEMPTS = 2                # попыток добиться от модели русского текста
 # Сколько картинок для одной новости качать параллельно (см. _images_of_page).
 # Сайт-источник и его CDN — общие: слишком широкий веер бьёт по ним не хуже,
@@ -1439,6 +1451,10 @@ class Publisher:
             return ("Сейчас включена отладка (/debug) — публикация отсюда выключена, "
                      "чтобы не уйти в канал мимо неё по ошибке. Выключите отладку "
                      "(/debug off) и повторите.")
+        if self.st.posted_recently(entry.link, int(time.time()) - DUPLICATE_GUARD_SECONDS):
+            # См. DUPLICATE_GUARD_SECONDS — предыдущий клик, судя по всему,
+            # всё же опубликовал, просто ответ до клиента не дошёл вовремя.
+            return None
         lock_key = f"dedup:{entry_key(*entry.key_parts)}"
         if lock_key in self._manual_publish_locks:
             return "Уже публикуется — подождите и обновите страницу."
@@ -1499,6 +1515,13 @@ class Publisher:
             if row is None:
                 return "Запись не найдена — возможно, уже обработана."
             feed_id, key = row["feed_id"], row["key"]
+            if self.st.posted_recently(row["link"], int(time.time()) - DUPLICATE_GUARD_SECONDS):
+                # Похоже, предыдущий клик всё же дошёл и опубликовал — просто
+                # не видели ответа вовремя (см. DUPLICATE_GUARD_SECONDS). Не
+                # публикуем второй раз, убираем карточку как разобранную.
+                self.st.mark_seen(feed_id, key)
+                self.st.remove_postponed(feed_id, key)
+                return None
             feed = self.st.feed(feed_id)
             entry = Entry(key_parts=(key,), title=row["title"], link=row["link"],
                           summary=row["summary"], published=row["published"], published_ts=0,

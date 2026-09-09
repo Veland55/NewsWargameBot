@@ -32,7 +32,6 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import LinkPreviewOptions
 from aiohttp import web
 
-from . import media_proxy
 from .db import DEFAULTS, Storage
 from .llm import LLMError
 from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, html_problem,
@@ -1192,9 +1191,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             if not password or not secrets.compare_digest(token, password):
                 return web.json_response({"error": "unauthorized"}, status=401)
             return await handler(request)
-        if request.path in PUBLIC_PATHS or request.path.startswith("/vk-img/"):
-            # /vk-img/* — карточки для VK-краулера (см. media_proxy): без
-            # cookie-сессии и без Bearer, VK не умеет ни то ни другое.
+        if request.path in PUBLIC_PATHS:
             return await handler(request)
         session = auth.verify(request.cookies.get(SESSION_COOKIE))
         if session is None:
@@ -3213,31 +3210,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if was_overdue:
             flash += " План публикации снят — время уже прошло, требуется новое решение."
         return await queue_detail(request, item_id_override=row["id"], page=page, flash=flash)
-
-    async def vk_img_page(request: web.Request) -> web.Response:
-        # Страница-обёртка с og:image для VK-краулера — см. media_proxy и
-        # VKClient._proxy_attachment. Публичный маршрут (см. auth_middleware).
-        entry = media_proxy.get(request.match_info["token"])
-        if entry is None:
-            raise web.HTTPNotFound(text="Картинка недоступна")
-        img_url = str(request.url) + "/raw"
-        title = _e(entry.title or "Новость")
-        body = (f'<!doctype html><html><head><meta charset="utf-8">'
-               f'<title>{title}</title>'
-               f'<meta property="og:title" content="{title}">'
-               f'<meta property="og:type" content="article">'
-               f'<meta property="og:image" content="{_e(img_url)}"></head>'
-               f'<body></body></html>')
-        return web.Response(text=body, content_type="text/html")
-
-    async def vk_img_raw(request: web.Request) -> web.Response:
-        entry = media_proxy.get(request.match_info["token"])
-        if entry is None:
-            raise web.HTTPNotFound(text="Картинка недоступна")
-        return web.Response(body=entry.data, content_type=entry.content_type)
-
-    app.router.add_get("/vk-img/{token}", vk_img_page)
-    app.router.add_get("/vk-img/{token}/raw", vk_img_raw)
 
     app.router.add_get("/login", login_get)
     app.router.add_post("/login", login_post)

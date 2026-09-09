@@ -684,6 +684,22 @@ class Storage:
             )
             self._conn.commit()
 
+    def posted_recently(self, link: str, since_ts: int) -> bool:
+        """Есть ли уже реально опубликованный пост с ЭТОЙ ссылкой не раньше
+        since_ts — защита publish_now/retry_postponed от повторной отправки
+        (см. DUPLICATE_GUARD_SECONDS в publisher.py): в отличие от
+        in-memory-лока, здесь проверяется факт доставки, а не намерение,
+        поэтому она не даёт дубля даже если предыдущий вызов уже успел
+        закончиться и снять свой лок к моменту повторного запроса."""
+        if not link:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM posts WHERE link = ? AND posted_at >= ? LIMIT 1",
+                (link, since_ts),
+            ).fetchone()
+        return row is not None
+
     def recent_posts(self, since_ts: int) -> list[sqlite3.Row]:
         """title/summary опубликованных постов за последние since_ts секунд —
         база для сравнения на схожесть с новыми записями (см. dedup)."""
