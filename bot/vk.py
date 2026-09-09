@@ -23,6 +23,7 @@ import html as html_mod
 import json
 import logging
 import re
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -322,7 +323,23 @@ class VKClient:
             return None
         title = text.strip().splitlines()[0][:200] if text.strip() else ""
         token = media_proxy.put(data, ctype, title)
-        return f"{self.public_base_url}/vk-img/{token}"
+        return f"{self._vk_public_base()}/vk-img/{token}"
+
+    def _vk_public_base(self) -> str:
+        """Хост из public_base_url, но обычным http и без порта.
+
+        Панель админа может висеть на нестандартном порте (сертификат
+        certbot часто выдают именно так, если 443 занят чем-то другим на
+        сервере) — но краулер VK, как и большинство линк-анфёрлеров, из
+        соображений защиты от SSRF ходит только по стандартным портам.
+        Ссылка со своим портом отклонялась VK той же ошибкой, что и голая
+        ссылка на источник (link_photo_sizing_rule) — то есть без запасного
+        хода на 80/443 весь смысл своей og:image-страницы терялся. См. nginx:
+        отдельный location /vk-img/ на порту 80 у этого же домена, без
+        редиректа на панель.
+        """
+        host = urlsplit(self.public_base_url).hostname or ""
+        return f"http://{host}" if host else ""
 
     # --- загрузка фото ----------------------------------------------------
     async def _download(self, url: str, referer: str = "") -> tuple[bytes, str]:
