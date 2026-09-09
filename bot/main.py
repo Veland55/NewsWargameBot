@@ -52,7 +52,8 @@ async def run() -> None:
     if saved_model := storage.get("model"):
         llm.model = saved_model
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    vk = VKClient(cfg.vk_token, cfg.vk_group_id, cfg.vk_user_token)
+    vk = VKClient(cfg.vk_token, cfg.vk_group_id, cfg.vk_user_token,
+                  public_base_url=cfg.web_panel_public_url)
     claude = ClaudeClient(cfg.claude_api_key, cfg.claude_model)
     # Gemini даёт OpenAI-совместимый /chat/completions — тот же LLMClient, что
     # и для DeepSeek/OpenRouter, просто второй экземпляр со своим ключом/URL.

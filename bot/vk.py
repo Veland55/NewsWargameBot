@@ -26,6 +26,7 @@ import re
 
 import aiohttp
 
+from . import media_proxy
 from .rss import PAGE_UA
 
 log = logging.getLogger(__name__)
@@ -111,11 +112,16 @@ def to_plain(text: str) -> str:
 
 class VKClient:
     def __init__(self, token: str, group_id: str = "", user_token: str = "", *,
-                 timeout: int = 60, api_version: str = API_VERSION, retries: int = 2):
+                 timeout: int = 60, api_version: str = API_VERSION, retries: int = 2,
+                 public_base_url: str = ""):
         self.token = (token or "").strip()
         self.group_id = str(group_id or "").strip().lstrip("-")
         # Нужен только для загрузки фото — публикует всё равно сообщество.
         self.user_token = (user_token or "").strip()
+        # Свой домен для прокси-карточки og:image (см. media_proxy) — запасной
+        # путь для картинки, когда фото не загрузилось или грузить нечем.
+        # Пусто — прокси недоступен, работаем как раньше (голая ссылка).
+        self.public_base_url = (public_base_url or "").strip().rstrip("/")
         self.api_version = api_version
         self.retries = retries
         self._timeout = aiohttp.ClientTimeout(total=timeout)
@@ -256,6 +262,17 @@ class VKClient:
 
         wanted_picture = bool(images) or bool(image)
         attachment = ",".join(attachments)
+        if not attachment and wanted_picture and self.public_base_url:
+            # Настоящее фото не загрузилось (нет VK_USER_TOKEN, он в
+            # флуд-контроле, или сама загрузка отказала) — вместо голой
+            # ссылки на источник (VK сам её краулит и не всегда может
+            # собрать карточку — сайт блокирует ботов, отдаёт другую
+            # картинку без referer и т.п.) отдаём свою страницу с готовым
+            # og:image на уже скачанные для Telegram байты. Не зависит ни
+            # от VK_USER_TOKEN, ни от поведения стороннего сайта.
+            proxy_url = await self._proxy_attachment(image, images, link, text)
+            if proxy_url:
+                attachment = proxy_url
         if not attachment and link:
             attachment = link
         used_attachment = attachment
@@ -285,6 +302,27 @@ class VKClient:
     def _is_attachment_error(exc: VKError) -> bool:
         text = str(exc).lower()
         return "ошибка 100" in text or "attach" in text or "link" in text
+
+    async def _proxy_attachment(self, image: str, images: list[tuple[bytes, str]] | None,
+                                link: str, text: str) -> str | None:
+        """Кладёт картинку в media_proxy, возвращает ссылку на свою og:image
+        страницу для вложения в wall.post — либо None, если картинки нет."""
+        data: bytes | None = None
+        ctype = "image/jpeg"
+        if images:
+            data, ctype = images[0]
+        elif image:
+            try:
+                data, ctype = await self._download(image, referer=link)
+            except (VKError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                log.warning("VK: не удалось скачать картинку для своей "
+                            "og:image-страницы (%s) — вложу ссылку на источник", exc)
+                return None
+        if not data:
+            return None
+        title = text.strip().splitlines()[0][:200] if text.strip() else ""
+        token = media_proxy.put(data, ctype, title)
+        return f"{self.public_base_url}/vk-img/{token}"
 
     # --- загрузка фото ----------------------------------------------------
     async def _download(self, url: str, referer: str = "") -> tuple[bytes, str]:
