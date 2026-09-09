@@ -3290,6 +3290,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             "llm_base_url": pub.llm.base_url,
             "llm_api_key": pub.llm.api_key,
             "llm_model": pub.llm.model,
+            "vk_enabled": pub.vk_on,
+            "vk_group_token": pub.vk.token if pub.vk else "",
+            "vk_group_id": pub.vk_group,
+            "vk_user_token": pub.vk.user_token if pub.vk else "",
         })
 
     async def api_feeds(request: web.Request) -> web.Response:
