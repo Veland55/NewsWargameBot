@@ -956,7 +956,7 @@ class Publisher:
                     # починил бэкенд), убираем оттуда.
                     self.st.remove_postponed(feed_id, key)
                     published += 1
-                    self._record_post(feed_id, entry, feed, post, sent)
+                    await self._record_post(feed_id, entry, feed, post, sent)
                     # После отметки о прочтении: новость уже не повторится, значит
                     # и в VK не задвоится, даже если он сейчас недоступен.
                     await self.send_vk(post)
@@ -1097,10 +1097,46 @@ class Publisher:
         self.st.remove_post_extra_id(post_id, message_id)
         return None
 
-    def _record_post(self, feed_id: int, entry: Entry, feed: sqlite3.Row | None,
+    async def _save_rss_image(self, post: Post, post_id_hint: str) -> str:
+        """Сохраняет копию картинки поста на диск для RSS-ленты (/rss/vk.xml,
+        см. web.py) — VK импортирует записи по RSS сам и тянет картинку
+        своим краулером, минуя API сообщества и личный токен, поэтому не
+        зависит от его флуд-контроля. Возвращает имя файла (пусто, если
+        картинки нет или скачать не удалось — тогда запись в RSS уйдёт без
+        вложения, не критично).
+
+        post.images (режим нескольких картинок) — уже скачанные байты,
+        повторно тянуть не нужно; post.image — только адрес, для одной
+        картинки скачиваем заново (тем же download_image, что и остальной
+        код) — расход один запрос на опубликованную новость, не на каждый
+        опрос RSS-читателя.
+        """
+        data: bytes | None = None
+        ctype = "image/jpeg"
+        if post.images:
+            data, ctype = post.images[0]
+        elif post.image:
+            downloaded = await download_image(post.image, referer=post.link)
+            if downloaded:
+                data, ctype = downloaded
+        if not data:
+            return ""
+        ext = {"image/png": "png", "image/webp": "webp", "image/gif": "gif"}.get(ctype, "jpg")
+        filename = f"{post_id_hint}.{ext}"
+        images_dir = self.st.data_dir / "rss_images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            (images_dir / filename).write_bytes(data)
+        except OSError as exc:
+            log.warning("RSS: не удалось сохранить картинку %s (%s)", filename, exc)
+            return ""
+        return filename
+
+    async def _record_post(self, feed_id: int, entry: Entry, feed: sqlite3.Row | None,
                      post: Post, sent: "Message | list[Message]") -> None:
         """Запоминает опубликованный пост — чтобы его можно было найти и
-        отредактировать (/posts, /edit, /setpost, /regen)."""
+        отредактировать (/posts, /edit, /setpost, /regen), и отдать в
+        RSS-ленту для импорта VK (см. _save_rss_image)."""
         messages = sent if isinstance(sent, list) else [sent]
         first = messages[0]
         if len(messages) > 1:
@@ -1109,6 +1145,10 @@ class Publisher:
             kind = "photo"
         else:
             kind = "text"
+        # Имя файла картинки привязываем к message_id — своего id записи
+        # posts ещё нет (add_post его только выдаст), а message_id уже
+        # уникален и известен.
+        rss_image = await self._save_rss_image(post, f"{first.chat.id}_{first.message_id}")
         self.st.add_post(
             feed_id=feed_id,
             chat_id=str(first.chat.id),
@@ -1124,6 +1164,7 @@ class Publisher:
             # (в тексте поста) есть лишь первая; хранится для точечного
             # удаления отдельной картинки (/delimage, веб-панель).
             extra_message_ids=",".join(str(m.message_id) for m in messages[1:]),
+            rss_image=rss_image,
         )
 
     def _drop_stale(self, feed_id: int, fresh: list[tuple[str, Entry]]
@@ -1477,7 +1518,7 @@ class Publisher:
             sent = await self._send(post.text, image=post.image, images=post.images)
             if not sent:
                 return "Не удалось опубликовать — канал недоступен или не задан."
-            self._record_post(feed["id"] if feed else None, entry, feed, post, sent)
+            await self._record_post(feed["id"] if feed else None, entry, feed, post, sent)
             await self.send_vk(post)
             return None
         finally:
@@ -1551,7 +1592,7 @@ class Publisher:
                 return "Не удалось опубликовать — канал недоступен или не задан."
             self.st.mark_seen(feed_id, key)
             self.st.remove_postponed(feed_id, key)
-            self._record_post(feed_id, entry, feed, post, sent)
+            await self._record_post(feed_id, entry, feed, post, sent)
             await self.send_vk(post)
             return None
         finally:
@@ -1629,7 +1670,7 @@ class Publisher:
             self.st.release_moderation(item_id, "канал недоступен или не задан")
             return "Не удалось опубликовать — канал недоступен или не задан."
         entry = self._moderation_entry(row)
-        self._record_post(row["feed_id"], entry, feed, post, sent)
+        await self._record_post(row["feed_id"], entry, feed, post, sent)
         await self.send_vk(post)
         self.st.delete_moderation(item_id)
         return None

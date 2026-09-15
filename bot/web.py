@@ -20,10 +20,12 @@ import hmac
 import html as html_mod
 import json
 import logging
+import mimetypes
 import secrets
 import sqlite3
 import time
 from datetime import datetime, timedelta
+from email.utils import formatdate
 from typing import Awaitable, Callable
 from urllib.parse import parse_qsl, quote, urlsplit
 
@@ -33,6 +35,7 @@ from aiogram.types import LinkPreviewOptions
 from aiohttp import web
 
 from .db import DEFAULTS, Storage
+from .vk import to_plain
 from .llm import LLMError
 from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, html_problem,
                         tg_len)
@@ -1104,7 +1107,8 @@ def _gone_page(title: str, message: str, status: int = 404,
 
 # ======================== приложение ========================
 def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
-               admin_ids: set[int] | None = None, secure_cookies: bool = False
+               admin_ids: set[int] | None = None, secure_cookies: bool = False,
+               public_base_url: str = ""
                ) -> web.Application:
     auth = WebAuth(password)
     admin_ids = admin_ids or set()
@@ -1113,6 +1117,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app["st"] = storage
     app["publisher"] = publisher
     app["bot"] = bot
+    # Абсолютный адрес для ссылок/картинок в /rss/vk.xml — без него VK не
+    # сможет их скачать (относительные пути ему не подходят никак).
+    app["public_base_url"] = public_base_url.rstrip("/")
     # Черновики после перегенерации поста через ИИ — держим в памяти между
     # POST /regen и последующим GET, а не отдаём их прямо в ответе на POST
     # (см. post_regen/post_detail): иначе обновление страницы/pull-to-refresh
@@ -1191,7 +1198,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             if not password or not secrets.compare_digest(token, password):
                 return web.json_response({"error": "unauthorized"}, status=401)
             return await handler(request)
-        if request.path in PUBLIC_PATHS:
+        if request.path in PUBLIC_PATHS or request.path.startswith("/rss/"):
+            # /rss/* — лента для импорта VK (см. /rss/vk.xml) и картинки к ней
+            # (/rss/img/<file>): VK её читает сам, без cookie-сессии и без
+            # Bearer, ни того ни другого у него нет и не может быть.
             return await handler(request)
         session = auth.verify(request.cookies.get(SESSION_COOKIE))
         if session is None:
@@ -3211,6 +3221,65 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             flash += " План публикации снят — время уже прошло, требуется новое решение."
         return await queue_detail(request, item_id_override=row["id"], page=page, flash=flash)
 
+    # --- RSS-лента для импорта в VK (Управление сообществом → Импорт) —
+    # VK сам опрашивает эту ленту и публикует новые записи на стену со своей
+    # стороны, включая картинку, которую он тянет сам как обычный краулер.
+    # Не задействует ни VKClient (vk.py), ни VK_USER_TOKEN — не зависит от
+    # флуд-контроля личного токена, который блокирует обычную публикацию.
+    async def rss_feed(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        base = app["public_base_url"] or f"http://{request.host}"
+        posts = st.recent_posts_for_rss(30)
+        items = []
+        for row in posts:
+            title = _e(row["title"] or row["source"] or "Новость")
+            link = _e(row["link"] or f"{base}/posts/{row['id']}")
+            guid = _e(f"post-{row['id']}")
+            pub_date = formatdate(row["posted_at"], usegmt=True)
+            img_url = f"{base}/rss/img/{row['rss_image']}" if row["rss_image"] else ""
+            # CDATA — раздел берётся буквально, никакого HTML-экранирования
+            # внутри него не нужно (и было бы ошибкой: "&" превратился бы в
+            # видимый текст "&amp;"); единственное, что внутри недопустимо —
+            # сама последовательность "]]>", на неё и проверяем. img_url —
+            # наш собственный адрес без query-параметров, но не полагаемся
+            # на это молча: экранирование ниже (enclosure/url=) — обычный
+            # XML-атрибут, а не CDATA, там оно обязательно.
+            body_plain = to_plain(row["text"] or "").replace("]]>", "]] >")
+            img_tag = f'<img src="{img_url}"><br>' if img_url else ""
+            description = f"<![CDATA[{img_tag}{body_plain}]]>"
+            enclosure = (f'<enclosure url="{_e(img_url)}" type="image/jpeg"/>'
+                        if img_url else "")
+            items.append(
+                f"<item><title>{title}</title><link>{link}</link>"
+                f"<guid isPermaLink=\"false\">{guid}</guid>"
+                f"<pubDate>{pub_date}</pubDate>"
+                f"<description>{description}</description>{enclosure}</item>"
+            )
+        xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+              '<rss version="2.0"><channel>'
+              f'<title>{_e(st.get("channel_id") or "News")}</title>'
+              f'<link>{_e(base)}</link>'
+              '<description>Новости — импорт для VK</description>'
+              + "".join(items) + "</channel></rss>")
+        return web.Response(text=xml, content_type="application/rss+xml")
+
+    async def rss_img(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        filename = request.match_info["filename"]
+        # Только простое имя файла (без "/", "..") — уже гарантировано тем,
+        # что мы сами формируем это имя (message_id + расширение) при
+        # сохранении, но лишняя проверка на пути наружу не помешает.
+        if "/" in filename or ".." in filename:
+            raise web.HTTPNotFound()
+        path = st.data_dir / "rss_images" / filename
+        if not path.is_file():
+            raise web.HTTPNotFound()
+        ctype = mimetypes.guess_type(filename)[0] or "image/jpeg"
+        return web.Response(body=path.read_bytes(), content_type=ctype)
+
+    app.router.add_get("/rss/vk.xml", rss_feed)
+    app.router.add_get("/rss/img/{filename}", rss_img)
+
     app.router.add_get("/login", login_get)
     app.router.add_post("/login", login_post)
     app.router.add_post("/tg-login", tg_login_post)
@@ -3419,10 +3488,11 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
 async def run_web_panel(storage: Storage, publisher: Publisher, bot: Bot,
                         password: str, port: int, host: str = "0.0.0.0",
-                        admin_ids: set[int] | None = None, secure_cookies: bool = False
+                        admin_ids: set[int] | None = None, secure_cookies: bool = False,
+                        public_base_url: str = ""
                         ) -> tuple[web.AppRunner, web.TCPSite]:
     app = create_app(storage, publisher, bot, password, admin_ids=admin_ids,
-                     secure_cookies=secure_cookies)
+                     secure_cookies=secure_cookies, public_base_url=public_base_url)
     runner = web.AppRunner(app, access_log=log)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
