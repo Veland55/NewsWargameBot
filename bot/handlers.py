@@ -22,7 +22,6 @@ from .publisher import (TG_CAPTION_LIMIT, TG_LIMIT, Publisher, _ext_for,
 from .quota import until_reset
 from .rss import Entry, fetch, fetch_article_entry
 from .search import domain_of, site_query
-from .vk import VKError, to_plain
 
 log = logging.getLogger(__name__)
 router = Router(name="admin")
@@ -95,7 +94,6 @@ SETUP.md). Удобнее через веб-панель, раздел «Ист�
 /set &lt;ключ&gt; &lt;значение&gt; — прочие параметры (см. /status)
 /setchannel &lt;@канал|id&gt; — куда публиковать
 /feedimages &lt;id&gt; — одна картинка или несколько альбомом для этой ленты (см. выше)
-/vk — дублирование постов в сообщество VK
 /claude — обработка через платный Claude
 /gemini — обработка через Gemini (обычно бесплатно), взаимоисключимо с Claude
 /checknow — проверить ленты немедленно
@@ -433,15 +431,6 @@ async def cmd_test(message: Message, command: CommandObject, st: Storage,
         await message.answer(post.text, parse_mode="HTML",
                              link_preview_options=NO_PREVIEW)
 
-    if publisher.vk_on:
-        # В VK уходит тот же пост без разметки — показываем и его, чтобы
-        # не выяснять постфактум, во что превратились теги и ссылки.
-        await _reply(message, "⬇️ Так же новость уйдёт в VK (тоже не опубликовано):")
-        # parse_mode=None обязателен: у бота по умолчанию HTML, а текст для VK
-        # уже без разметки — случайный «<» иначе сорвал бы отправку.
-        await message.answer(to_plain(post.text) or "(пусто)", parse_mode=None,
-                             link_preview_options=NO_PREVIEW)
-
 
 @router.message(Command("template"))
 async def cmd_template(message: Message, st: Storage, publisher: Publisher) -> None:
@@ -725,8 +714,6 @@ async def cmd_checknow(message: Message, st: Storage, publisher: Publisher) -> N
     debug = publisher.debug
     verb = "показано в личке" if debug else "опубликовано"
     tail = f", ошибок: {stats['errors']}" if stats["errors"] else ""
-    if publisher.vk_on and not debug:
-        tail += f", в VK: {stats['vk']}"
     if stats.get("postponed"):
         tail += f", отложено: {stats['postponed']}"
     if stats.get("queued"):
@@ -1056,163 +1043,6 @@ async def cmd_feedimages(message: Message, command: CommandObject, st: Storage) 
     )
 
 
-VK_HELP = """<b>Публикация в VK</b>
-
-Посты дублируются на стену сообщества после публикации в Telegram.
-Разметка убирается (VK её не понимает), ссылки разворачиваются в текст.
-
-<b>Что нужно</b>
-1. В сообществе: Управление → Работа с API → Создать ключ.
-   Права: <b>Стена</b> и <b>Фотографии</b>.
-2. Числовой id сообщества (не короткое имя): «Ещё» → «Статистика» в адресе,
-   либо regvk.com/id
-3. В <code>.env</code>: <code>VK_TOKEN=vk1.a...</code> и <code>VK_GROUP_ID=123456789</code>, затем перезапуск.
-
-<b>Про картинку</b>
-Загружать фото на стену VK разрешает <b>только пользовательскому ключу</b>.
-Без него бот прикрепляет к записи ссылку на новость, и картинку подбирает сам
-VK со страницы источника — иногда её нет вовсе.
-
-Чтобы картинка была всегда, нужен <code>VK_USER_TOKEN</code>. Своё приложение создавать
-не обязательно (для этого нужно юрлицо) — подойдёт id уже существующего:
-
-1. Откройте в браузере под аккаунтом администратора сообщества:
-<code>https://oauth.vk.com/authorize?client_id=6121396&amp;scope=photos,wall,groups,offline&amp;response_type=token&amp;redirect_uri=https://oauth.vk.com/blank.html&amp;display=page</code>
-2. Разрешите доступ — откроется пустая страница.
-3. Из адресной строки скопируйте всё между <code>access_token=</code> и <code>&amp;expires_in</code>.
-4. Добавьте в <code>.env</code> строкой <code>VK_USER_TOKEN=...</code> и перезапустите бота.
-
-Ключ бессрочный, хранить его надо как пароль. Публикует по-прежнему
-сообщество — пользовательский ключ идёт только на загрузку фото.
-
-<b>Команды</b>
-/vk — это сообщение и состояние
-/vk on · /vk off — включить и выключить дублирование
-/vk group &lt;id&gt; — сменить сообщество без правки .env
-/vk check — проверить ключи (запрос к VK, ничего не публикует)
-/vk test &lt;id ленты&gt; — опубликовать последнюю новость ленты в VK
-(диагностическая команда — публикует сразу, минуя паузу, отладку и
-согласование: нужна, чтобы проверить именно доставку в VK саму по себе)"""
-
-
-@router.message(Command("vk"))
-async def cmd_vk(message: Message, command: CommandObject, st: Storage,
-                 publisher: Publisher) -> None:
-    args = (command.args or "").split()
-    action = args[0].lower() if args else ""
-    vk = publisher.vk
-
-    if action in ("on", "вкл", "1"):
-        st.set("vk_enabled", "1")
-        if not publisher.vk_on:
-            await _reply(message, "Включил, но публиковать пока не выйдет: "
-                                  "не хватает VK_TOKEN или id сообщества.\n\n" + VK_HELP)
-            return
-        await _reply(message, f"✅ Дублирую в VK, сообщество "
-                              f"<code>{_e(publisher.vk_group)}</code>")
-        return
-
-    if action in ("off", "выкл", "0"):
-        st.set("vk_enabled", "0")
-        await _reply(message, "⏸ В VK больше не публикую. Вернуть — <code>/vk on</code>")
-        return
-
-    if action == "group":
-        value = args[1].lstrip("-") if len(args) > 1 else ""
-        if not value.isdigit():
-            await _reply(message, "Как использовать: <code>/vk group 123456789</code> — "
-                                  "числовой id сообщества, не короткое имя.")
-            return
-        st.set("vk_group_id", value)
-        await _reply(message, f"✅ Сообщество VK: <code>{value}</code>. "
-                              f"Проверить: <code>/vk check</code>")
-        return
-
-    if action == "check":
-        if vk is None or not vk.token:
-            await _reply(message, "VK_TOKEN не задан.\n\n" + VK_HELP)
-            return
-        if not publisher.vk_group.isdigit():
-            await _reply(message, "Не задан id сообщества: "
-                                  "<code>/vk group 123456789</code>")
-            return
-        vk.group_id = publisher.vk_group
-        await _reply(message, "Спрашиваю VK…")
-        try:
-            name = await vk.group_name()
-        except VKError as exc:
-            await _reply(message, f"❌ VK ответил ошибкой: <code>{_e(exc)}</code>\n\n"
-                                  f"Чаще всего это чужой или отозванный ключ, "
-                                  f"либо у ключа нет прав «Стена» и «Фотографии».")
-            return
-        lines = [f"✅ Ключ сообщества рабочий: <b>{_e(name)}</b> "
-                 f"(<code>{_e(publisher.vk_group)}</code>)",
-                 f"Дублирование сейчас "
-                 f"{'включено' if publisher.vk_on else 'выключено'}."]
-        if vk.user_token:
-            # Тот же запрос, что и при публикации фото, но без самой загрузки.
-            try:
-                await vk._call("photos.getWallUploadServer",
-                               _token=vk.user_token, group_id=publisher.vk_group)
-                lines.append("🖼 Пользовательский ключ рабочий — картинки "
-                             "уходят настоящим фото.")
-            except VKError as exc:
-                lines.append(f"⚠️ Пользовательский ключ не работает: "
-                             f"<code>{_e(exc)}</code>\nКартинки пойдут "
-                             f"карточкой-ссылкой.")
-        else:
-            lines.append("🖼 <code>VK_USER_TOKEN</code> не задан — вместо фото "
-                         "карточка-ссылка, картинку выбирает сам VK. "
-                         "Как это исправить — /vk")
-        await _reply(message, "\n".join(lines))
-        return
-
-    if action == "test":
-        feed_id = _parse_id(" ".join(args[1:]))
-        feed = st.feed(feed_id) if feed_id is not None else None
-        if feed is None:
-            await _reply(message, "Как использовать: <code>/vk test 1</code> "
-                                  "(id ленты из /list)")
-            return
-        if vk is None or not publisher.vk_group.isdigit() or not vk.token:
-            await _reply(message, "Сначала настройте доступ.\n\n" + VK_HELP)
-            return
-        await _reply(message, "Беру последнюю новость и публикую её в VK…")
-        entry, error = await _last_entry(feed, publisher)
-        if error:
-            await _reply(message, f"❌ {_e(error)}")
-            return
-        try:
-            post = await publisher.build_post(entry, feed)
-        except LLMError as exc:
-            await _reply(message, f"❌ Модель вернула ошибку: <code>{_e(exc)}</code>")
-            return
-        vk.group_id = publisher.vk_group
-        try:
-            post_id = await vk.post(to_plain(post.text), post.image, post.link,
-                                    images=post.images)
-        except VKError as exc:
-            await _reply(message, f"❌ VK не принял пост: <code>{_e(exc)}</code>")
-            return
-        link = f"https://vk.com/wall-{publisher.vk_group}_{post_id}" if post_id else ""
-        await _reply(message, "✅ Опубликовано в VK"
-                     + (f": {link}" if link else "")
-                     + "\n\nЭто настоящая запись на стене — если она не нужна, удалите её.")
-        return
-
-    state = "включено ✅" if publisher.vk_on else "выключено"
-    token = "задан" if vk and vk.token else "❌ не задан"
-    group = publisher.vk_group or "не задан"
-    picture = (vk.photo_mode if vk and vk.can_upload_photo
-               else "карточка-ссылка — VK возьмёт картинку со страницы источника")
-    await _reply(
-        message,
-        f"Дублирование в VK: {state}\n"
-        f"Ключ сообщества: {token}\nСообщество: <code>{_e(group)}</code>\n"
-        f"Картинка: {picture}\n\n" + VK_HELP,
-    )
-
-
 CLAUDE_HELP = """<b>Режим Claude</b>
 
 Платно, вместо обычного режима.
@@ -1526,8 +1356,6 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
         f"Публикация: {mode}\n"
         f"Сейчас обрабатывает: <code>{_e(publisher.active_backend_label)}</code>\n"
         f"Канал: <code>{_e(publisher.channel or 'не задан')}</code>\n"
-        f"VK: " + (f"сообщество <code>{_e(publisher.vk_group)}</code>"
-                   if publisher.vk_on else "выключен") + "\n"
         f"Claude: " + (f"включён, <code>{_e(claude.model)}</code>"
                        if publisher.claude_mode else "выключен") + "\n"
         f"Gemini: " + (f"включён, <code>{_e(gemini.model)}</code>"
@@ -1574,7 +1402,7 @@ def _to_int(value: str) -> int | None:
 
 
 async def _last_entry(feed: sqlite3.Row, publisher: Publisher) -> tuple[Entry | None, str | None]:
-    """Последняя запись ленты для /test, /vk test, /claude test, /gemini test —
+    """Последняя запись ленты для /test, /claude test, /gemini test —
     учитывает вид источника. Для search fetch() (RSS-парсер) на источнике
     без RSS просто не даёт записей — эти команды раньше молча говорили
     «в ленте нет записей» даже для рабочего источника.

@@ -31,9 +31,6 @@ class Config:
     llm_base_url: str = "https://openrouter.ai/api/v1"
     llm_model: str = "deepseek/deepseek-v4-flash"
     llm_api_key: str = ""
-    vk_token: str = ""
-    vk_group_id: str = ""
-    vk_user_token: str = ""
     claude_api_key: str = ""
     claude_model: str = "claude-sonnet-5"
     gemini_api_key: str = ""
@@ -75,15 +72,6 @@ class Config:
                 "Ожидается @имя_канала или числовой id вида -1001234567890"
             )
 
-        # id сообщества всегда положительный: минус к нему приписывает vk.py.
-        vk_group = os.getenv("VK_GROUP_ID", "").strip().lstrip("-")
-        if vk_group and not vk_group.isdigit():
-            raise SystemExit(
-                f"VK_GROUP_ID={vk_group!r} должен быть числом.\n"
-                "Это числовой id сообщества, а не короткое имя — узнать можно "
-                "на vk.com/<имя> → «Ещё» → «Статистика», либо через regvk.com/id"
-            )
-
         db_path = Path(os.getenv("DB_PATH", "data/bot.db"))
         if not db_path.is_absolute():
             db_path = ROOT / db_path
@@ -103,9 +91,6 @@ class Config:
             llm_base_url=os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/"),
             llm_model=os.getenv("LLM_MODEL", "deepseek/deepseek-v4-flash").strip(),
             llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
-            vk_token=os.getenv("VK_TOKEN", "").strip(),
-            vk_group_id=vk_group,
-            vk_user_token=os.getenv("VK_USER_TOKEN", "").strip(),
             claude_api_key=os.getenv("CLAUDE_API_KEY", "").strip(),
             claude_model=os.getenv("CLAUDE_MODEL", "claude-sonnet-5").strip(),
             gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),

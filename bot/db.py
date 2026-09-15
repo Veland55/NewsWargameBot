@@ -207,8 +207,6 @@ DEFAULTS: dict[str, str] = {
     "og_image": "1",           # если в ленте картинки нет — взять со страницы новости
     "max_images": "6",         # сколько картинок скачивать за раз, если у ленты
                                # включено «несколько картинок» (feeds.multi_images, 1-10)
-    "vk_enabled": "1",         # дублировать посты в VK, если задан VK_TOKEN
-    "vk_group_id": "",         # переопределяет VK_GROUP_ID из .env
     "claude_mode": "0",        # обработка через платный Claude вместо LLM_* из .env
     "gemini_mode": "0",        # обработка через Gemini вместо LLM_* из .env (обычно бесплатно);
                                # взаимоисключим с claude_mode — включение одного гасит другой
@@ -627,9 +625,8 @@ class Storage:
 
     def recent_posts_for_rss(self, limit: int = 20) -> list[sqlite3.Row]:
         """Источник для /rss/vk.xml (см. web.py): VK импортирует записи по
-        RSS сам, минуя API сообщества и личный токен — не зависит от
-        флуд-контроля VK, который блокирует обычную публикацию через
-        VKClient (vk.py)."""
+        RSS сам, минуя Wall API и личный токен целиком — не зависит от их
+        ограничений (флуд-контроль, права ключа сообщества и т.п.)."""
         with self._lock:
             return self._conn.execute(
                 "SELECT id, title, summary, link, source, text, rss_image, posted_at "

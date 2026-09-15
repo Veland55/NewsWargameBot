@@ -26,7 +26,6 @@ from .rss import (Entry, FetchResult, download_image, fetch,
                   page_images, strip_html)
 from .search import (BingNewsClient, SearchClient, domain_of,
                      merge_search_results, site_query)
-from .vk import VKClient, VKError, to_plain
 
 log = logging.getLogger(__name__)
 
@@ -299,13 +298,13 @@ class Post:
     # ссылки: Telegram лучше принимает файл, чем адрес за нестабильным CDN
     # источника.
     images: list[tuple[bytes, str]] = field(default_factory=list)
-    link: str = ""      # адрес новости — вложение для VK, если фото нечем грузить
+    link: str = ""      # адрес новости — referer при скачивании картинки (см. _save_rss_image)
 
 
 class Publisher:
     def __init__(self, bot: Bot, storage: Storage, llm: LLMClient, default_channel: str,
                  admin_ids: set[int] | None = None, quota: "Quota | None" = None,
-                 vk: "VKClient | None" = None, claude: "ClaudeClient | None" = None,
+                 claude: "ClaudeClient | None" = None,
                  gemini: "LLMClient | None" = None, search: "SearchClient | None" = None,
                  bing: "BingNewsClient | None" = None, panel_url: str = ""):
         self.bot = bot
@@ -316,7 +315,6 @@ class Publisher:
         self.default_channel = default_channel
         self.admin_ids = set(admin_ids or ())
         self.quota = quota
-        self.vk = vk
         self.search = search
         # Для кнопки в уведомлении о новых карточках на согласование
         # (открывает веб-панель сразу на /queue) — пусто, если панель выключена.
@@ -327,17 +325,6 @@ class Publisher:
         # /checknow и фоновый цикл не должны опрашивать ленты одновременно —
         # иначе одна и та же новость успеет уйти в канал дважды.
         self._lock = asyncio.Lock()
-        self._vk_posted = 0
-        # Результат последнего send_vk() — раньше publish_moderated() его не
-        # сохранял вовсе (await self.send_vk(post) без проверки результата),
-        # из-за чего ни веб-панель, ни JSON API синхронизации не могли
-        # сказать пользователю, что публикация в канал прошла, а в VK —
-        # нет (например, картинка не загрузилась из-за флуд-контроля VK).
-        # Не потокобезопасно между параллельными публикациями разных карточек,
-        # но publish_moderated и так сериализована через claim_moderation —
-        # на карточку одновременно работает только один вызов.
-        self.last_vk_ok: bool = False
-        self.last_vk_error: str = ""
         self._postponed: list[tuple[str, str]] = []
         self._postponed_flood: list[tuple[int, int]] = []
         self._postponed_dupes: list[tuple[int, str, int, float]] = []
@@ -431,18 +418,6 @@ class Publisher:
             return f"Gemini ({self.gemini.model})"
         return self.llm.model
 
-    @property
-    def vk_group(self) -> str:
-        """id сообщества из команды важнее значения из .env."""
-        return self.st.get("vk_group_id") or (self.vk.group_id if self.vk else "")
-
-    @property
-    def vk_on(self) -> bool:
-        """VK включён, если есть чем и куда публиковать и его не выключили."""
-        if self.vk is None or not self.vk.token or self.st.get("vk_enabled") == "0":
-            return False
-        return self.vk_group.isdigit()
-
     def wake(self) -> None:
         """Разбудить цикл, не дожидаясь интервала (для /checknow)."""
         self._wake.set()
@@ -502,7 +477,7 @@ class Publisher:
         автоматический проход публикацию не делает: новости не помечаются
         прочитанными, и одни и те же посты приходили бы в личку каждый цикл.
         """
-        stats = {"feeds": 0, "published": 0, "queued": 0, "errors": 0, "vk": 0,
+        stats = {"feeds": 0, "published": 0, "queued": 0, "errors": 0,
                  "postponed": 0, "scheduled": 0, "debug": int(self.debug)}
         # До проверки паузы/отладки и независимо от них: расписание — такое
         # же явное решение админа, как клик «Опубликовать» (которому тоже
@@ -526,7 +501,6 @@ class Publisher:
             # как первый вызов их ещё заполняет — искажая его же отчёт
             # (_report_postponed/_report_dupes/_report_flood) вплоть до нуля,
             # хотя сама публикация под локом остаётся корректной.
-            self._vk_posted = 0
             self._postponed = []
             self._postponed_flood = []
             self._postponed_dupes = []
@@ -549,7 +523,6 @@ class Publisher:
                               "тратить лимит модели впустую")
                     break
 
-        stats["vk"] = self._vk_posted
         stats["postponed"] = len(self._postponed)
         if self._postponed:
             await self._report_postponed()
@@ -957,9 +930,6 @@ class Publisher:
                     self.st.remove_postponed(feed_id, key)
                     published += 1
                     await self._record_post(feed_id, entry, feed, post, sent)
-                    # После отметки о прочтении: новость уже не повторится, значит
-                    # и в VK не задвоится, даже если он сейчас недоступен.
-                    await self.send_vk(post)
 
             if self._blocked:
                 break
@@ -1519,7 +1489,6 @@ class Publisher:
             if not sent:
                 return "Не удалось опубликовать — канал недоступен или не задан."
             await self._record_post(feed["id"] if feed else None, entry, feed, post, sent)
-            await self.send_vk(post)
             return None
         finally:
             self._manual_publish_locks.discard(lock_key)
@@ -1593,7 +1562,6 @@ class Publisher:
             self.st.mark_seen(feed_id, key)
             self.st.remove_postponed(feed_id, key)
             await self._record_post(feed_id, entry, feed, post, sent)
-            await self.send_vk(post)
             return None
         finally:
             self._manual_publish_locks.discard(lock_key)
@@ -1671,7 +1639,6 @@ class Publisher:
             return "Не удалось опубликовать — канал недоступен или не задан."
         entry = self._moderation_entry(row)
         await self._record_post(row["feed_id"], entry, feed, post, sent)
-        await self.send_vk(post)
         self.st.delete_moderation(item_id)
         return None
 
@@ -1872,7 +1839,7 @@ class Publisher:
     async def _download_candidates(candidates: list[str], referer: str, limit: int
                                    ) -> tuple[str, list[tuple[bytes, str]]]:
         """Скачивает картинки-кандидаты пачками, возвращает адрес первой
-        (для VK, см. ниже) и байты успешно скачанных, не больше limit."""
+        (см. ниже) и байты успешно скачанных, не больше limit."""
         out: list[tuple[bytes, str]] = []
         first_url = ""
         # Качаем пачками по IMAGE_DOWNLOAD_CONCURRENCY штук параллельно, а не
@@ -1907,9 +1874,8 @@ class Publisher:
         В отличие от _image_of (одна картинка, может остаться просто ссылкой),
         здесь качаем сами: несколько ссылок из разных источников надёжнее
         отправлять байтами, чем адресами за нестабильными CDN. Возвращает
-        ещё и адрес первой картинки отдельной строкой — VK грузит фото по
-        ссылке, а не байтами (см. VKClient.post), и без этого в режиме
-        нескольких картинок публикация в VK оставалась совсем без фото.
+        ещё и адрес первой картинки отдельной строкой — используется как
+        ссылочный fallback там, где нужен именно адрес, а не байты.
         """
         if self.st.get("images") != "1" or not entry.link:
             return "", []
@@ -1938,52 +1904,12 @@ class Publisher:
             return Post(text=text, image=image_url, images=images, link=entry.link)
         return Post(text=text, image=await self._image_of(entry), link=entry.link)
 
-    async def send_vk(self, post: Post) -> bool:
-        """Дублирует пост в сообщество VK. Ошибку только логируем.
-
-        VK — второй адресат, а не главный: если он отвалился, публикация в
-        Telegram уже состоялась и новость помечена прочитанной. Картинки
-        альбома (post.images) переиспользуем как есть — уже скачаны для
-        Telegram, повторно с CDN источника их не тянем.
-        """
-        if not self.vk_on:
-            # Сбрасываем, а не оставляем как есть — иначе последний вызов
-            # send_vk() ДЛЯ ДРУГОЙ карточки мог бы утечь в ответ на эту
-            # (last_vk_ok/last_vk_error читает api_queue_publish сразу после
-            # publish_moderated, ничего иного между вызовами не значит "ВК
-            # не при делах в этот раз").
-            self.last_vk_ok, self.last_vk_error = True, ""
-            return False
-        self.vk.group_id = self.vk_group
-        try:
-            post_id, warning = await self.vk.post(to_plain(post.text), post.image, post.link,
-                                                  images=post.images)
-        except VKError as exc:
-            log.error("VK: пост не опубликован — %s", exc)
-            self.last_vk_ok, self.last_vk_error = False, str(exc)
-            return False
-        except Exception as exc:
-            log.exception("VK: непредвиденная ошибка при публикации")
-            self.last_vk_ok, self.last_vk_error = False, f"непредвиденная ошибка: {exc}"
-            return False
-        # last_vk_ok=True — пост реально опубликован (не считаем это отказом,
-        # publish_moderated не должен из-за пропавшей картинки терять карточку
-        # или пытаться опубликовать повторно), last_vk_error — предупреждение
-        # для интерфейса о том, что вышло без изображения.
-        self.last_vk_ok, self.last_vk_error = True, warning
-        if warning:
-            log.warning("VK: wall-%s_%s опубликован, но %s", self.vk.group_id, post_id or "?", warning)
-        else:
-            log.info("VK: опубликовано wall-%s_%s", self.vk.group_id, post_id or "?")
-        self._vk_posted += 1
-        return True
-
     async def broadcast(self, text: str) -> str | None:
-        """Отправляет произвольный текст сразу во все подключённые каналы —
-        Telegram-канал и, если включено, сообщество VK. В обход всего
-        конвейера новостей (build_post, очередь согласования, дедуп, posts):
-        это не новость из ленты — своя запись, feed_id, entry для неё не
-        существуют, а вся эта инфраструктура строится вокруг записей RSS.
+        """Отправляет произвольный текст сразу в Telegram-канал. В обход
+        всего конвейера новостей (build_post, очередь согласования, дедуп,
+        posts): это не новость из ленты — своя запись, feed_id, entry для
+        неё не существуют, а вся эта инфраструктура строится вокруг записей
+        RSS.
 
         Как и publish_now/retry_postponed — при отладке (/debug) целиком
         отказывает, а не тихо шлёт в реальный канал мимо неё: отладка
@@ -1992,7 +1918,7 @@ class Publisher:
         Как и они же — защищена от двойного клика/повторной отправки формы
         (веб-панель рендерит результат прямо в ответ на POST, а не редиректит,
         так что F5/pull-to-refresh на этой странице повторяет ту же
-        отправку): без лока текст ушёл бы в канал и VK дважды.
+        отправку): без лока текст ушёл бы в канал дважды.
         Возвращает None при полном успехе, иначе текст ошибки."""
         if self.debug:
             return ("Сейчас включена отладка (/debug) — рассылка отсюда выключена, "
@@ -2006,11 +1932,6 @@ class Publisher:
             sent = await self._send(text)
             if not sent:
                 return "Не удалось опубликовать — канал недоступен или не задан."
-            if not self.vk_on:
-                return None
-            ok_vk = await self.send_vk(Post(text=text))
-            if not ok_vk:
-                return "В канал ушло, а в VK — не получилось (подробности в логе)."
             return None
         finally:
             self._manual_publish_locks.discard(lock_key)
@@ -2025,7 +1946,6 @@ class Publisher:
             f"{html.escape(feed['title'] or '')}\n"
             f"Так пост выглядел бы в канале. В канал не отправлено, "
             f"новость останется непрочитанной."
-            + (" В VK в отладке тоже не публикуем." if self.vk_on else "")
         )
         delivered = False
         for admin_id in sorted(self.admin_ids):

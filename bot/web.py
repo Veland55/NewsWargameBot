@@ -1327,8 +1327,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             ("Модель", _e(pub.active_backend_label)),
             ("Канал", _e(pub.channel or "не задан")),
             ("Ленты (активно/всего)", feeds_value),
-            ("VK", ('<span class="pill on">' + _e(pub.vk_group) + '</span>')
-                   if pub.vk_on else '<span class="pill neutral">выключен</span>'),
         ]
         # Пилюлю очереди согласования показываем и без включённого режима —
         # выключили с непустой очередью, сами карточки не публикуются (см.
@@ -1928,20 +1926,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         <div>
         <h2>VK</h2>
         <div class="card">
-          <div class="line">Сейчас: <span class="pill {'on' if pub.vk_on else 'neutral'}">
-            {'включено, сообщество ' + _e(pub.vk_group) if pub.vk_on else 'выключено'}</span>
-            {'· ключ не задан (VK_TOKEN в .env)' if not (pub.vk and pub.vk.token) else ''}</div>
-          <form method="post" action="/settings/vk">{csrf_field(request)}
-            <div class="row" style="align-items:flex-end;">
-              <div style="flex:1;"><label for="settings-vk-group">id сообщества (числовой)</label>
-                <input type="text" id="settings-vk-group" name="vk_group_id" value="{_e(st.get('vk_group_id'))}" placeholder="123456789"></div>
-            </div>
-            <input type="hidden" name="action" value="{'off' if pub.vk_on else 'on'}">
-            <div class="card-actions">
-              <button class="{'' if pub.vk_on else 'primary'}" type="submit">
-                {'Выключить' if pub.vk_on else 'Включить'}</button>
-            </div>
-          </form>
+          <p class="muted" style="margin:0 0 10px;">Публикация в VK — через RSS-импорт: VK сам
+            опрашивает ленту ниже и публикует новые записи на стену, включая картинку.
+            Вставьте адрес в настройках сообщества — Управление → Работа с сообществом → Импорт.</p>
+          <div class="line"><code>{_e(app["public_base_url"] or f"http://{request.host}")}/rss/vk.xml</code></div>
         </div>
         </div>
         </div>
@@ -2023,17 +2011,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         # Редирект, не прямой рендер — см. комментарий у modflash в queue_get:
         # F5 на POST-ответе иначе переключал бы тумблер обратно молча.
         return _redirect(f"/queue?modflash={'on' if turning_on else 'off'}")
-
-    async def settings_vk(request: web.Request) -> web.Response:
-        st: Storage = app["st"]
-        form = request["form"]
-        group = str(form.get("vk_group_id", "")).strip().lstrip("-")
-        if group:
-            if not _ascii_digits(group):
-                return await settings_get(request, "id сообщества должен быть числом.", "err")
-            st.set("vk_group_id", group)
-        st.set("vk_enabled", "1" if form.get("action") == "on" else "0")
-        return await settings_get(request, "Сохранено.")
 
     async def settings_ai(request: web.Request) -> web.Response:
         """Один выбор вместо двух отдельных переключателей Claude/Gemini —
@@ -2545,8 +2522,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                    "публикуются автоматически. Здесь то, что накопилось раньше — само не уйдёт, "
                    "разберите вручную или включите режим обратно ниже.</div>")
         targets = [pub.channel or "канал не задан"]
-        if pub.vk_on:
-            targets.append(f"сообщество VK {pub.vk_group}")
         broadcast_card = f"""
         <h3 class="page-heading" id="broadcast" style="margin-top:22px;">📢 Сообщение во все каналы</h3>
         <div class="card">
@@ -3224,8 +3199,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     # --- RSS-лента для импорта в VK (Управление сообществом → Импорт) —
     # VK сам опрашивает эту ленту и публикует новые записи на стену со своей
     # стороны, включая картинку, которую он тянет сам как обычный краулер.
-    # Не задействует ни VKClient (vk.py), ни VK_USER_TOKEN — не зависит от
-    # флуд-контроля личного токена, который блокирует обычную публикацию.
+    # Не задействует Wall API вовсе — не зависит от его ограничений (см.
+    # docstring bot/vk.py).
     async def rss_feed(request: web.Request) -> web.Response:
         st: Storage = app["st"]
         base = app["public_base_url"] or f"http://{request.host}"
@@ -3307,7 +3282,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/settings/general", settings_general)
     app.router.add_post("/settings/debug", settings_debug)
     app.router.add_post("/settings/moderation", settings_moderation)
-    app.router.add_post("/settings/vk", settings_vk)
     app.router.add_post("/settings/ai", settings_ai)
     app.router.add_get("/posts", posts_get)
     app.router.add_get("/posts/{id}", post_detail)
@@ -3359,10 +3333,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             "llm_base_url": pub.llm.base_url,
             "llm_api_key": pub.llm.api_key,
             "llm_model": pub.llm.model,
-            "vk_enabled": pub.vk_on,
-            "vk_group_token": pub.vk.token if pub.vk else "",
-            "vk_group_id": pub.vk_group,
-            "vk_user_token": pub.vk.user_token if pub.vk else "",
         })
 
     async def api_feeds(request: web.Request) -> web.Response:
@@ -3431,15 +3401,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         error = await pub.publish_moderated(item_id, actor="api")
         if error:
             return web.json_response({"ok": False, "error": error}, status=409)
-        # ok=True всегда означает "в канал ушло" — VK второстепенен (см.
-        # Publisher.send_vk), но раньше его результат нигде не попадал в
-        # ответ, и клиент не мог узнать, что VK-дубль вышел без картинки
-        # или не вышел вовсе.
-        return web.json_response({
-            "ok": True,
-            "vk_ok": pub.last_vk_ok,
-            "vk_warning": pub.last_vk_error,
-        })
+        return web.json_response({"ok": True})
 
     async def api_queue_reject(request: web.Request) -> web.Response:
         st: Storage = app["st"]

@@ -20,7 +20,6 @@ from .publisher import Publisher
 from .quota import Quota
 from .rss import close_http
 from .search import BingNewsClient, SearchClient
-from .vk import VKClient
 from .web import run_web_panel
 
 log = logging.getLogger("bot")
@@ -36,7 +35,7 @@ async def run() -> None:
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
     # Раньше здесь default executor урезался до 2 воркеров под фидпарсер —
-    # но aiohttp резолвит DNS для ВСЕХ запросов бота (RSS, LLM, VK, поиск,
+    # но aiohttp резолвит DNS для ВСЕХ запросов бота (RSS, LLM, поиск,
     # сам Telegram Bot API) через тот же default executor (нет aiodns).
     # Двух воркеров хватало впритык для последовательного разбора лент, но
     # при зависшем DNS одной ленты оба потока замораживались навсегда
@@ -52,7 +51,6 @@ async def run() -> None:
     if saved_model := storage.get("model"):
         llm.model = saved_model
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    vk = VKClient(cfg.vk_token, cfg.vk_group_id, cfg.vk_user_token)
     claude = ClaudeClient(cfg.claude_api_key, cfg.claude_model)
     # Gemini даёт OpenAI-совместимый /chat/completions — тот же LLMClient, что
     # и для DeepSeek/OpenRouter, просто второй экземпляр со своим ключом/URL.
@@ -81,7 +79,7 @@ async def run() -> None:
     search = SearchClient(cfg.serper_api_key)
     bing = BingNewsClient()
     publisher = Publisher(bot, storage, llm, cfg.channel_id,
-                          admin_ids=cfg.admin_ids, quota=quota, vk=vk, claude=claude,
+                          admin_ids=cfg.admin_ids, quota=quota, claude=claude,
                           gemini=gemini, search=search, bing=bing,
                           panel_url=cfg.web_panel_public_url)
 
@@ -106,10 +104,8 @@ async def run() -> None:
         storage.close()
         raise SystemExit(f"Не удалось связаться с Telegram: {exc}")
 
-    log.info("бот @%s запущен; канал: %s; модель: %s; VK: %s; Claude: %s; Gemini: %s",
+    log.info("бот @%s запущен; канал: %s; модель: %s; Claude: %s; Gemini: %s",
              me.username, publisher.channel or "не задан", llm.model,
-             (f"сообщество {publisher.vk_group}, картинка — {vk.photo_mode}"
-              ) if publisher.vk_on else "выключен",
              f"включён, {claude.model}" if publisher.claude_mode else "выключен",
              f"включён, {gemini.model}" if publisher.gemini_mode else "выключен")
     if not llm.api_key:
@@ -127,9 +123,6 @@ async def run() -> None:
         log.warning("канал не задан — укажите CHANNEL_ID в .env или /setchannel")
     if publisher.debug:
         log.warning("включён режим отладки — посты уходят в личку, а не в канал")
-    if cfg.vk_token and not publisher.vk_group.isdigit():
-        log.warning("VK_TOKEN задан, но id сообщества нет — "
-                    "укажите VK_GROUP_ID в .env или /vk group <id>")
 
     web_runner = None
     if cfg.web_panel_password:
@@ -170,7 +163,6 @@ async def run() -> None:
         if web_runner is not None:
             await web_runner.cleanup()
         await llm.close()
-        await vk.close()
         await claude.close()
         await gemini.close()
         await search.close()
