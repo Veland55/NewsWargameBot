@@ -244,9 +244,6 @@ class Storage:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self._path = path
-        # Каталог рядом с базой — сюда же кладём локальные копии картинок
-        # для RSS-ленты (см. Publisher._record_post, web.py /rss/img/<file>)
-        self.data_dir = path.parent
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -277,8 +274,7 @@ class Storage:
                       ("kind", "TEXT NOT NULL DEFAULT 'rss'"),
                       ("article_path", "TEXT NOT NULL DEFAULT ''"),
                       ("listing_url", "TEXT NOT NULL DEFAULT ''")],
-            "posts": [("extra_message_ids", "TEXT NOT NULL DEFAULT ''"),
-                      ("rss_image", "TEXT NOT NULL DEFAULT ''")],
+            "posts": [("extra_message_ids", "TEXT NOT NULL DEFAULT ''")],
             "moderation": [("scheduled_at", "INTEGER")],
         }
         for table, columns in added.items():
@@ -598,15 +594,14 @@ class Storage:
     # --- опубликованные посты (/posts, /edit, /setpost, /regen) -----------
     def add_post(self, *, feed_id: int | None, chat_id: str, message_id: int,
                 kind: str, title: str, summary: str, link: str, source: str,
-                published: str, text: str, extra_message_ids: str = "",
-                rss_image: str = "") -> int:
+                published: str, text: str, extra_message_ids: str = "") -> int:
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO posts (feed_id, chat_id, message_id, kind, title, "
-                "summary, link, source, published, text, extra_message_ids, rss_image, posted_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "summary, link, source, published, text, extra_message_ids, posted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (feed_id, chat_id, message_id, kind, title, summary, link,
-                 source, published, text, extra_message_ids, rss_image, int(time.time())),
+                 source, published, text, extra_message_ids, int(time.time())),
             )
             self._conn.commit()
             return int(cur.lastrowid)
@@ -622,16 +617,6 @@ class Storage:
             return self._conn.execute(
                 "SELECT * FROM posts WHERE id = ?", (post_id,)
             ).fetchone()
-
-    def recent_posts_for_rss(self, limit: int = 20) -> list[sqlite3.Row]:
-        """Источник для /rss/vk.xml (см. web.py): VK импортирует записи по
-        RSS сам, минуя Wall API и личный токен целиком — не зависит от их
-        ограничений (флуд-контроль, права ключа сообщества и т.п.)."""
-        with self._lock:
-            return self._conn.execute(
-                "SELECT id, title, summary, link, source, text, rss_image, posted_at "
-                "FROM posts ORDER BY posted_at DESC LIMIT ?", (limit,)
-            ).fetchall()
 
     def existing_post_ids(self, post_ids: list[int]) -> set[int]:
         """Какие из этих id ещё есть в posts — один запрос вместо по одному

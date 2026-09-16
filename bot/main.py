@@ -135,8 +135,7 @@ async def run() -> None:
         web_runner, _ = await run_web_panel(storage, publisher, bot,
                                             cfg.web_panel_password, cfg.web_panel_port,
                                             host=bind_host, admin_ids=cfg.admin_ids,
-                                            secure_cookies=bool(cfg.web_panel_public_url),
-                                            public_base_url=cfg.web_panel_public_url)
+                                            secure_cookies=bool(cfg.web_panel_public_url))
         where = cfg.web_panel_public_url or f"http://{bind_host}:{cfg.web_panel_port}"
         log.info("веб-панель: %s (слушает %s:%s)", where, bind_host, cfg.web_panel_port)
 

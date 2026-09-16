@@ -12,13 +12,16 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from bot.db import Storage
-from bot.publisher import (DEDUP_MIN_SIGNAL, Publisher, _dedup_similarity,
+from bot.publisher import (DEDUP_MIN_SIGNAL, Post, Publisher, _dedup_similarity,
                            _shares_named_run)
 from tests.conftest import make_entry
 
 
 def make_publisher(storage: Storage, **overrides) -> Publisher:
-    bot = MagicMock()
+    # AsyncMock, не MagicMock: bot.send_message/send_photo — реальные async-методы
+    # aiogram.Bot, _send_vk_ready (см. publisher.py) их await-ит напрямую, а не
+    # через мокнутый Publisher._send.
+    bot = AsyncMock()
     llm = MagicMock()
     llm.model = "test-model"
     llm.on_usage = None
@@ -266,3 +269,55 @@ async def test_publish_now_skips_resend_when_already_posted(storage: Storage, mo
 
     assert error is None
     send_mock.assert_not_called()
+
+
+# --- _send_vk_ready: пересылка готового поста админам для ручной публикации в VK -
+
+
+@pytest.mark.asyncio
+async def test_send_vk_ready_text_only_sends_plain_message_to_each_admin(storage: Storage):
+    pub = make_publisher(storage)  # admin_ids={1, 2}
+    post = Post(text="<b>Заголовок</b><br>Текст с & амперсандом", image="", images=[])
+
+    await pub._send_vk_ready(post)
+
+    assert pub.bot.send_photo.await_count == 0
+    assert pub.bot.send_message.await_count == 2
+    sent_ids = {c.kwargs["chat_id"] for c in pub.bot.send_message.await_args_list}
+    assert sent_ids == {1, 2}
+    for c in pub.bot.send_message.await_args_list:
+        assert c.kwargs["parse_mode"] is None  # иначе "<b>"/"&" сорвали бы отправку
+        assert "<b>" not in c.kwargs["text"]  # to_plain уже снял разметку
+        assert "Текст с & амперсандом" in c.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_send_vk_ready_with_image_sends_photo_then_text(storage: Storage):
+    pub = make_publisher(storage)
+    post = Post(text="Новость с картинкой", image="", images=[(b"fake-bytes", "image/jpeg")])
+
+    await pub._send_vk_ready(post)
+
+    assert pub.bot.send_photo.await_count == 2  # по одному на каждого из 2 админов
+    assert pub.bot.send_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_send_vk_ready_empty_post_sends_nothing(storage: Storage):
+    pub = make_publisher(storage)
+    post = Post(text="", image="", images=[])
+
+    await pub._send_vk_ready(post)
+
+    assert pub.bot.send_photo.await_count == 0
+    assert pub.bot.send_message.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_send_vk_ready_no_admins_sends_nothing(storage: Storage):
+    pub = make_publisher(storage, admin_ids=set())
+    post = Post(text="Новость", image="", images=[])
+
+    await pub._send_vk_ready(post)
+
+    pub.bot.send_message.assert_not_awaited()

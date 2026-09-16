@@ -26,6 +26,7 @@ from .rss import (Entry, FetchResult, download_image, fetch,
                   page_images, strip_html)
 from .search import (BingNewsClient, SearchClient, domain_of,
                      merge_search_results, site_query)
+from .vk import to_plain
 
 log = logging.getLogger(__name__)
 
@@ -298,7 +299,7 @@ class Post:
     # ссылки: Telegram лучше принимает файл, чем адрес за нестабильным CDN
     # источника.
     images: list[tuple[bytes, str]] = field(default_factory=list)
-    link: str = ""      # адрес новости — referer при скачивании картинки (см. _save_rss_image)
+    link: str = ""      # адрес новости — referer при скачивании картинки (см. _send_vk_ready)
 
 
 class Publisher:
@@ -1067,46 +1068,54 @@ class Publisher:
         self.st.remove_post_extra_id(post_id, message_id)
         return None
 
-    async def _save_rss_image(self, post: Post, post_id_hint: str) -> str:
-        """Сохраняет копию картинки поста на диск для RSS-ленты (/rss/vk.xml,
-        см. web.py) — VK импортирует записи по RSS сам и тянет картинку
-        своим краулером, минуя API сообщества и личный токен, поэтому не
-        зависит от его флуд-контроля. Возвращает имя файла (пусто, если
-        картинки нет или скачать не удалось — тогда запись в RSS уйдёт без
-        вложения, не критично).
+    async def _send_vk_ready(self, post: Post) -> None:
+        """Пересылает админам в личку картинку(и) и обычный текст поста —
+        чтобы вручную опубликовать в VK с телефона (сохранить фото,
+        скопировать текст). Публикация в VK через API оказалась нерабочей
+        структурно (см. docstring bot/vk.py) — это единственный оставшийся
+        способ.
 
         post.images (режим нескольких картинок) — уже скачанные байты,
         повторно тянуть не нужно; post.image — только адрес, для одной
         картинки скачиваем заново (тем же download_image, что и остальной
-        код) — расход один запрос на опубликованную новость, не на каждый
-        опрос RSS-читателя.
+        код). Лучшая попытка: в канал новость уже ушла к моменту вызова,
+        сбой здесь не должен выглядеть как сбой публикации.
         """
-        data: bytes | None = None
-        ctype = "image/jpeg"
-        if post.images:
-            data, ctype = post.images[0]
-        elif post.image:
+        if not self.admin_ids:
+            return
+        images: list[tuple[bytes, str]] = list(post.images)
+        if not images and post.image:
             downloaded = await download_image(post.image, referer=post.link)
             if downloaded:
-                data, ctype = downloaded
-        if not data:
-            return ""
-        ext = {"image/png": "png", "image/webp": "webp", "image/gif": "gif"}.get(ctype, "jpg")
-        filename = f"{post_id_hint}.{ext}"
-        images_dir = self.st.data_dir / "rss_images"
-        images_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            (images_dir / filename).write_bytes(data)
-        except OSError as exc:
-            log.warning("RSS: не удалось сохранить картинку %s (%s)", filename, exc)
-            return ""
-        return filename
+                images = [downloaded]
+        plain = to_plain(post.text)
+        if not images and not plain:
+            return
+        header = ("📋 Готово для ручной публикации в VK — сохраните фото и "
+                 "скопируйте текст ниже.")
+        # parse_mode=None обязателен: у бота по умолчанию HTML, а текст для
+        # VK уже без разметки — случайный "<" иначе сорвал бы отправку.
+        text = f"{header}\n\n{plain}" if plain else header
+        for admin_id in sorted(self.admin_ids):
+            try:
+                if len(images) >= 2:
+                    await self._send_media_group("", admin_id, images[:10])
+                elif images:
+                    data, ctype = images[0]
+                    await self.bot.send_photo(
+                        chat_id=admin_id,
+                        photo=BufferedInputFile(data, filename=f"image.{_ext_for(ctype)}"),
+                    )
+                await self.bot.send_message(chat_id=admin_id, text=text, parse_mode=None)
+            except TelegramAPIError as exc:
+                log.warning("не удалось переслать %s заготовку для VK: %s", admin_id, exc)
 
     async def _record_post(self, feed_id: int, entry: Entry, feed: sqlite3.Row | None,
                      post: Post, sent: "Message | list[Message]") -> None:
         """Запоминает опубликованный пост — чтобы его можно было найти и
-        отредактировать (/posts, /edit, /setpost, /regen), и отдать в
-        RSS-ленту для импорта VK (см. _save_rss_image)."""
+        отредактировать (/posts, /edit, /setpost, /regen) — и параллельно
+        пересылает его админам для ручной публикации в VK (см.
+        _send_vk_ready)."""
         messages = sent if isinstance(sent, list) else [sent]
         first = messages[0]
         if len(messages) > 1:
@@ -1115,10 +1124,7 @@ class Publisher:
             kind = "photo"
         else:
             kind = "text"
-        # Имя файла картинки привязываем к message_id — своего id записи
-        # posts ещё нет (add_post его только выдаст), а message_id уже
-        # уникален и известен.
-        rss_image = await self._save_rss_image(post, f"{first.chat.id}_{first.message_id}")
+        await self._send_vk_ready(post)
         self.st.add_post(
             feed_id=feed_id,
             chat_id=str(first.chat.id),
@@ -1134,7 +1140,6 @@ class Publisher:
             # (в тексте поста) есть лишь первая; хранится для точечного
             # удаления отдельной картинки (/delimage, веб-панель).
             extra_message_ids=",".join(str(m.message_id) for m in messages[1:]),
-            rss_image=rss_image,
         )
 
     def _drop_stale(self, feed_id: int, fresh: list[tuple[str, Entry]]
