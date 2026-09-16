@@ -1091,22 +1091,25 @@ class Publisher:
         plain = to_plain(post.text)
         if not images and not plain:
             return
-        header = ("📋 Готово для ручной публикации в VK — сохраните фото и "
-                 "скопируйте текст ниже.")
+        # Метка "для VK" — подписью к картинке, а не перед текстом: текстовое
+        # сообщение должно быть голой новостью, которую можно скопировать
+        # одним касанием, без обрезки лишнего вручную.
+        caption = "Для VK 👇" if images else ""
         # parse_mode=None обязателен: у бота по умолчанию HTML, а текст для
         # VK уже без разметки — случайный "<" иначе сорвал бы отправку.
-        text = f"{header}\n\n{plain}" if plain else header
         for admin_id in sorted(self.admin_ids):
             try:
                 if len(images) >= 2:
-                    await self._send_media_group("", admin_id, images[:10])
+                    await self._send_media_group(caption, admin_id, images[:10])
                 elif images:
                     data, ctype = images[0]
                     await self.bot.send_photo(
                         chat_id=admin_id,
                         photo=BufferedInputFile(data, filename=f"image.{_ext_for(ctype)}"),
+                        caption=caption,
                     )
-                await self.bot.send_message(chat_id=admin_id, text=text, parse_mode=None)
+                if plain:
+                    await self.bot.send_message(chat_id=admin_id, text=plain, parse_mode=None)
             except TelegramAPIError as exc:
                 log.warning("не удалось переслать %s заготовку для VK: %s", admin_id, exc)
 

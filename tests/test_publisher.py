@@ -288,7 +288,9 @@ async def test_send_vk_ready_text_only_sends_plain_message_to_each_admin(storage
     for c in pub.bot.send_message.await_args_list:
         assert c.kwargs["parse_mode"] is None  # иначе "<b>"/"&" сорвали бы отправку
         assert "<b>" not in c.kwargs["text"]  # to_plain уже снял разметку
-        assert "Текст с & амперсандом" in c.kwargs["text"]
+        # Голая новость — без служебных пометок вроде "Готово для..." в начале,
+        # чтобы копировать одним касанием без ручной обрезки.
+        assert c.kwargs["text"] == "Заголовок\nТекст с & амперсандом"
 
 
 @pytest.mark.asyncio
@@ -299,7 +301,11 @@ async def test_send_vk_ready_with_image_sends_photo_then_text(storage: Storage):
     await pub._send_vk_ready(post)
 
     assert pub.bot.send_photo.await_count == 2  # по одному на каждого из 2 админов
+    for c in pub.bot.send_photo.await_args_list:
+        assert c.kwargs["caption"] == "Для VK 👇"  # пометка — на фото, не перед текстом
     assert pub.bot.send_message.await_count == 2
+    for c in pub.bot.send_message.await_args_list:
+        assert c.kwargs["text"] == "Новость с картинкой"  # тоже голый текст, без пометки
 
 
 @pytest.mark.asyncio
