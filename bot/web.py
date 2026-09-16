@@ -3222,8 +3222,23 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             body_plain = to_plain(row["text"] or "").replace("]]>", "]] >")
             img_tag = f'<img src="{img_url}"><br>' if img_url else ""
             description = f"<![CDATA[{img_tag}{body_plain}]]>"
-            enclosure = (f'<enclosure url="{_e(img_url)}" type="image/jpeg"/>'
-                        if img_url else "")
+            enclosure = ""
+            if img_url:
+                # length — обязательный атрибут enclosure по RSS 2.0
+                # (наравне с url и type, не факультативный): строгие парсеры,
+                # включая VK, вправе отбросить вложение или всю запись без
+                # него. Тип берём по расширению сохранённого файла, а не
+                # захардкоженный image/jpeg — _save_rss_image сохраняет и
+                # png/webp/gif.
+                img_path = st.data_dir / "rss_images" / row["rss_image"]
+                try:
+                    img_size = img_path.stat().st_size
+                except OSError:
+                    img_size = 0
+                if img_size:
+                    ctype = mimetypes.guess_type(row["rss_image"])[0] or "image/jpeg"
+                    enclosure = (f'<enclosure url="{_e(img_url)}" '
+                                f'length="{img_size}" type="{ctype}"/>')
             items.append(
                 f"<item><title>{title}</title><link>{link}</link>"
                 f"<guid isPermaLink=\"false\">{guid}</guid>"
