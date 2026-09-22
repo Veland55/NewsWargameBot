@@ -183,6 +183,23 @@ def _rows_for(text: str, min_rows: int = 6, max_rows: int = 22) -> int:
     return max(min_rows, min(max_rows, text.count("\n") + 3))
 
 
+def _char_counter_html(text: str, limit: int, warn: int | None = None) -> str:
+    """Живой счётчик символов под textarea — сама textarea должна идти
+    непосредственно перед этим div (см. bindCharCounters в TG_INIT_SCRIPT:
+    он ищет counter как nextElementSibling) и иметь class="counted"
+    data-limit=limit (data-warn=warn, если задан).
+
+    warn — не общий лимит Telegram (тот и так задан через maxlength и не
+    даёт напечатать лишнее), а более узкий порог, после которого пост
+    молча меняет форму — например TG_CAPTION_LIMIT: с картинкой и текстом
+    длиннее этого порога уходит уже не «фото с подписью», а «текст со
+    превью-картинкой сверху» (см. caption_note в queue_detail). Обычный
+    maxlength этого не подсвечивает, а раньше об этом можно было узнать
+    только из статичной сноски под полем, которую легко пропустить при правке."""
+    n = len(text)
+    return f'<div class="char-counter" data-limit="{limit}"{f" data-warn={warn}" if warn else ""}>{n} / {limit}</div>'
+
+
 def _is_http_url(url: str) -> bool:
     return url.strip().lower().startswith(("http://", "https://"))
 
@@ -263,7 +280,16 @@ class WebAuth:
 # десктопные удобства (таблицы вместо карточек и т.п.) сверху.
 STYLE = """
 :root {
-  color-scheme: dark; --tg-top: 0px; --tg-bottom: 0px; --nav-h: 60px; --side-w: 204px;
+  color-scheme: dark;
+  /* env(safe-area-inset-*) — запасной вариант, когда панель открыта не
+     внутри Telegram (обычный мобильный браузер по паролю — см. README), а
+     значит tg.safeAreaInset/applyInsets ниже вообще не выполнится и не
+     перезапишет эти переменные своими inline-style значениями: без него
+     нижнее меню на iPhone упиралось бы прямо в домашний индикатор, ничем
+     не отступая от него. Внутри Telegram JS всё равно перезапишет оба
+     значения — env() здесь работает, только пока их не тронули. */
+  --tg-top: env(safe-area-inset-top, 0px); --tg-bottom: env(safe-area-inset-bottom, 0px);
+  --nav-h: 60px; --side-w: 204px;
   /* Палитра — тёмный терминал: почти-чёрный с еле заметным зелёным подтоном,
      фосфорно-зелёный (--accent/--green) под «включено»/бренд, терминальный
      циан (--blue, имя сохранено — на нём завязана логика акцентных кнопок/
@@ -342,7 +368,7 @@ header .logout button { padding: 7px 13px; font-size: 12.5px; }
   display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: var(--radius-sm);
   color: var(--text-dim); text-decoration: none; font-size: 13px; transition: background .12s, color .12s;
 }
-.side-nav .nav-link .ic { font-size: 15px; line-height: 1; }
+.side-nav .nav-link .ic { font-size: 15px; line-height: 1; position: relative; display: inline-flex; }
 .side-nav .nav-link:hover { background: var(--card-hover); color: var(--text); }
 .side-nav .nav-link.active { background: var(--accent-dim); color: var(--accent); font-weight: 600; }
 /* Мигающий курсор у активного пункта меню — единственная непрерывная
@@ -367,7 +393,15 @@ header .logout button { padding: 7px 13px; font-size: 12.5px; }
   flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 3px; color: var(--text-dim); text-decoration: none; font-size: 12px; min-width: 0; padding: 0 2px;
 }
-.bottom-nav .nav-link .ic { font-size: 21px; line-height: 1; }
+.bottom-nav .nav-link .ic { font-size: 21px; line-height: 1; position: relative; display: inline-flex; }
+/* Бейдж числа в очереди на пункте меню «Публикация» (см. _nav_badge в
+   _layout) — тот же приём, что счётчик непрочитанного у иконки приложения:
+   видно сразу, не заходя на «Статус», чтобы узнать, накопилось ли что-то. */
+.nav-badge {
+  position: absolute; top: -4px; right: -8px; min-width: 15px; height: 15px; padding: 0 3px;
+  border-radius: 8px; background: var(--red); color: #fff; font-size: 9.5px; font-weight: 700;
+  line-height: 15px; text-align: center; box-shadow: 0 0 0 2px var(--bg-alt);
+}
 .bottom-nav .nav-link .lbl { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 /* Активная вкладка не должна опираться только на цвет (WCAG 1.4.1) —
    на телефоне это единственный ориентир «где я», второй признак — точка. */
@@ -437,8 +471,22 @@ pre code { background: none; border: none; padding: 0; color: inherit; }
 /* На телефоне высоту растягивает скрипт (autosizeTextareas в TG_INIT_SCRIPT)
    под конкретную страницу — здесь только запасной размер на случай, если он
    не отработал. На широком экране скрипт этого не делает (см. скрипт) —
-   там высотой управляет только rows= в разметке плюс ручной resize. */
-textarea { min-height: 45vh; resize: vertical; font-family: var(--font); font-size: 13.5px; }
+   там высотой управляет только rows= в разметке плюс ручной resize.
+   font-size здесь — 16px, тот же общий размер полей из правила выше, не
+   13.5px: та же причина, что и в комментарии над ним (iOS-зум), но именно
+   для textarea раньше молча терялась — правило с одинаковой специфичностью
+   ниже по файлу переопределяло 16px обратно вниз, и редактирование текста
+   новости (единственное поле, где реально печатают, а не выбирают значение)
+   зумило экран при каждом открытии карточки на iPhone. Уменьшаем обратно
+   только на широком экране ниже (там зума при фокусе нет, см. media). */
+textarea { min-height: 45vh; resize: vertical; font-family: var(--font); font-size: 16px; }
+/* Живой счётчик символов под textarea (см. _char_counter_html/bindCharCounters) —
+   текст выравнен вправо под правым краем textarea, чтобы не спорить за
+   внимание со статичной подсказкой лимита/подписи рядом. Цвет — как у
+   .muted по умолчанию, ярче только при приближении/превышении warn-порога. */
+.char-counter { text-align: right; font-size: 11px; color: var(--text-faint); margin-top: 3px; }
+.char-counter.warn { color: var(--amber); font-weight: 600; }
+.char-counter.over { color: var(--red); font-weight: 600; }
 button, .btn {
   background: var(--card-hover); color: var(--text); border: 1px solid var(--border);
   border-radius: var(--radius-sm); padding: 11px 16px; font-size: 13.5px; cursor: pointer;
@@ -457,7 +505,12 @@ button.primary { background: var(--blue); border-color: var(--blue); color: var(
 button.primary:hover { background: var(--blue-hover); }
 button.danger { background: var(--red-dim); border-color: var(--red-border); color: var(--red); }
 button.danger:hover { background: var(--red-hover); }
-button.icon, .btn.icon { min-height: 38px; min-width: 38px; padding: 6px; font-size: 15px; flex: 0 0 auto; }
+/* 44px — минимальный размер тач-таргета (Apple HIG/WCAG 2.5.5), не 38 —
+   это конкретно ✅/🚫 в каждой строке очереди, самое частое касание во всей
+   панели, и промах между «опубликовать» и «отклонить» стоит дороже, чем
+   на любой другой паре кнопок. На широком экране ниже (там курсор мыши,
+   не палец) размер уменьшается обратно, там это не нужно. */
+button.icon, .btn.icon { min-height: 44px; min-width: 44px; padding: 6px; font-size: 15px; flex: 0 0 auto; }
 .card-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
 .link-btn {
   background: none; border: none; color: var(--text-faint); font-size: 12px; padding: 6px 2px;
@@ -648,6 +701,7 @@ a.list-item:hover { background: var(--card-hover); }
      iOS Safari — на десктопе зума при фокусе нет), кнопки и карточки-строки
      компактнее, чем в мобильной раскладке. */
   input[type=text], input[type=password], input[type=number], select { font-size: 13px; padding: 7px 9px; }
+  textarea { font-size: 13.5px; }
   button, .btn { min-height: 32px; padding: 7px 12px; }
   button.icon, .btn.icon { min-height: 28px; min-width: 28px; }
   .list-item { padding: 8px 14px; }
@@ -836,6 +890,7 @@ window.__autoRefreshStart = function (intervalMs) {
       }
       window.scrollTo(0, scrollY);
       if (window.autosizeTextareas) window.autosizeTextareas();
+      if (window.bindCharCounters) window.bindCharCounters();
       if (window.__pageInit) window.__pageInit();
     }).catch(function () {}).then(function () { inFlight = false; });
   }
@@ -851,6 +906,21 @@ document.addEventListener('DOMContentLoaded', function () {
   function cssPx(name, fallback) {
     var v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(name));
     return isNaN(v) ? fallback : v;
+  }
+  // window.innerHeight — высота ЛОЖНОГО (layout) вьюпорта, она НЕ меняется
+  // при открытии экранной клавиатуры ни в Mobile Safari, ни в Chrome
+  // Android (это визуальный вьюпорт ужимается, layout остаётся как был) —
+  // растянутая под него textarea при открытой клавиатуре реально уезжает
+  // нижним краем ПОД неё, и «Сохранить черновик»/«Отклонить» сразу под
+  // полем вместе с ним. tg.viewportHeight — то же самое, но от самого
+  // Telegram (внутри Mini App это основной путь входа, см. README), уже
+  // учитывает клавиатуру; visualViewport.height — тот же смысл в обычном
+  // браузере (открытие панели паролем без Telegram).
+  function currentViewportHeight() {
+    var tg = window.Telegram && window.Telegram.WebApp;
+    if (tg && tg.viewportHeight) return tg.viewportHeight;
+    if (window.visualViewport) return window.visualViewport.height;
+    return window.innerHeight;
   }
   // Растягивает textarea от текущей позиции (какая бы она ни была на
   // конкретной странице — это и есть вся разница с фиксированным числом
@@ -871,6 +941,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // кнопку под полем перекрывало нижним меню. Теперь меряем реальную
     // высоту того, что идёт после textarea (до конца main), а не гадаем.
     var reserve = cssPx('--nav-h', 58) + cssPx('--tg-bottom', 0) + 14;
+    var vh = currentViewportHeight();
     var list = document.querySelectorAll('textarea');
     for (var i = 0; i < list.length; i++) {
       var ta = list[i];
@@ -878,20 +949,63 @@ document.addEventListener('DOMContentLoaded', function () {
       var taRect = ta.getBoundingClientRect();
       var mainRect = mainEl.getBoundingClientRect();
       var following = Math.max(0, mainRect.bottom - taRect.bottom);
-      var h = window.innerHeight - reserve - taRect.top - following;
-      h = Math.max(160, Math.min(h, window.innerHeight * 0.7));
+      var h = vh - reserve - taRect.top - following;
+      h = Math.max(160, Math.min(h, vh * 0.7));
       ta.style.height = h + 'px';
     }
   }
   window.addEventListener('load', autosizeTextareas);
   window.addEventListener('resize', autosizeTextareas);
+  // window resize (выше) не срабатывает при открытии/закрытии клавиатуры
+  // вне Telegram (см. currentViewportHeight) — только visualViewport.resize.
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', autosizeTextareas);
   // Доступна снаружи IIFE — __autoRefreshStart зовёт её заново после
   // подмены <main>, иначе новые textarea остались бы нерастянутыми.
   window.autosizeTextareas = autosizeTextareas;
 
+  // Живой счётчик символов (см. _char_counter_html) — textarea.counted и
+  // соседний .char-counter идут парой прямо в разметке с сервера, здесь
+  // только навешиваем 'input' и сразу считаем один раз (сервер уже вывел
+  // верное число на момент рендера, но если это подмена после автообновления
+  // с восстановленным .value браузера — не наш случай, isDirty блокирует
+  // подмену — на всякий случай пересчитываем).
+  function updateCharCounter(ta, counter) {
+    var limit = parseInt(counter.dataset.limit, 10) || 0;
+    var warn = counter.dataset.warn ? parseInt(counter.dataset.warn, 10) : null;
+    var n = ta.value.length;
+    counter.textContent = n + ' / ' + limit;
+    counter.classList.toggle('over', limit > 0 && n >= limit);
+    counter.classList.toggle('warn', !!warn && n >= warn && n < limit);
+  }
+  function bindCharCounters() {
+    var list = document.querySelectorAll('main textarea.counted');
+    for (var i = 0; i < list.length; i++) {
+      var ta = list[i];
+      var counter = ta.nextElementSibling;
+      if (!counter || !counter.classList.contains('char-counter')) continue;
+      if (!ta.__counterBound) {
+        ta.__counterBound = true;
+        ta.addEventListener('input', function () { updateCharCounter(this, this.nextElementSibling); });
+      }
+      updateCharCounter(ta, counter);
+    }
+  }
+  window.addEventListener('load', bindCharCounters);
+  // Доступна снаружи IIFE по той же причине, что и autosizeTextareas выше —
+  // __autoRefreshStart зовёт её заново после подмены <main>.
+  window.bindCharCounters = bindCharCounters;
+
   var tg = window.Telegram && window.Telegram.WebApp;
   if (!tg) return;
   try { tg.ready(); tg.expand(); } catch (e) {}
+  // Вертикальный свайп внутри Mini App по умолчанию сворачивает/закрывает
+  // его самим Telegram — на страницах с длинным списком (очередь) или
+  // растянутой во весь экран textarea (карточка новости, см.
+  // autosizeTextareas) это ровно тот же жест, что и обычный скролл/выделение
+  // текста, так что случайное закрытие панели прямо посреди правки поста —
+  // обычное дело, а не редкий случай. Отключаем на всех страницах панели,
+  // не только на карточке — соседний список тоже длинный и скроллится так же.
+  try { if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) {}
   // Каждая страница по умолчанию прячет MainButton/BackButton — это полная
   // перезагрузка страницы, а не SPA, так что состояние кнопок с прошлой
   // страницы (см. очередь согласования ниже) иначе могло бы протечь на
@@ -924,10 +1038,14 @@ NAV_ITEMS = [
     ("/", "📊", "Статус"),
     ("/feeds", "📰", "Источники"),
     ("/queue", "🖐", "Публикация"),
-    ("/content", "📝", "Контент"),
-    ("/settings", "⚙️", "Настройки"),
-    ("/posts", "📮", "Посты"),
+    ("/more", "⋯", "Ещё"),
 ]
+# «Контент»/«Настройки»/«Посты» больше не отдельные пункты нижнего меню (см.
+# more_get и замечание UX-аудита там) — они по-прежнему свои страницы со
+# своим active=, просто ни одна из них не совпадает ни с одним path в
+# NAV_ITEMS напрямую. Без этого набора активный пункт меню просто гас бы
+# на этих трёх страницах, а не подсвечивал «Ещё» откуда до них дошли.
+SECONDARY_NAV_PATHS = {"/content", "/settings", "/posts"}
 
 
 async def _usage_body(pub: "Publisher") -> str:
@@ -964,22 +1082,43 @@ async def _usage_body(pub: "Publisher") -> str:
 
 
 def _layout(title: str, body: str, flash: str = "", flash_kind: str = "ok", active: str = "",
-           wide: bool = False, flash_action: str = "", refresh_path: str | None = None) -> str:
+           wide: bool = False, flash_action: str = "", refresh_path: str | None = None,
+           queue_n: int = 0) -> str:
     # flash_action — готовый HTML (например, форма «Отменить»), не текст:
     # вызывающий код сам решает, что туда положить, поэтому не экранируем,
     # в отличие от flash. Пусто по умолчанию — большинство флешей его не используют.
     flash_html = (f'<div class="flash {flash_kind}">{_e(flash)}{flash_action}</div>' if flash else "")
 
+    # queue_n — сколько ждёт согласования, бейджем прямо на пункте меню:
+    # раньше это число было видно только на «Статусе» (пилюля-ссылка), и
+    # чтобы понять, накопилось ли что-то, нужно было сначала зайти туда, а
+    # не сразу на «Публикацию». 0 — бейдж не рисуем вовсе (пусто — не «0»,
+    # см. .nav-badge в STYLE). Не обновляется при фоновом автообновлении
+    # <main> (см. __autoRefreshStart) — сама навигация вне <main> и не
+    # трогается им; отстаёт максимум на один цикл (20с), тот же компромисс,
+    # что и у остальной статики шапки/меню.
+    def _nav_badge(path: str) -> str:
+        if path != "/queue" or not queue_n:
+            return ""
+        return f'<span class="nav-badge">{queue_n if queue_n <= 99 else "99+"}</span>'
+
+    # active приходит как "/content"/"/settings"/"/posts" с их собственных
+    # страниц (заголовок шапки берёт его же) — ни один из них не совпадает
+    # с path в NAV_ITEMS напрямую (там только "/more"), см. SECONDARY_NAV_PATHS.
+    def _is_active(path: str) -> bool:
+        return path == active or (path == "/more" and active in SECONDARY_NAV_PATHS)
+
     nav_html = "".join(
-        f'<a href="{path}" class="nav-link{" active" if path == active else ""}">'
-        f'<span class="ic">{icon}</span><span class="lbl">{label}</span>'
+        f'<a href="{path}" class="nav-link{" active" if _is_active(path) else ""}">'
+        f'<span class="ic">{icon}{_nav_badge(path)}</span>'
+        f'<span class="lbl">{label}</span>'
         f'<span class="nav-dot" aria-hidden="true"></span></a>'
         for path, icon, label in NAV_ITEMS
     )
     main_class = " wide" if wide else ""
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>{_e(title)} — bot panel</title>
 {TG_INIT_SCRIPT}
 <style>{STYLE}</style></head><body>
@@ -1030,7 +1169,7 @@ def _login_page(error: str = "", next_path: str = "/") -> str:
     err_html = f'<div class="flash err">{_e(error)}</div>' if error else ""
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Вход — bot panel</title>
 {TG_INIT_SCRIPT}
 <style>{STYLE}</style></head><body>
@@ -1354,7 +1493,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         """
         body += await _usage_body(pub)
         return web.Response(text=_layout("Статус", body, flash, flash_kind, active="/", wide=True,
-                                         refresh_path="/"), content_type="text/html")
+                                         refresh_path="/", queue_n=queue_n), content_type="text/html")
 
     async def pause_post(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -1369,6 +1508,32 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         pub.wake()
         return await dashboard(request, "Проверка запущена — новые публикации появятся в течение минуты.")
 
+    async def more_get(request: web.Request) -> web.Response:
+        """Хаб для разделов, которые открывают не каждый день — «Контент»,
+        «Настройки», «Посты» — по замечанию UX-аудита: на телефоне нижнее
+        меню с шестью пунктами теснее, чем с четырьмя, а «Публикация»
+        (реальная ежедневная работа) там ничем не выделена среди остальных
+        пяти. Сами разделы никуда не делись, просто на один тап дальше —
+        через общий пункт «Ещё» (см. NAV_ITEMS/SECONDARY_PATHS)."""
+        st: Storage = app["st"]
+        items = [
+            ("/content", "📝", "Контент", "Промпт для ИИ, формат поста, что именно обрабатывается"),
+            ("/settings", "⚙️", "Настройки", "Параметры публикации, отладка, канал, ИИ-бэкенд"),
+            ("/posts", "📮", "Посты", "Уже опубликованное — можно поправить и задним числом"),
+        ]
+        list_html = "".join(
+            f"""<a class="list-item" href="{path}">
+              <div class="list-item-info">
+                <div class="list-item-title">{icon} {label}</div>
+                <div class="muted">{_e(hint)}</div>
+              </div>
+              <div class="list-item-chevron">›</div>
+            </a>""" for path, icon, label, hint in items
+        )
+        body = f"<h2 class='page-heading'>Ещё</h2><div class='list'>{list_html}</div>"
+        return web.Response(text=_layout("Ещё", body, active="/more", queue_n=st.count_moderation()),
+                            content_type="text/html")
+
     # --- ленты ---------------------------------------------------------------
     def _dupes_section_html(st: "Storage") -> str:
         """Список найденных дублей — рендерится на «Публикация» (queue_get),
@@ -1376,7 +1541,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         а не управление источниками лент (было на «Ленты»/«Источники» —
         перенесено по замечанию UX-аудита). Пусто — секция не рендерится
         вовсе, чтобы не мозолить глаза, когда разбирать нечего (как бейдж на
-        дашборде)."""
+        дашборде). Непусто — свёрнута по умолчанию (как и «⚙️ Настройки
+        дедупликации» рядом): по замечанию UX-аудита, /queue — рабочий
+        список на согласование в первую очередь, разбор дублей — реже
+        нужное действие, и не должен растягивать страницу под собой всегда
+        развёрнутым. Счётчик — прямо в заголовке-summary, чтобы не открывать
+        ради того, чтобы просто увидеть, сколько там накопилось."""
         dupes = st.dedup_candidates(50)
         if not dupes:
             return ""
@@ -1390,7 +1560,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             matched = r["matched_post_id"] in matched_ids
             matched_html = (f'<a href="/posts/{r["matched_post_id"]}">пост #{r["matched_post_id"]}</a>'
                             if matched else f'пост #{r["matched_post_id"]} (уже удалён)')
-            thumb = (f'<img class="dupe-thumb" src="{_safe_href(r["image"])}" alt="" '
+            thumb = (f'<img class="dupe-thumb" src="{_safe_href(r["image"])}" alt="" loading="lazy" decoding="async" '
                     f'style="object-fit:cover;">'
                     if r["image"] and _is_http_url(r["image"])
                     else '<div class="dupe-thumb" style="background:var(--field-bg);"></div>')
@@ -1406,17 +1576,29 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
               </div>
             </div>"""
         return f"""
-        <h4 style="margin:14px 0 6px;">Найденные дубли <span class="muted" style="font-weight:400;">({total})</span></h4>
-        <div class="section-hint">Похожи на уже опубликованные с другой ленты — не в канале, ждут решения.</div>
-        <div class="list">{items}</div>
-        {more_note}
+        <details style="margin-top:10px;">
+          <summary class="disclosure">Найденные дубли
+            <span class="pill warn" style="margin-left:6px;">{total}</span></summary>
+          <div style="margin-top:10px;">
+            <div class="section-hint">Похожи на уже опубликованные с другой ленты — не в канале, ждут решения.</div>
+            <div class="list">{items}</div>
+            {more_note}
+          </div>
+        </details>
         """
 
     def _postponed_section_html(st: "Storage") -> str:
         """Новости, на которых модель отказала (сбой бэкенда, квота, гео-блок
         и т.п.) — не потеряны, каждый автопроход переоценивает их заново
         сам, но до тех пор админ не видел вообще ничего, кроме почасового
-        отчёта в личке. Пусто — секция не рендерится, как и «Дубли»."""
+        отчёта в личке. Пусто — секция не рендерится, как и «Дубли». Непусто —
+        свёрнута по умолчанию, той же логикой и по той же причине, что и
+        «Дубли» ниже (см. _dupes_section_html): /queue — в первую очередь
+        список на согласование, а не разбор отказов модели. id — на summary,
+        не на сам <details>: тогда переход по /queue#postponed (со «Статуса»
+        и из quick-nav ниже) находит id внутри свёрнутого блока и по
+        стандартному поведению браузера сам его раскрывает, а не остаётся
+        свёрнутым с фокусом непонятно на чём."""
         rows = st.postponed_list(50)
         if not rows:
             return ""
@@ -1438,11 +1620,17 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
               </div>
             </div>"""
         return f"""
-        <h2 id="postponed">Отложенные <span class="muted" style="font-weight:400;">({total})</span></h2>
-        <div class="section-hint">Модель отказала при обработке — новость не потеряна и переоценивается
-          сама на каждом автопроходе; здесь можно повторить прямо сейчас или отказаться от публикации.</div>
-        <div class="list">{items}</div>
-        {more_note}
+        <h3 class="page-heading" style="margin-top:22px;">Отложенные</h3>
+        <details style="margin-bottom:10px;">
+          <summary id="postponed" class="disclosure">Показать
+            <span class="pill off" style="margin-left:6px;">{total}</span></summary>
+          <div style="margin-top:10px;">
+            <div class="section-hint">Модель отказала при обработке — новость не потеряна и переоценивается
+              сама на каждом автопроходе; здесь можно повторить прямо сейчас или отказаться от публикации.</div>
+            <div class="list">{items}</div>
+            {more_note}
+          </div>
+        </details>
         """
 
     def _feed_row_html(f: sqlite3.Row, request: web.Request, st: "Storage") -> str:
@@ -1552,7 +1740,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         <div class="list list-grid" style="margin-top:10px;">{search_list}</div>
         """
         return web.Response(text=_layout("Ленты", body, flash, flash_kind, active="/feeds",
-                                         refresh_path="/feeds"), content_type="text/html")
+                                         refresh_path="/feeds", queue_n=app["st"].count_moderation()),
+                            content_type="text/html")
 
     async def feeds_add(request: web.Request) -> web.Response:
         form = request["form"]
@@ -1671,7 +1860,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         </div>
         """
         return web.Response(text=_layout(f"Промпт ленты #{feed_id}", body, flash, flash_kind, active="/feeds",
-                                         refresh_path=f"/feeds/{feed_id}/template"),
+                                         refresh_path=f"/feeds/{feed_id}/template",
+                                         queue_n=app["st"].count_moderation()),
                             content_type="text/html")
 
     async def feed_template_post(request: web.Request) -> web.Response:
@@ -1763,7 +1953,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         </div>
         """
         return web.Response(text=_layout("Контент", body, flash, flash_kind, active="/content", wide=True,
-                                         refresh_path="/content"), content_type="text/html")
+                                         refresh_path="/content", queue_n=app["st"].count_moderation()),
+                            content_type="text/html")
 
     async def content_prompt_post(request: web.Request) -> web.Response:
         text = str(request["form"].get("text", "")).strip()
@@ -1915,7 +2106,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         </div>
         """
         return web.Response(text=_layout("Настройки", body, flash, flash_kind, active="/settings", wide=True,
-                                         refresh_path="/settings"), content_type="text/html")
+                                         refresh_path="/settings", queue_n=app["st"].count_moderation()),
+                            content_type="text/html")
 
     async def settings_channel(request: web.Request) -> web.Response:
         target = str(request["form"].get("channel", "")).strip()
@@ -2040,7 +2232,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         body = (f"<h2 class='page-heading'>Последние посты "
                f"<span class='muted' style='font-weight:400;'>(до 30)</span></h2>"
                f"<div class='list'>{list_html}</div>")
-        return web.Response(text=_layout("Посты", body, active="/posts", refresh_path="/posts"), content_type="text/html")
+        return web.Response(text=_layout("Посты", body, active="/posts", refresh_path="/posts",
+                                         queue_n=st.count_moderation()), content_type="text/html")
 
     async def post_detail(request: web.Request, draft: str | None = None,
                           flash: str = "", flash_kind: str = "ok") -> web.Response:
@@ -2092,9 +2285,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           <hr class="sep">
           {draft_note}
           <form method="post" action="/posts/{row['id']}/save">{csrf_field(request)}
-            <textarea name="text" rows="{_rows_for(text, min_rows=8)}" maxlength="{limit}">{_e(text)}</textarea>
-            <div class="muted" style="margin-top:4px;">Лимит для этого поста: {limit} символов
-              ({'подпись к фото' if row['kind'] in ('photo','album') else 'текстовое сообщение'})</div>
+            <textarea name="text" class="counted" rows="{_rows_for(text, min_rows=8)}" maxlength="{limit}">{_e(text)}</textarea>
+            {_char_counter_html(text, limit)}
+            <div class="muted" style="margin-top:4px;">
+              {'подпись к фото' if row['kind'] in ('photo','album') else 'текстовое сообщение'}</div>
             <div class="card-actions"><button class="primary" type="submit">Сохранить в канал</button></div>
           </form>
         </div>
@@ -2112,7 +2306,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         </div>
         """
         return web.Response(text=_layout(f"Пост #{row['id']}", body, flash, flash_kind, active="/posts",
-                                         refresh_path=f"/posts/{row['id']}"), content_type="text/html")
+                                         refresh_path=f"/posts/{row['id']}", queue_n=st.count_moderation()),
+                            content_type="text/html")
 
     async def post_save(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -2220,7 +2415,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         matched_html = (f'<a href="/posts/{row["matched_post_id"]}">пост #{row["matched_post_id"]}</a>'
                         f' — «{_e(matched["title"][:100])}»' if matched
                         else f'пост #{row["matched_post_id"]} (уже удалён)')
-        image_html = (f'<img src="{_safe_href(row["image"])}" alt="" '
+        image_html = (f'<img src="{_safe_href(row["image"])}" alt="" loading="lazy" decoding="async" '
                       f'style="max-width:100%; border-radius:10px; margin-top:10px;">'
                       if row["image"] and _is_http_url(row["image"]) else "")
         publish_label = ("✅ Обработать (пойдёт на согласование)" if pub.moderation and not pub.debug
@@ -2250,7 +2445,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </div>
         </div>
         """
-        return web.Response(text=_layout(f"Дубль #{row['id']}", body, active="/queue"), content_type="text/html")
+        return web.Response(text=_layout(f"Дубль #{row['id']}", body, active="/queue",
+                                         queue_n=st.count_moderation()), content_type="text/html")
 
     async def duplicate_publish(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -2294,7 +2490,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             raise web.HTTPNotFound(text="Запись не найдена — возможно, уже обработана")
         when_first = time.strftime("%d.%m %H:%M", time.localtime(row["first_failed_at"]))
         when_last = time.strftime("%d.%m %H:%M", time.localtime(row["last_failed_at"]))
-        image_html = (f'<img src="{_safe_href(row["image"])}" alt="" '
+        image_html = (f'<img src="{_safe_href(row["image"])}" alt="" loading="lazy" decoding="async" '
                       f'style="max-width:100%; border-radius:10px; margin-top:10px;">'
                       if row["image"] and _is_http_url(row["image"]) else "")
         retry_hint = ('<p class="field-hint" style="margin:6px 0 0; color:var(--red);">Включена '
@@ -2329,7 +2525,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </div>
         </div>
         """
-        return web.Response(text=_layout(f"Отложено #{row['id']}", body, active="/queue"), content_type="text/html")
+        return web.Response(text=_layout(f"Отложено #{row['id']}", body, active="/queue",
+                                         queue_n=st.count_moderation()), content_type="text/html")
 
     async def postponed_retry(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -2372,7 +2569,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     LIST_ORIGIN_FIELD = '<input type="hidden" name="from" value="list">'
 
     def _queue_row_html(request: web.Request, r: sqlite3.Row, page: int) -> str:
-        thumb = (f'<img class="dupe-thumb" src="{_safe_href(r["image"])}" alt="" '
+        thumb = (f'<img class="dupe-thumb" src="{_safe_href(r["image"])}" alt="" loading="lazy" decoding="async" '
                 f'style="object-fit:cover;">'
                 if r["image"] and _is_http_url(r["image"])
                 else '<div class="dupe-thumb" style="background:var(--field-bg);"></div>')
@@ -2510,10 +2707,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           <form method="post" action="/queue/broadcast"
                 onsubmit="return tgConfirmSubmit(this, 'Отправить это сообщение сразу во все подключённые каналы?')">
             {csrf_field(request)}
-            <textarea name="text" rows="{_rows_for(broadcast_draft, min_rows=3, max_rows=10)}"
+            <textarea name="text" class="counted" rows="{_rows_for(broadcast_draft, min_rows=3, max_rows=10)}"
                       maxlength="{TG_LIMIT}"
                       placeholder="Текст объявления, не новость из ленты — например, «сегодня без вечернего дайджеста»...">{_e(broadcast_draft)}</textarea>
-            <div class="muted" style="margin:4px 0 10px;">Лимит: {TG_LIMIT} символов.</div>
+            {_char_counter_html(broadcast_draft, TG_LIMIT)}
             <div class="card-actions">
               <button class="primary" type="submit">Отправить</button>
             </div>
@@ -2606,7 +2803,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         """
         return web.Response(text=_layout("Публикация", body, flash, flash_kind, active="/queue",
                                          flash_action=flash_action,
-                                         refresh_path=f"/queue?page={page}" if page > 1 else "/queue"),
+                                         refresh_path=f"/queue?page={page}" if page > 1 else "/queue",
+                                         queue_n=total),
                             content_type="text/html")
 
     async def queue_detail(request: web.Request, draft: str | None = None,
@@ -2671,12 +2869,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         gallery = ""
         if len(urls) == 1 and _is_http_url(urls[0]):
             gallery = (f'<a href="{_safe_href(urls[0])}" target="_blank" rel="noopener">'
-                      f'<img src="{_safe_href(urls[0])}" alt="" '
+                      f'<img src="{_safe_href(urls[0])}" alt="" loading="lazy" decoding="async" '
                       f'style="max-width:100%; border-radius:10px; margin-top:10px;"></a>')
         elif urls:
             thumbs = "".join(
                 f'<a href="{_safe_href(u)}" target="_blank" rel="noopener">'
-                f'<img src="{_safe_href(u)}" alt="" style="width:100%; border-radius:8px; '
+                f'<img src="{_safe_href(u)}" alt="" loading="lazy" decoding="async" style="width:100%; border-radius:8px; '
                 f'aspect-ratio:1; object-fit:cover;">{" <span class=\"pill neutral\">1-я, с подписью</span>" if i == 0 else ""}</a>'
                 for i, u in enumerate(urls) if _is_http_url(u)
             )
@@ -2685,10 +2883,15 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                       f'<div class="muted" style="margin-top:4px;">Альбом — уйдёт без подписи под каждой '
                       f'картинкой, текст отдельным сообщением следом.</div>' if len(urls) > 1 else "")
 
+        album_branch = row["multi"] and len(urls) > 1
         caption_note = ("Альбом — картинки уйдут без общей подписи, текст отдельным сообщением следом."
-                        if row["multi"] and len(urls) > 1 else
+                        if album_branch else
                         f"С картинкой и текстом длиннее {TG_CAPTION_LIMIT} — уйдёт текстом, "
                         f"картинка станет превью-ссылкой над ним.")
+        # warn=TG_CAPTION_LIMIT только вне альбома — именно там текст длиннее
+        # этого порога молча меняет форму поста (см. caption_note выше),
+        # у альбома общий лимит один — TG_LIMIT, без промежуточного порога.
+        counter_html = _char_counter_html(text, TG_LIMIT, warn=None if album_branch else TG_CAPTION_LIMIT)
 
         body = f"""
         <div><a href="{_e(back_href)}" class="back-link">‹ Публикация</a></div>
@@ -2709,8 +2912,9 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           {draft_note}
           <form method="post" action="/queue/{row['id']}/publish" id="queue-publish-form">{csrf_field(request)}{page_field}
             <label>Текст поста — уйдёт в канал как есть</label>
-            <textarea name="text" rows="{_rows_for(text, min_rows=8)}" maxlength="{TG_LIMIT}">{_e(text)}</textarea>
-            <div class="muted" style="margin-top:4px;">Лимит: {TG_LIMIT} символов. {caption_note}</div>
+            <textarea name="text" class="counted" rows="{_rows_for(text, min_rows=8)}" maxlength="{TG_LIMIT}">{_e(text)}</textarea>
+            {counter_html}
+            <div class="muted" style="margin-top:4px;">{caption_note}</div>
             <div class="card-actions">
               <button class="primary" type="submit" {disabled}
                       onclick="return tgConfirmSubmit(this.form, 'Опубликовать в канал прямо сейчас?')">
@@ -2721,38 +2925,40 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             </div>
           </form>
         </div>
-        <div class="card">
-          <form method="post" action="/queue/{row['id']}/regen?page={_e(page)}">{csrf_field(request)}
-            <label>Перегенерировать через ИИ из исходной новости</label>
-            <p class="field-hint" style="margin:0 0 8px;">Пожелание необязательно. Заменит текст выше —
-              несохранённые правки в поле пропадут.</p>
+        <details class="card"{" open" if row["scheduled_at"] else ""}>
+          <summary class="disclosure">Ещё действия
+            <span class="muted" style="font-weight:400;">регенерация, отложить, показать в личке</span></summary>
+          <div style="margin-top:12px;">
+            <form method="post" action="/queue/{row['id']}/regen?page={_e(page)}">{csrf_field(request)}
+              <label>Перегенерировать через ИИ из исходной новости</label>
+              <p class="field-hint" style="margin:0 0 8px;">Пожелание необязательно. Заменит текст выше —
+                несохранённые правки в поле пропадут.</p>
+              <div class="row">
+                <input type="text" name="extra" placeholder="например: короче и без хештегов" style="flex:1;">
+                <button type="submit" {disabled}>🤖 Перегенерировать</button>
+              </div>
+            </form>
+            <hr class="sep">
+            <label>Отложить публикацию</label>
+            <p class="field-hint" style="margin:0 0 8px;">Опубликуется само в выбранное время —
+              возвращаться и нажимать «Опубликовать» вручную не нужно. Правки в тексте выше сохранятся
+              вместе с планом, отдельно нажимать «Сохранить черновик» не нужно.</p>
             <div class="row">
-              <input type="text" name="extra" placeholder="например: короче и без хештегов" style="flex:1;">
-              <button type="submit" {disabled}>🤖 Перегенерировать</button>
+              <select name="day" form="queue-publish-form">
+                <option value="today" {"selected" if schedule_day_value == "today" else ""}>Сегодня</option>
+                <option value="tomorrow" {"selected" if schedule_day_value == "tomorrow" else ""}>Завтра</option>
+              </select>
+              <input type="time" name="time" value="{schedule_time_value}" required style="flex:1;"
+                     form="queue-publish-form">
+              <button type="submit" form="queue-publish-form"
+                      formaction="/queue/{row['id']}/schedule" {disabled}>🕒 Запланировать</button>
             </div>
-          </form>
-        </div>
-        <div class="card">
-          <label>Отложить публикацию</label>
-          <p class="field-hint" style="margin:0 0 8px;">Опубликуется само в выбранное время —
-            возвращаться и нажимать «Опубликовать» вручную не нужно. Правки в тексте выше сохранятся
-            вместе с планом, отдельно нажимать «Сохранить черновик» не нужно.</p>
-          <div class="row">
-            <select name="day" form="queue-publish-form">
-              <option value="today" {"selected" if schedule_day_value == "today" else ""}>Сегодня</option>
-              <option value="tomorrow" {"selected" if schedule_day_value == "tomorrow" else ""}>Завтра</option>
-            </select>
-            <input type="time" name="time" value="{schedule_time_value}" required style="flex:1;"
-                   form="queue-publish-form">
-            <button type="submit" form="queue-publish-form"
-                    formaction="/queue/{row['id']}/schedule" {disabled}>🕒 Запланировать</button>
+            {unschedule_form}
+            <hr class="sep">
+            <form method="post" action="/queue/{row['id']}/preview">{csrf_field(request)}{page_field}
+              <button type="submit">👁 Показать в личке</button></form>
           </div>
-          {unschedule_form}
-        </div>
-        <div class="card">
-          <form method="post" action="/queue/{row['id']}/preview">{csrf_field(request)}{page_field}
-            <button type="submit">👁 Показать в личке</button></form>
-        </div>
+        </details>
         <script>
         // window.__pageInit, не разовая IIFE — эта карточка обновляется в
         // фоне (см. __autoRefreshStart в TG_INIT_SCRIPT), и после каждой
@@ -2811,7 +3017,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         return web.Response(text=_layout(f"Публикация #{row['id']}", body, flash, flash_kind, active="/queue",
                                          flash_action=flash_action,
                                          refresh_path=f"/queue/{row['id']}?page={page}" if page
-                                                     else f"/queue/{row['id']}"),
+                                                     else f"/queue/{row['id']}",
+                                         queue_n=st.count_moderation()),
                             content_type="text/html")
 
     def _form_page(request: web.Request) -> str:
@@ -3183,6 +3390,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_get("/", dashboard)
     app.router.add_post("/pause", pause_post)
     app.router.add_post("/checknow", checknow_post)
+    app.router.add_get("/more", more_get)
     app.router.add_get("/feeds", feeds_get)
     app.router.add_post("/feeds/add", feeds_add)
     app.router.add_post("/feeds/add-search", feeds_add_search)
