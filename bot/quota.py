@@ -13,9 +13,11 @@
 """
 from __future__ import annotations
 
+import html
 import logging
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from datetime import datetime, timezone
 
 from aiogram import Bot
@@ -23,6 +25,9 @@ from aiogram.exceptions import TelegramAPIError
 
 from .db import FREE_RPD_NO_CREDITS, FREE_RPD_WITH_CREDITS, Storage
 from .llm import LLMClient
+
+if TYPE_CHECKING:
+    from .claude import ClaudeClient
 
 log = logging.getLogger(__name__)
 
@@ -232,7 +237,7 @@ class Quota:
             return (
                 f"{icon} <b>Израсходовано {pct:.0f}% суточного лимита запросов</b>\n\n"
                 f"Запросов сегодня: {info.requests} из {info.request_limit}\n"
-                f"Модель: <code>{info.model}</code>\n"
+                f"Модель: <code>{html.escape(info.model)}</code>\n"
                 f"Лимит: {info.limit_source}\n"
                 f"Обнулится через {until_reset()} (00:00 UTC)\n\n"
                 + (
@@ -250,7 +255,7 @@ class Quota:
             f"Потрачено: {(info.credit_limit or 0) - (info.credit_remaining or 0):.4f} "
             f"из {info.credit_limit:.4f}\n"
             f"Осталось: {info.credit_remaining:.4f}\n"
-            f"Модель: <code>{info.model}</code>\n\n"
+            f"Модель: <code>{html.escape(info.model)}</code>\n\n"
             "Пополните баланс или поднимите лимит ключа на openrouter.ai/settings/keys."
         )
 

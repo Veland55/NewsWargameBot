@@ -17,7 +17,6 @@ warhammer-community.com sitemap.xml оказался закэширован на
 from __future__ import annotations
 
 import asyncio
-import calendar
 import logging
 from urllib.parse import parse_qs, unquote, urlsplit
 

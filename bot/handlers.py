@@ -412,7 +412,7 @@ async def cmd_test(message: Message, command: CommandObject, st: Storage,
             backend_name, model_hint = publisher.llm.model, "Проверьте LLM_API_KEY / LLM_MODEL / LLM_BASE_URL в .env"
         await _reply(
             message,
-            f"❌ {backend_name} вернул ошибку: <code>{_e(exc)}</code>\n\n{model_hint}",
+            f"❌ {_e(backend_name)} вернул ошибку: <code>{_e(exc)}</code>\n\n{model_hint}",
         )
         return
 
@@ -605,26 +605,28 @@ async def cmd_set(message: Message, command: CommandObject, st: Storage) -> None
             await _reply(message, "on_llm_error принимает <code>raw</code> или <code>skip</code>")
             return
     elif key == "max_images":
-        n = _to_int(value)
+        n = _setting_int(value)
         if n is None or not (1 <= n <= 10):
             await _reply(message, "max_images — число от 1 до 10.")
             return
     elif key == "dedup_threshold":
-        n = _to_int(value)
+        n = _setting_int(value)
         if n is None or not (1 <= n <= 100):
             await _reply(message, "dedup_threshold — число от 1 до 100 (% схожести).")
             return
     elif key == "alert_thresholds":
         parsed = [p for p in value.replace(" ", "").split(",") if p]
-        nums = [_to_int(p) for p in parsed]
+        nums = [_setting_int(p) for p in parsed]
         if not parsed or any(n is None or not (1 <= n <= 100) for n in nums):
             await _reply(message, "Пороги — числа 1–100 через запятую, например "
                                   "<code>/set alert_thresholds 70,90</code>")
             return
         value = ",".join(str(n) for n in sorted({n for n in nums}))
-    elif _to_int(value) is None:
-        await _reply(message, f"{_e(key)} ожидает число.")
+    elif _setting_int(value) is None:
+        await _reply(message, f"{_e(key)} ожидает целое число ≥ 0.")
         return
+    else:
+        value = str(int(value))
 
     st.set(key, value)
     await _reply(message, f"✅ <code>{_e(key)}</code> = <code>{_e(value)}</code>")
@@ -1075,12 +1077,14 @@ async def cmd_claude(message: Message, command: CommandObject, st: Storage,
     claude = publisher.claude
 
     if action in ("on", "вкл", "1"):
+        # Ключ проверяем ДО записи, как и веб-панель (settings_ai): иначе
+        # /claude on без ключа молча выключал работающий Gemini, а сам
+        # Claude включался бы позже, как только ключ появится в .env.
+        if claude is None or not claude.api_key:
+            await _reply(message, "Не включил: не хватает CLAUDE_API_KEY в .env.\n\n" + CLAUDE_HELP)
+            return
         st.set("claude_mode", "1")
         st.set("gemini_mode", "0")  # одновременно работать может только один альтернативный бэкенд
-        if not publisher.claude_mode:
-            await _reply(message, "Включил, но работать пока не выйдет: "
-                                  "не хватает CLAUDE_API_KEY в .env.\n\n" + CLAUDE_HELP)
-            return
         await _reply(message, f"✅ Обрабатываю через Claude (<code>{_e(claude.model)}</code>).")
         return
 
@@ -1178,12 +1182,11 @@ async def cmd_gemini(message: Message, command: CommandObject, st: Storage,
     gemini = publisher.gemini
 
     if action in ("on", "вкл", "1"):
+        if gemini is None or not gemini.api_key:  # см. /claude on
+            await _reply(message, "Не включил: не хватает GEMINI_API_KEY в .env.\n\n" + GEMINI_HELP)
+            return
         st.set("gemini_mode", "1")
         st.set("claude_mode", "0")
-        if not publisher.gemini_mode:
-            await _reply(message, "Включил, но работать пока не выйдет: "
-                                  "не хватает GEMINI_API_KEY в .env.\n\n" + GEMINI_HELP)
-            return
         await _reply(message, f"✅ Обрабатываю через Gemini (<code>{_e(gemini.model)}</code>).")
         return
 
@@ -1356,9 +1359,9 @@ async def cmd_status(message: Message, st: Storage, publisher: Publisher) -> Non
         f"Публикация: {mode}\n"
         f"Сейчас обрабатывает: <code>{_e(publisher.active_backend_label)}</code>\n"
         f"Канал: <code>{_e(publisher.channel or 'не задан')}</code>\n"
-        f"Claude: " + (f"включён, <code>{_e(claude.model)}</code>"
+        "Claude: " + (f"включён, <code>{_e(claude.model)}</code>"
                        if publisher.claude_mode else "выключен") + "\n"
-        f"Gemini: " + (f"включён, <code>{_e(gemini.model)}</code>"
+        "Gemini: " + (f"включён, <code>{_e(gemini.model)}</code>"
                        if publisher.gemini_mode else "выключен") + "\n"
         f"Ленты: {active} активных из {len(feeds)}"
         + (f", с ошибками: {len(errors)}" if errors else "")
@@ -1401,6 +1404,13 @@ def _to_int(value: str) -> int | None:
         return None
 
 
+def _setting_int(value: str) -> int | None:
+    """Значение числовой настройки — те же правила, что у веб-панели
+    (web._ascii_digits): только ASCII-цифры. int() сам принимает и "-5",
+    и "+5", и "1_000" — /set сохранял такое, а панель отвергала."""
+    return int(value) if value.isascii() and value.isdigit() else None
+
+
 async def _last_entry(feed: sqlite3.Row, publisher: Publisher) -> tuple[Entry | None, str | None]:
     """Последняя запись ленты для /test, /claude test, /gemini test —
     учитывает вид источника. Для search fetch() (RSS-парсер) на источнике
@@ -1424,8 +1434,13 @@ async def _last_entry(feed: sqlite3.Row, publisher: Publisher) -> tuple[Entry | 
         # найденные страницы разом (это разовая ручная команда, не
         # автоцикл — можно не жалеть чужой сайт) и берём самую свежую по
         # настоящей дате публикации со страницы (fetch_article_entry).
+        # Без даты на странице — дата из выдачи (Bing) или 0, а не «сейчас»:
+        # иначе любая страница без datePublished обгоняла бы действительно
+        # свежую статью. Если дат нет ни у кого, max() вернёт первую по
+        # выдаче — самую релевантную.
         candidates = await asyncio.gather(
-            *(fetch_article_entry(it["link"], time.time(), "") for it in items))
+            *(fetch_article_entry(it["link"], it.get("published_ts") or 0.0, "")
+              for it in items))
         found = [c for c in candidates if c is not None]
         if not found:
             return None, "не удалось прочитать ни одну из найденных страниц"

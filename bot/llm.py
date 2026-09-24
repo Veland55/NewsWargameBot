@@ -198,6 +198,13 @@ class LLMClient:
                             finish = exc.finish_reason
                             if exc.usage:
                                 record(exc.usage)
+                        except LLMError as exc:
+                            # 200 с не-JSON (страница прокси/балансировщика)
+                            # или {"error": ...} от провайдера — разовый сбой
+                            # того же рода, что 5xx: повторяем, а не
+                            # выпадаем из цикла с первой же попытки.
+                            last_error = str(exc)
+                            finish = ""
                         else:
                             record(usage)
                             if finish != "length":

@@ -99,6 +99,9 @@ class ClaudeClient:
                             last_error = str(exc)
                             if exc.usage:
                                 record(exc.usage)
+                        except LLMError as exc:
+                            # См. LLMClient.complete — битый ответ с кодом 200 повторяем.
+                            last_error = str(exc)
                         else:
                             record(usage)
                             return text

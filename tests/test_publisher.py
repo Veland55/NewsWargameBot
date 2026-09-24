@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from bot.db import Storage
-from bot.publisher import (DEDUP_MIN_SIGNAL, Post, Publisher, _dedup_similarity,
+from bot.publisher import (Post, Publisher, _dedup_similarity,
                            _shares_named_run)
 from tests.conftest import make_entry
 

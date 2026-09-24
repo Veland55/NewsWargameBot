@@ -21,8 +21,8 @@ from .claude import ClaudeClient
 from .db import Storage, entry_key
 from .llm import LLMClient, LLMError, LLMQuotaExceeded
 from .quota import Quota
-from .rss import (Entry, FetchResult, download_image, fetch,
-                  fetch_article_entry, image_dedup_key, page_image,
+from .rss import (Entry, FetchResult, article_text, download_image, fetch,
+                  fetch_article_entry, format_ts, image_dedup_key, page_image,
                   page_images, strip_html)
 from .search import (BingNewsClient, SearchClient, domain_of,
                      merge_search_results, site_query)
@@ -58,6 +58,17 @@ PUBLISH_CLAIM_TTL = 600
 # столько секунд, значит первая попытка дошла, а это — тот самый повтор.
 DUPLICATE_GUARD_SECONDS = 600
 RU_ATTEMPTS = 2                # попыток добиться от модели русского текста
+# Сколько проходов подряд страница статьи сайта без RSS может не читаться
+# (403 от защиты от ботов, снятая статья, не-статья в выдаче поиска), прежде
+# чем запись помечается прочитанной. Без предела такая ссылка скачивалась
+# заново каждый цикл, пока держалась в выдаче поиска — до недели.
+HYDRATE_MAX_FAILS = 3
+# Ниже этой длины summary из RSS считаем огрызком (см. build_post_text):
+# у части сайтов-конструкторов (см. rss.article_text) в ленте лежит только
+# первая фраза вступления, а не текст статьи — подгружаем страницу и
+# проверяем, нет ли там настоящего текста, только когда своих данных
+# заведомо мало для содержательной заметки.
+THIN_SUMMARY_LENGTH = 120
 # Сколько картинок для одной новости качать параллельно (см. _images_of_page).
 # Сайт-источник и его CDN — общие: слишком широкий веер бьёт по ним не хуже,
 # чем по нам, а выигрыш по времени после ~4 параллельных запросов уже плоский.
@@ -343,6 +354,9 @@ class Publisher:
         # dedup_candidates/postponed). Обычный set с проверкой-и-добавлением
         # без await между ними безопасен под GIL одного процесса.
         self._manual_publish_locks: set[str] = set()
+        # (feed_id, key) → сколько проходов подряд страница не прочиталась,
+        # см. HYDRATE_MAX_FAILS.
+        self._hydrate_fails: dict[tuple[int, str], int] = {}
 
     # --- публичный API ---------------------------------------------------
     @property
@@ -524,17 +538,21 @@ class Publisher:
                               "тратить лимит модели впустую")
                     break
 
-        stats["postponed"] = len(self._postponed)
-        if self._postponed:
-            await self._report_postponed()
-        if self._postponed_flood:
-            await self._report_flood()
-        if self._postponed_dupes:
-            await self._report_dupes()
-        if self._queued and self.st.get("moderation_notify") == "1":
-            await self._report_queued()
-        if self._queue_overflow:
-            await self._report_queue_overflow()
+            # Отчёты — тоже под локом: списки выше обнуляет следующий
+            # run_once, как только получит лок, а отчёты await-ят отправку
+            # в Telegram. Вне лока параллельный /checknow успевал обнулить
+            # списки между первым и вторым отчётом — те терялись.
+            stats["postponed"] = len(self._postponed)
+            if self._postponed:
+                await self._report_postponed()
+            if self._postponed_flood:
+                await self._report_flood()
+            if self._postponed_dupes:
+                await self._report_dupes()
+            if self._queued and self.st.get("moderation_notify") == "1":
+                await self._report_queued()
+            if self._queue_overflow:
+                await self._report_queue_overflow()
         if (stats["published"] or stats["queued"]) and self.quota:
             await self.quota.check_and_alert(self.backend_key)
         return stats
@@ -860,12 +878,16 @@ class Publisher:
             # теперь backfill/max_age_days можно применять осмысленно,
             # раньше (по синтетическому порядку выдачи) оба были бы по сути
             # лотереей вместо «оставить настоящие последние N».
-            fresh = await self._hydrate_search_entries(fresh)
+            fresh = await self._hydrate_search_entries(feed_id, fresh)
             fresh = self._drop_stale(feed_id, fresh)
             fresh = backfill_slice(fresh)
-        fresh = self._drop_duplicates(feed, fresh)
+        # flood_guard — до дедупликации, не после: сбитая лента (сменилась
+        # схема guid) — это как раз те же уже опубликованные статьи, и без
+        # этого порядка вся выдача разом уходила в очередь дублей вместе с
+        # сообщением «похоже на дубли: 40», хотя её надо просто отсечь.
         if not first_poll and kind != "search":
             fresh = self._guard_flood(feed_id, fresh)
+        fresh = self._drop_duplicates(feed, fresh)
 
         # Берём не больше max_per_cycle за проход; остаток — на следующем.
         to_post = fresh[: max(1, self.st.get_int("max_per_cycle"))]
@@ -963,9 +985,25 @@ class Publisher:
         только после одобрения (см. _image_candidates/_download_candidates) —
         не тратить трафик на новости, которые ещё могут отклонить."""
         source = (feed["title"] if feed and feed["title"] else "") or "RSS"
+        summary = entry.summary or entry.title
+        if len(summary) < THIN_SUMMARY_LENGTH and entry.link:
+            # RSS/og-теги части сайтов (конструкторы вроде Go Daddy Website
+            # Builder — см. rss.article_text) отдают только огрызок
+            # вступления вместо текста статьи. Без проверки модель получает
+            # почти пустой {summary} и, чтобы всё равно выдать целый абзац
+            # по шаблону, сочиняет недостающие факты от себя — например,
+            # реальную новость о новой миниатюре превращает в анонс
+            # несуществующей игры с придуманным Kickstarter. Дочитываем
+            # страницу здесь и берём найденный текст, только если он
+            # действительно длиннее — на большинстве сайтов там всё то же
+            # самое (или пусто), лишний раз подменять нечем.
+            richer = await article_text(entry.link)
+            if richer and len(richer) > len(summary):
+                summary = richer[:4000]
+                entry.summary = summary
         raw_values = {
             "title": entry.title,
-            "summary": entry.summary or entry.title,
+            "summary": summary,
             "link": entry.link,
             "source": source,
             "published": entry.published,
@@ -1000,12 +1038,25 @@ class Publisher:
         измениться на сайте, а редактируем мы историю, а не текущую версию).
         Картинки не трогаем — /regen меняет только текст.
 
+        summary в row может остаться огрызком даже после того, как
+        build_post_text научился его обогащать — для постов, опубликованных
+        ДО этого исправления, БД так и хранит старый короткий текст (никто
+        задним числом её не переписывал). Поэтому здесь та же проверка
+        THIN_SUMMARY_LENGTH и тот же повторный поход на страницу, что и в
+        build_post_text — иначе /regen для таких старых постов будет
+        бесконечно крутиться на том же огрызке, из которого нечего добыть.
+
         `limit` — явный лимит длины вместо вывода по row["kind"]: строки
         moderation (очередь согласования) такого столбца не имеют вовсе.
         """
+        summary = row["summary"] or row["title"]
+        if len(summary) < THIN_SUMMARY_LENGTH and row["link"]:
+            richer = await article_text(row["link"])
+            if richer and len(richer) > len(summary):
+                summary = richer[:4000]
         raw_values = {
             "title": row["title"],
-            "summary": row["summary"] or row["title"],
+            "summary": summary,
             "link": row["link"],
             "source": row["source"] or "RSS",
             "published": row["published"],
@@ -1021,6 +1072,70 @@ class Publisher:
         if limit is None:
             limit = TG_CAPTION_LIMIT if row["kind"] in ("photo", "album") else TG_LIMIT
         return _shorten(render(post_format, {**raw_values, "ai": ai_text}, escape=True), limit)
+
+    async def republish_post(self, post_id: int, text: str,
+                             expected_message_id: int | None = None) -> str | None:
+        """Публикует уже существующий пост заново отдельным сообщением — на
+        случай, когда исходное сообщение удалено из канала вручную и правка
+        (/posts/{id}/save → _apply_edit) отвечает MESSAGE_ID_INVALID: Telegram
+        не даёт редактировать то, чего больше нет, а другого способа вернуть
+        текст в канал у обычной правки нет.
+
+        Байты картинок исходной публикации нигде не хранились (см. Post —
+        для многокартиночных лент это временные скачанные данные, не файл на
+        диске), поэтому картинки качаем заново со страницы новости — так же,
+        как при самой первой публикации в build_post.
+
+        text — уже готовый, отформатированный текст (из формы веб-панели),
+        через модель заново не прогоняется — для этого есть /regen отдельно.
+
+        Защита от двойной отправки: in-memory лок на время запроса плюс
+        expected_message_id — message_id, с которого форма предлагала
+        переопубликовать. Если запись уже указывает на другое сообщение,
+        предыдущий клик дошёл до Telegram (ответ до браузера — нет), и
+        второй раз отправлять нечего. posted_recently(link) тут не годится:
+        он находит сам исходный пост, и если тот опубликован меньше
+        DUPLICATE_GUARD_SECONDS назад (удалили сразу после публикации —
+        типичный случай), переопубликация молча «удавалась» без отправки.
+        Возвращает None при успехе, иначе текст ошибки."""
+        row = self.st.post(post_id)
+        if row is None:
+            return "Пост не найден."
+        if expected_message_id is not None and row["message_id"] != expected_message_id:
+            return None
+        lock_key = f"republish:{post_id}"
+        if lock_key in self._manual_publish_locks:
+            return "Уже публикуется — подождите и обновите страницу."
+        self._manual_publish_locks.add(lock_key)
+        try:
+            feed = self.st.feed(row["feed_id"]) if row["feed_id"] else None
+            entry = Entry(key_parts=(row["link"] or f"post:{post_id}",), title=row["title"],
+                          link=row["link"], summary=row["summary"], published=row["published"],
+                          published_ts=0.0)
+            if self.multi_images_for(feed):
+                image_url, images = await self._images_of_page(entry)
+            else:
+                image_url, images = await self._image_of(entry), []
+            sent = await self._send(text, image=image_url, images=images)
+            if not sent:
+                return "Не удалось отправить сообщение в канал — подробности в логе бота."
+            messages = sent if isinstance(sent, list) else [sent]
+            first = messages[0]
+            kind = "album" if len(messages) > 1 else ("photo" if first.photo else "text")
+            self.st.republish_post(
+                post_id, chat_id=str(first.chat.id), message_id=first.message_id, kind=kind,
+                text=text, extra_message_ids=",".join(str(m.message_id) for m in messages[1:]),
+            )
+            # Как и при обычной публикации (_record_post) — заготовка для
+            # ручной публикации в VK админам в личку. Без этого шага republish
+            # тихо выпадал из общего правила «каждая новость в канале — это и
+            # пересланная админам заготовка для VK», хотя внешне выглядел как
+            # обычная успешная публикация.
+            await self._send_vk_ready_safe(
+                Post(text=text, image=image_url, images=images, link=row["link"]))
+            return None
+        finally:
+            self._manual_publish_locks.discard(lock_key)
 
     async def set_model_tested(self, name: str) -> str | None:
         """/setmodel: переключает модель обычного LLM, только если она
@@ -1127,7 +1242,9 @@ class Publisher:
             kind = "photo"
         else:
             kind = "text"
-        await self._send_vk_ready(post)
+        # Сначала запись в базу, потом заготовка для VK: пересылка качает
+        # картинку и шлёт по сообщению каждому админу — пока она идёт, пост
+        # должен уже быть виден posted_recently (защита от повторного клика).
         self.st.add_post(
             feed_id=feed_id,
             chat_id=str(first.chat.id),
@@ -1144,6 +1261,16 @@ class Publisher:
             # удаления отдельной картинки (/delimage, веб-панель).
             extra_message_ids=",".join(str(m.message_id) for m in messages[1:]),
         )
+        await self._send_vk_ready_safe(post)
+
+    async def _send_vk_ready_safe(self, post: Post) -> None:
+        """_send_vk_ready, который никогда не роняет вызывающего: к этому
+        моменту новость уже в канале, сбой пересылки не должен выглядеть
+        как сбой публикации (и откатывать её учёт)."""
+        try:
+            await self._send_vk_ready(post)
+        except Exception:
+            log.exception("не удалось переслать админам заготовку для VK")
 
     def _drop_stale(self, feed_id: int, fresh: list[tuple[str, Entry]]
                     ) -> list[tuple[str, Entry]]:
@@ -1279,13 +1406,17 @@ class Publisher:
                 continue
             seen_links.add(link)
             ts = item.get("published_ts")
+            # Настоящая дата из выдачи (Bing) — сразу и строкой для
+            # {published}; псевдо-дата по порядку выдачи (Serper) строкой
+            # не показывается, её заменит datePublished со страницы.
+            published = format_ts(ts) if ts is not None else ""
             if ts is None:
                 ts = now - (len(items) - i)
             entries.append(Entry(key_parts=(link,), title="", link=link, summary="",
-                                 published="", published_ts=ts, image=""))
+                                 published=published, published_ts=ts, image=""))
         return FetchResult(entries=entries)
 
-    async def _hydrate_search_entries(self, fresh: list[tuple[str, Entry]]
+    async def _hydrate_search_entries(self, feed_id: int, fresh: list[tuple[str, Entry]]
                                       ) -> list[tuple[str, Entry]]:
         """Источник без RSS (search) даёт только адрес — заголовок, описание
         и картинку дочитываем со страницы самой статьи, по одной странице
@@ -1305,9 +1436,21 @@ class Publisher:
         for key, entry in fresh:
             full = await fetch_article_entry(entry.link, entry.published_ts, entry.published)
             if full is None:
-                log.info("статья не прочиталась, отложена: %s", entry.link[:90])
+                fails = self._hydrate_fails.get((feed_id, key), 0) + 1
+                if fails >= HYDRATE_MAX_FAILS and not self.debug:
+                    self._hydrate_fails.pop((feed_id, key), None)
+                    self.st.mark_seen(feed_id, key)
+                    log.warning("статья не прочиталась %s раз подряд, больше не пробую: %s",
+                                fails, entry.link[:90])
+                else:
+                    self._hydrate_fails[(feed_id, key)] = fails
+                    log.info("статья не прочиталась, отложена: %s", entry.link[:90])
                 continue
+            self._hydrate_fails.pop((feed_id, key), None)
             out.append((key, full))
+        if len(self._hydrate_fails) > 1000:
+            # Ссылки, выпавшие из выдачи поиска, сами отсюда не уходят.
+            self._hydrate_fails.clear()
         out.sort(key=lambda pair: pair[1].published_ts)
         return out
 
@@ -1646,8 +1789,13 @@ class Publisher:
             self.st.release_moderation(item_id, "канал недоступен или не задан")
             return "Не удалось опубликовать — канал недоступен или не задан."
         entry = self._moderation_entry(row)
-        await self._record_post(row["feed_id"], entry, feed, post, sent)
-        self.st.delete_moderation(item_id)
+        try:
+            await self._record_post(row["feed_id"], entry, feed, post, sent)
+        finally:
+            # Пост уже в канале — карточку убираем в любом случае. Если бы
+            # _record_post упал, карточка осталась бы в 'publishing', через
+            # PUBLISH_CLAIM_TTL её снова захватило бы расписание — дубль.
+            self.st.delete_moderation(item_id)
         return None
 
     async def run_scheduled_publishes(self) -> int:
@@ -2056,7 +2204,11 @@ class Publisher:
             except TelegramBadRequest as exc:
                 if not self._is_markup_error(exc):
                     log.error("не удалось отправить в %s: %s", target, exc)
-                    self._mark_blocked(target)
+                    # Весь проход обрываем только за отказ по адресату (как в
+                    # _send_photo/_send_media_group) — иначе одна «плохая»
+                    # новость останавливала бы все ленты после неё каждый цикл.
+                    if self._is_delivery_error(exc):
+                        self._mark_blocked(target)
                     return None
                 # Разметку Telegram не принял (обычно из-за /setformat).
                 # Публикуем текстом, иначе новость зависнет и будет

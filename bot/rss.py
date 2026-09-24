@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import calendar
 import html
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -93,6 +94,12 @@ class FetchResult:
     error: str | None = None
 
 
+def format_ts(ts: float) -> str:
+    """Дата публикации для плейсхолдера {published} — один формат для
+    RSS-лент и сайтов без RSS."""
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
 def _published(entry) -> tuple[str, float]:
     for field in ("published_parsed", "updated_parsed", "created_parsed"):
         parsed = entry.get(field)
@@ -100,8 +107,7 @@ def _published(entry) -> tuple[str, float]:
             try:
                 # feedparser отдаёт struct_time уже в UTC — timegm, не mktime.
                 ts = float(calendar.timegm(parsed))
-                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                return dt.strftime("%Y-%m-%d %H:%M UTC"), ts
+                return format_ts(ts), ts
             except (OverflowError, ValueError):
                 continue
     for field in ("published", "updated"):
@@ -538,6 +544,20 @@ def image_dedup_key(url: str) -> str:
     """Ключ для сравнения «на самом деле одна и та же картинка»."""
     path = url.split("?", 1)[0].split("#", 1)[0]
     path = re.sub(r"^https?://", "", path, flags=re.I)
+    host = path.split("/", 1)[0].lower()
+    if "squarespace" in host:
+        # Squarespace отдаёт один и тот же файл под двумя СТРУКТУРНО разными
+        # путями с разными хешами: images.squarespace-cdn.com/content/v1/
+        # <site>/<hash>/<file> — это то, что лежит в RSS-ленте (entry.image,
+        # см. _image()); staticN.squarespace.com/static/<site>/t/<hash>/
+        # <ts>/<file> — это то, что в og:image/теле самой страницы
+        # (page_images). Пути целиком поэтому никогда не совпадают, и без
+        # этой ветки одна и та же картинка новости считалась двумя разными
+        # и попадала в альбом дважды (см. дубль первой картинки у Wyrd
+        # Games — на этом сайте это происходит с любой новостью, не только
+        # с конкретной). Сравниваем по имени файла — оно у Squarespace
+        # одинаковое в обоих представлениях, это исходное имя загрузки.
+        return path.rsplit("/", 1)[-1].lower()
     path = _RESIZE_SUFFIX_RE.sub("", path)
     return path.lower()
 
@@ -716,7 +736,118 @@ async def page_images(url: str, limit: int = MAX_ARTICLE_IMAGES) -> list[str]:
         seen.add(dedup_key)
         body_ordered.append(candidate)
 
+    if not body_ordered:
+        # На сайтах-конструкторах (см. _blog_data_post) в статичном HTML
+        # вообще нет <img> тела — сама статья дорисовывается JS из блока
+        # window._BLOG_DATA. og:image в таком случае — обложка/кадр видео,
+        # а не иллюстрация статьи, поэтому проверяем блог-данные РАНЬШЕ
+        # meta_ordered, а не после.
+        if post := _blog_data_post(page):
+            blog_images = []
+            blog_seen: set[str] = set()
+            for candidate in _blog_data_images(post, url):
+                dedup_key = image_dedup_key(candidate)
+                if dedup_key in blog_seen:
+                    continue
+                blog_seen.add(dedup_key)
+                blog_images.append(candidate)
+                if len(blog_images) >= limit:
+                    break
+            if blog_images:
+                return blog_images
+
     return body_ordered or meta_ordered[:limit]
+
+
+def _blog_data_post(page: str) -> dict | None:
+    """window._BLOG_DATA — данные для JS-виджета блога на сайтах-
+    конструкторах (Go Daddy Website Builder — ttcommunity.co.uk и похожие):
+    RSS и og-теги для таких статей отдают только первую фразу вступления
+    (см. og:description на этих сайтах), настоящий текст и иллюстрации
+    тела статьи лежат только тут, в Draft.js-формате — их не видно ни в
+    RSS, ни в обычных <img> страницы (см. _body_images)."""
+    marker = "window._BLOG_DATA="
+    i = page.find(marker)
+    if i == -1:
+        return None
+    try:
+        data, _ = json.JSONDecoder().raw_decode(page, i + len(marker))
+    except ValueError:
+        return None
+    post = data.get("post") if isinstance(data, dict) else None
+    return post if isinstance(post, dict) else None
+
+
+def _blog_data_full_content(post: dict) -> dict | None:
+    raw = post.get("fullContent")
+    if not raw:
+        return None
+    try:
+        fc = json.loads(raw)
+    except ValueError:
+        return None
+    return fc if isinstance(fc, dict) else None
+
+
+def _blog_data_text(post: dict) -> str:
+    fc = _blog_data_full_content(post)
+    if fc:
+        parts = [b.get("text", "") for b in fc.get("blocks", []) if isinstance(b, dict)]
+        text = "\n".join(p for p in parts if p).strip()
+        if text:
+            return text
+    return strip_html(post.get("content") or "")
+
+
+def _blog_data_images(post: dict, article_url: str) -> list[str]:
+    images: list[str] = []
+    fc = _blog_data_full_content(post)
+    if fc:
+        for ent in (fc.get("entityMap") or {}).values():
+            if not isinstance(ent, dict) or ent.get("type") != "IMAGE":
+                continue
+            src = (ent.get("data") or {}).get("src")
+            if src:
+                images.append(urljoin(article_url, src))
+    if not images and post.get("featuredImage"):
+        images.append(urljoin(article_url, post["featuredImage"]))
+    return images
+
+
+async def article_text(url: str) -> str | None:
+    """Полный текст статьи со страницы — на случай, когда RSS отдаёт только
+    огрызок вступления (см. _blog_data_post). Вызывается один раз, только
+    для записей с подозрительно коротким summary, прямо перед тем, как
+    отдать новость модели (см. Publisher.build_post_text).
+
+    None — страница не прочиталась или на ней нет такого блока. Пустая
+    строка не возвращается: решение, использовать ли результат (сравнивая
+    длину с тем, что уже есть), остаётся за вызывающим кодом.
+    """
+    if not url.lower().startswith(("http://", "https://")):
+        return None
+    try:
+        async with _http().get(url, headers={"User-Agent": PAGE_UA}) as resp:
+            if resp.status != 200:
+                return None
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if ctype and "html" not in ctype:
+                return None
+            buf = bytearray()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                buf += chunk
+                if len(buf) >= ARTICLE_LIMIT:
+                    break
+    except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeDecodeError):
+        return None
+    except Exception:
+        log.debug("не удалось прочитать страницу %s", url, exc_info=True)
+        return None
+
+    post = _blog_data_post(buf.decode("utf-8", "replace"))
+    if post is None:
+        return None
+    return _blog_data_text(post) or None
 
 
 # Telegram сам режет фото крупнее 10 МБ при отправке (sendPhoto/sendMediaGroup);
@@ -885,7 +1016,10 @@ async def fetch_article_entry(url: str, published_ts: float, published: str) -> 
     if m := _JSONLD_DATE_RE.search(page):
         real_ts = _parse_iso_date(m.group(1))
         if real_ts is not None:
+            # Строку тоже — иначе {published} в промпте оставался пустым
+            # (или синтетическим), хотя настоящая дата уже известна.
             published_ts = real_ts
+            published = format_ts(real_ts)
 
     head_end = page.lower().find("</head")
     head = page[:head_end] if head_end != -1 else page

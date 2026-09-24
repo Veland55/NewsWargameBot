@@ -7,8 +7,6 @@ from __future__ import annotations
 import sqlite3
 import time
 
-import pytest
-
 from bot.db import DEFAULTS, Storage, entry_key
 
 

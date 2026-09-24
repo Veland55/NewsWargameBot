@@ -673,6 +673,22 @@ class Storage:
             )
             self._conn.commit()
 
+    def republish_post(self, post_id: int, *, chat_id: str, message_id: int, kind: str,
+                       text: str, extra_message_ids: str = "") -> None:
+        """Переключает уже существующую запись поста на новое сообщение —
+        когда старое удалено из канала вручную (Telegram отвечает
+        MESSAGE_ID_INVALID на попытку править) и вместо правки текст
+        отправлен заново отдельным сообщением (см. Publisher.republish_post).
+        posted_at сдвигается на текущее время — это и есть момент публикации
+        нового сообщения; edited_at сбрасывается, оно свежее, а не «правленое»."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE posts SET chat_id = ?, message_id = ?, kind = ?, text = ?, "
+                "extra_message_ids = ?, posted_at = ?, edited_at = NULL WHERE id = ?",
+                (chat_id, message_id, kind, text, extra_message_ids, int(time.time()), post_id),
+            )
+            self._conn.commit()
+
     def prune_posts(self, keep: int = 500) -> None:
         with self._lock:
             self._conn.execute(

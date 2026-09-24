@@ -136,7 +136,7 @@ def verify_telegram_init_data(init_data: str, bot_token: str) -> dict | None:
     check_string = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
     secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
     computed_hash = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(computed_hash, received_hash):
+    if not _secret_eq(computed_hash, received_hash):
         return None
     try:
         auth_date = int(data.get("auth_date", "0"))
@@ -149,6 +149,15 @@ def verify_telegram_init_data(init_data: str, bot_token: str) -> dict | None:
     except ValueError:
         return None
     return user if isinstance(user, dict) and "id" in user else None
+
+
+def _secret_eq(given: str, expected: str) -> bool:
+    """Сравнение секрета за постоянное время. secrets.compare_digest на str
+    с не-ASCII символами бросает TypeError — пароль, набранный в русской
+    раскладке (или содержащий кириллицу сам по себе), ронял вход в 500,
+    а неудачная попытка при этом не попадала в счётчик блокировки.
+    Сравниваем байты — там ограничения нет."""
+    return secrets.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
 
 
 def _e(text: object) -> str:
@@ -233,6 +242,10 @@ class WebAuth:
 
     def record_fail(self, ip: str) -> None:
         now = time.time()
+        # Истёкшие записи чистим здесь же — иначе словарь рос бы на каждый
+        # новый адрес, с которого хоть раз ошиблись паролем, до перезапуска.
+        for stale_ip in [k for k, (_, r) in self._fails.items() if now > r]:
+            self._fails.pop(stale_ip, None)
         count, reset_at = self._fails.get(ip, (0, now + LOGIN_LOCKOUT))
         if now > reset_at:
             count, reset_at = 0, now + LOGIN_LOCKOUT
@@ -242,7 +255,7 @@ class WebAuth:
         self._fails.pop(ip, None)
 
     def check(self, password: str) -> bool:
-        return bool(self.password) and secrets.compare_digest(password, self.password)
+        return bool(self.password) and _secret_eq(password, self.password)
 
     def new_session(self) -> str:
         token = secrets.token_urlsafe(32)
@@ -1227,8 +1240,11 @@ document.addEventListener('DOMContentLoaded', function () {{
 </body></html>"""
 
 
-def _redirect(path: str) -> web.HTTPFound:
-    return web.HTTPFound(path)
+def _redirect(path: str) -> web.Response:
+    """302 обычным ответом. Возвращать web.HTTPFound из обработчика aiohttp
+    объявил устаревшим (DeprecationWarning, будет удалено) — после
+    обновления перестали бы работать все редиректы панели."""
+    return web.Response(status=302, headers={"Location": path})
 
 
 def _gone_page(title: str, message: str, status: int = 404,
@@ -1285,15 +1301,17 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
     @web.middleware
     async def bad_id_middleware(request: web.Request, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]):
-        # Роуты вида /posts/{id}, /feeds/{id}/... делают int(match_info["id"])
-        # без проверки — нечисловой id (ссылка вручную, битая закладка) иначе
-        # ронял бы запрос в голый 500 вместо понятного «не найдено».
+        # Нечисловой id в адресе отсекает сам роутер ({id:[0-9]{1,18}}, см. маршруты
+        # ниже) — это обычный 404; 19+ цифр не влезают в INTEGER SQLite
+        # (OverflowError → 500), поэтому длина тоже ограничена. ValueError отсюда, значит, уже не «битая
+        # ссылка», а ошибка в коде или во вводе: раньше она молча выдавалась
+        # за «некорректный идентификатор» и не попадала в журнал вовсе.
         try:
             return await handler(request)
         except ValueError:
-            if request.path.startswith("/api/"):
-                return web.json_response({"ok": False, "error": "bad_id"}, status=400)
-            return _gone_page("Не найдено", "Некорректный идентификатор в адресе.")
+            log.exception("ошибка обработки %s %s", request.method, request.path)
+            return _gone_page("Ошибка", "Не удалось обработать запрос — подробности в журнале бота.",
+                              status=400)
         except web.HTTPNotFound as exc:
             # Хендлеры делают `raise web.HTTPNotFound(text="...")` (запись уже
             # удалена/обработана — обычное дело для очередей на разбор, не
@@ -1320,16 +1338,6 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
     @web.middleware
     async def auth_middleware(request: web.Request, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]):
-        # /api/* — машинный клиент (десктоп-приложение синхронизации), не браузер:
-        # ни cookie-сессии, ни CSRF-токена у него нет и не может быть. Отдельная
-        # авторизация тем же паролем панели, но как Bearer-токен в заголовке —
-        # тот же секрет, тот же уровень доступа, что и у входа в саму панель.
-        if request.path.startswith("/api/"):
-            given = request.headers.get("Authorization", "")
-            token = given[7:] if given.startswith("Bearer ") else ""
-            if not password or not secrets.compare_digest(token, password):
-                return web.json_response({"error": "unauthorized"}, status=401)
-            return await handler(request)
         if request.path in PUBLIC_PATHS:
             return await handler(request)
         session = auth.verify(request.cookies.get(SESSION_COOKIE))
@@ -1340,7 +1348,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         request["csrf"] = session["csrf"]
         if request.method == "POST":
             form = await request.post()
-            if not secrets.compare_digest(str(form.get("csrf", "")), session["csrf"]):
+            if not _secret_eq(str(form.get("csrf", "")), session["csrf"]):
                 # Голый текст без стилей и без выхода — тупик для Telegram
                 # Mini App, где назад можно уйти только системным жестом.
                 body = ('<div class="card"><p>Токен формы устарел — обычно значит, что страница была'
@@ -1351,6 +1359,16 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         return await handler(request)
 
     app.middlewares.append(auth_middleware)
+
+    def _wanted_flag(request: web.Request, current: bool) -> bool:
+        """Какое состояние переключателя просили. Форма передаёт его явно
+        (value=1/0), а не «инвертировать»: двойной клик или повторная
+        отправка формы на медленной сети иначе молча возвращали тумблер
+        обратно. Без value (старая вкладка) — прежнее поведение."""
+        value = str(request["form"].get("value", ""))
+        if value in ("0", "1"):
+            return value == "1"
+        return not current
 
     def csrf_field(request: web.Request) -> str:
         return f'<input type="hidden" name="csrf" value="{_e(request["csrf"])}">'
@@ -1415,6 +1433,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         try:
             payload = await request.json()
         except Exception:
+            return web.json_response({"ok": False, "error": "bad_request"}, status=400)
+        if not isinstance(payload, dict):
             return web.json_response({"ok": False, "error": "bad_request"}, status=400)
         user = verify_telegram_init_data(str(payload.get("initData", "")), bot.token)
         if user is None:
@@ -1482,6 +1502,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           </div>
           <div class="row" style="margin:0;">
             <form method="post" action="/pause"><input type="hidden" name="csrf" value="{_e(request['csrf'])}">
+              <input type="hidden" name="value" value="{'0' if paused else '1'}">
               <button class="{'primary' if paused else ''}" type="submit">
                 {'▶️ Возобновить' if paused else '⏸ Приостановить'}
               </button></form>
@@ -1497,7 +1518,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
     async def pause_post(request: web.Request) -> web.Response:
         st: Storage = app["st"]
-        st.set("paused", "0" if st.get("paused") == "1" else "1")
+        st.set("paused", "1" if _wanted_flag(request, st.get("paused") == "1") else "0")
         return _redirect("/")
 
     async def checknow_post(request: web.Request) -> web.Response:
@@ -1658,8 +1679,10 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           <div class="list-item-actions">
             <a class="btn icon" href="/feeds/{f['id']}/template" title="Свой промпт" aria-label="Свой промпт">🤖</a>
             <form class="inline" method="post" action="/feeds/{f['id']}/multiimages">{csrf_field(request)}
+              <input type="hidden" name="value" value="{'0' if f['multi_images'] else '1'}">
               <button class="icon" type="submit" title="{multi_label}" aria-label="{multi_label}">🖼</button></form>
             <form class="inline" method="post" action="/feeds/{f['id']}/toggle">{csrf_field(request)}
+              <input type="hidden" name="value" value="{'0' if f['enabled'] else '1'}">
               <button class="icon" type="submit" title="{toggle_label}" aria-label="{toggle_label}">{'⏸' if f['enabled'] else '▶️'}</button></form>
             <form class="inline" method="post" action="/feeds/{f['id']}/delete"
                   onsubmit="return tgConfirmSubmit(this, 'Удалить #{f['id']}?')">{csrf_field(request)}
@@ -1803,7 +1826,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         st: Storage = app["st"]
         row = st.feed(feed_id)
         if row is not None:
-            st.set_enabled(feed_id, not row["enabled"])
+            st.set_enabled(feed_id, _wanted_flag(request, bool(row["enabled"])))
         return _redirect("/feeds")
 
     async def feeds_toggle_multi(request: web.Request) -> web.Response:
@@ -1811,7 +1834,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         st: Storage = app["st"]
         row = st.feed(feed_id)
         if row is not None:
-            st.set_multi_images(feed_id, not row["multi_images"])
+            st.set_multi_images(feed_id, _wanted_flag(request, bool(row["multi_images"])))
         return _redirect("/feeds")
 
     # --- свой промпт для отдельной ленты ----------------------------------
@@ -2096,6 +2119,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
           <div class="line">Сейчас: <span class="pill {'on' if pub.debug else 'neutral'}">{debug_state}</span></div>
           <p class="muted">Посты уходят в личку админам вместо канала, автоцикл в отладке молчит.</p>
           <form method="post" action="/settings/debug">{csrf_field(request)}
+            <input type="hidden" name="value" value="{'0' if pub.debug else '1'}">
             <div class="card-actions">
               <button class="{'' if pub.debug else 'primary'}" type="submit">
                 {'Выключить' if pub.debug else 'Включить отладку'}</button>
@@ -2167,7 +2191,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
     async def settings_debug(request: web.Request) -> web.Response:
         st: Storage = app["st"]
-        st.set("debug", "0" if st.get("debug") == "1" else "1")
+        st.set("debug", "1" if _wanted_flag(request, st.get("debug") == "1") else "0")
         return _redirect("/settings")
 
     async def settings_moderation(request: web.Request) -> web.Response:
@@ -2178,7 +2202,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         флеш-сообщения тут же сами себя поправляли текстом «см. «Публикация»
         в меню». Теперь тумблер и лимиты живут там же, где очередь."""
         st: Storage = app["st"]
-        turning_on = st.get("moderation") != "1"
+        turning_on = _wanted_flag(request, st.get("moderation") == "1")
         st.set("moderation", "1" if turning_on else "0")
         # Редирект, не прямой рендер — см. комментарий у modflash в queue_get:
         # F5 на POST-ответе иначе переключал бы тумблер обратно молча.
@@ -2236,7 +2260,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                                          queue_n=st.count_moderation()), content_type="text/html")
 
     async def post_detail(request: web.Request, draft: str | None = None,
-                          flash: str = "", flash_kind: str = "ok") -> web.Response:
+                          flash: str = "", flash_kind: str = "ok",
+                          offer_republish: bool = False) -> web.Response:
         st: Storage = app["st"]
         post_id = int(request.match_info["id"])
         row = st.post(post_id)
@@ -2292,6 +2317,19 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             <div class="card-actions"><button class="primary" type="submit">Сохранить в канал</button></div>
           </form>
         </div>
+        {f'''<div class="card">
+          <div class="muted" style="margin-bottom:8px;">⚠️ Исходное сообщение этого поста не найдено в
+            канале — похоже, его удалили вручную. Править (кнопка выше) поэтому нечего. Можно вместо
+            этого опубликовать текущий текст отдельным новым сообщением — этот пост в панели станет
+            указывать на него.</div>
+          <form method="post" action="/posts/{row['id']}/republish"
+                onsubmit="return tgConfirmSubmit(this, 'Опубликовать текст как новое сообщение в канале?')">
+            {csrf_field(request)}
+            <input type="hidden" name="text" value="{_e(text)}">
+            <input type="hidden" name="from_msg" value="{row['message_id']}">
+            <button class="primary" type="submit">🆕 Опубликовать как новое сообщение</button>
+          </form>
+        </div>''' if offer_republish else ''}
         {images_card}
         <div class="card">
           <form method="post" action="/posts/{row['id']}/regen">{csrf_field(request)}
@@ -2335,10 +2373,40 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
         err = await _apply_edit(app["bot"], row, text)
         if err:
-            return await post_detail(request, draft=text, flash=err, flash_kind="err")
+            return await post_detail(request, draft=text, flash=err, flash_kind="err",
+                                     offer_republish=_message_gone(err))
         st.update_post_text(post_id, text)
         app["regen_drafts"].pop(post_id, None)
         return await post_detail(request, flash="Сохранено.")
+
+    async def post_republish(request: web.Request) -> web.Response:
+        st: Storage = app["st"]
+        pub: Publisher = app["publisher"]
+        post_id = int(request.match_info["id"])
+        row = st.post(post_id)
+        if row is None:
+            raise web.HTTPNotFound(text="Пост не найден")
+        text = str(request["form"].get("text", "")).strip()
+        if not text:
+            return await post_detail(request, flash="Пустой текст не сохранён.", flash_kind="err")
+        limit = TG_CAPTION_LIMIT if row["kind"] in ("photo", "album") else TG_LIMIT
+        if tg_len(text) > limit:
+            return await post_detail(request, draft=text, offer_republish=True,
+                                     flash=f"Текст длиннее лимита ({tg_len(text)} из {limit}) — не опубликовано.",
+                                     flash_kind="err")
+        problem = html_problem(text)
+        if problem:
+            problem = html_mod.unescape(problem)
+            return await post_detail(request, draft=text, offer_republish=True,
+                                     flash=f"Разметка не годится: {problem}", flash_kind="err")
+        from_msg = str(request["form"].get("from_msg", "")).strip()
+        expected = int(from_msg) if from_msg.isascii() and from_msg.isdigit() else None
+        err = await pub.republish_post(post_id, text, expected_message_id=expected)
+        if err:
+            return await post_detail(request, draft=text, flash=err, flash_kind="err",
+                                     offer_republish=True)
+        app["regen_drafts"].pop(post_id, None)
+        return await post_detail(request, flash="Опубликовано новым сообщением.")
 
     async def post_regen(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -2375,6 +2443,16 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if error:
             return await post_detail(request, flash=error, flash_kind="err")
         return await post_detail(request, flash="Картинка удалена.")
+
+    def _message_gone(err: str) -> bool:
+        """Отличает «сообщение удалено из канала вручную» от прочих отказов
+        правки (нет прав, разметка, «текст не изменился») — Telegram в этом
+        случае отвечает MESSAGE_ID_INVALID (edit_message_caption) или
+        "message to edit not found" (edit_message_text). Только тогда есть
+        смысл предлагать republish — во всех остальных случаях повторная
+        отправка тоже ни к чему не приведёт."""
+        low = err.lower()
+        return "message_id_invalid" in low or "message to edit not found" in low
 
     async def _apply_edit(bot_: Bot, row, text: str) -> str | None:
         try:
@@ -2737,6 +2815,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
               одобрения здесь, кроме отложенных на конкретное время: те публикуются сами по
               расписанию, даже на паузе. {'В отладке не действует.' if pub.debug else ''}</p>
             <form method="post" action="/settings/moderation">{csrf_field(request)}
+              <input type="hidden" name="value" value="{'0' if pub.moderation else '1'}">
               <div class="card-actions" style="margin-bottom:14px;">
                 <button class="{'' if pub.moderation else 'primary'}" type="submit">
                   {'Выключить согласование' if pub.moderation else 'Включить согласование'}</button>
@@ -2767,6 +2846,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             <p class="muted" style="margin:0 0 10px;">Новость, похожая на уже опубликованную с другой
               ленты (или ждущую согласования выше), сама в канал не уходит — ждёт разбора ниже.</p>
             <form method="post" action="/queue/dedup-toggle">{csrf_field(request)}
+              <input type="hidden" name="value" value="{'0' if dedup_on else '1'}">
               <div class="card-actions" style="margin-bottom:14px;">
                 <button class="{'' if dedup_on else 'primary'}" type="submit">
                   {'Выключить дедупликацию' if dedup_on else 'Включить дедупликацию'}</button>
@@ -2880,18 +2960,21 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             )
             gallery = (f'<div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(100px,1fr)); '
                       f'gap:8px; margin-top:10px;">{thumbs}</div>'
-                      f'<div class="muted" style="margin-top:4px;">Альбом — уйдёт без подписи под каждой '
-                      f'картинкой, текст отдельным сообщением следом.</div>' if len(urls) > 1 else "")
+                      f'<div class="muted" style="margin-top:4px;">Альбом — текст до {TG_CAPTION_LIMIT} символов '
+                      f'станет подписью к первой картинке, длиннее — уйдёт отдельным сообщением '
+                      f'следом.</div>' if len(urls) > 1 else "")
 
         album_branch = row["multi"] and len(urls) > 1
-        caption_note = ("Альбом — картинки уйдут без общей подписи, текст отдельным сообщением следом."
+        # Так же, как решает Publisher._send: подпись влезает — она на
+        # первой картинке альбома, не влезает — текст отдельным сообщением.
+        caption_note = (f"Альбом с текстом длиннее {TG_CAPTION_LIMIT} — картинки уйдут без подписи, "
+                        f"текст отдельным сообщением следом."
                         if album_branch else
                         f"С картинкой и текстом длиннее {TG_CAPTION_LIMIT} — уйдёт текстом, "
                         f"картинка станет превью-ссылкой над ним.")
-        # warn=TG_CAPTION_LIMIT только вне альбома — именно там текст длиннее
-        # этого порога молча меняет форму поста (см. caption_note выше),
-        # у альбома общий лимит один — TG_LIMIT, без промежуточного порога.
-        counter_html = _char_counter_html(text, TG_LIMIT, warn=None if album_branch else TG_CAPTION_LIMIT)
+        # warn=TG_CAPTION_LIMIT и для альбома: за этим порогом пост меняет
+        # форму в обоих случаях (см. caption_note выше и Publisher._send).
+        counter_html = _char_counter_html(text, TG_LIMIT, warn=TG_CAPTION_LIMIT)
 
         body = f"""
         <div><a href="{_e(back_href)}" class="back-link">‹ Публикация</a></div>
@@ -3025,7 +3108,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         """Номер страницы списка, с которой открыли карточку — только цифры,
         чтобы не тащить произвольный текст в query string."""
         v = str(request["form"].get("page", "")).strip()
-        return v if v.isdigit() else ""
+        return v if v.isascii() and v.isdigit() else ""
 
     def _query_page(request: web.Request) -> str:
         """То же самое, но из query (?page=) в queue_detail/queue_regen —
@@ -3035,7 +3118,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         hidden-поле. Только цифры закрывают инъекцию в любом из трёх
         контекстов сразу, надёжнее точечного экранирования каждого."""
         v = str(request.query.get("page", "")).strip()
-        return v if v.isdigit() else ""
+        return v if v.isascii() and v.isdigit() else ""
 
     def _refuse_if_publishing(row: sqlite3.Row) -> str | None:
         """claim_moderation переводит карточку в status='publishing' на время
@@ -3318,7 +3401,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
 
     async def queue_dedup_toggle(request: web.Request) -> web.Response:
         st: Storage = app["st"]
-        turning_on = st.get("dedup_enabled") != "1"
+        turning_on = _wanted_flag(request, st.get("dedup_enabled") == "1")
         st.set("dedup_enabled", "1" if turning_on else "0")
         # Редирект — см. modflash в queue_get: та же причина (F5 на прямом
         # рендере POST-ответа переключал бы тумблер обратно молча).
@@ -3394,12 +3477,12 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_get("/feeds", feeds_get)
     app.router.add_post("/feeds/add", feeds_add)
     app.router.add_post("/feeds/add-search", feeds_add_search)
-    app.router.add_post("/feeds/{id}/delete", feeds_delete)
-    app.router.add_post("/feeds/{id}/toggle", feeds_toggle)
-    app.router.add_post("/feeds/{id}/multiimages", feeds_toggle_multi)
-    app.router.add_get("/feeds/{id}/template", feed_template_get)
-    app.router.add_post("/feeds/{id}/template", feed_template_post)
-    app.router.add_post("/feeds/{id}/template/reset", feed_template_reset)
+    app.router.add_post("/feeds/{id:[0-9]{1,18}}/delete", feeds_delete)
+    app.router.add_post("/feeds/{id:[0-9]{1,18}}/toggle", feeds_toggle)
+    app.router.add_post("/feeds/{id:[0-9]{1,18}}/multiimages", feeds_toggle_multi)
+    app.router.add_get("/feeds/{id:[0-9]{1,18}}/template", feed_template_get)
+    app.router.add_post("/feeds/{id:[0-9]{1,18}}/template", feed_template_post)
+    app.router.add_post("/feeds/{id:[0-9]{1,18}}/template/reset", feed_template_reset)
     app.router.add_get("/content", content_get)
     app.router.add_post("/content/prompt", content_prompt_post)
     app.router.add_post("/content/prompt/reset", content_prompt_reset)
@@ -3413,166 +3496,31 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_post("/settings/moderation", settings_moderation)
     app.router.add_post("/settings/ai", settings_ai)
     app.router.add_get("/posts", posts_get)
-    app.router.add_get("/posts/{id}", post_detail)
-    app.router.add_post("/posts/{id}/save", post_save)
-    app.router.add_post("/posts/{id}/regen", post_regen)
-    app.router.add_post("/posts/{id}/image/{msg_id}/delete", post_delete_image)
-    app.router.add_get("/duplicates/{id}", duplicate_detail)
-    app.router.add_post("/duplicates/{id}/publish", duplicate_publish)
-    app.router.add_post("/duplicates/{id}/delete", duplicate_delete)
-    app.router.add_get("/postponed/{id}", postponed_detail)
-    app.router.add_post("/postponed/{id}/retry", postponed_retry)
-    app.router.add_post("/postponed/{id}/delete", postponed_delete)
+    app.router.add_get("/posts/{id:[0-9]{1,18}}", post_detail)
+    app.router.add_post("/posts/{id:[0-9]{1,18}}/save", post_save)
+    app.router.add_post("/posts/{id:[0-9]{1,18}}/republish", post_republish)
+    app.router.add_post("/posts/{id:[0-9]{1,18}}/regen", post_regen)
+    app.router.add_post("/posts/{id:[0-9]{1,18}}/image/{msg_id:[0-9]{1,18}}/delete", post_delete_image)
+    app.router.add_get("/duplicates/{id:[0-9]{1,18}}", duplicate_detail)
+    app.router.add_post("/duplicates/{id:[0-9]{1,18}}/publish", duplicate_publish)
+    app.router.add_post("/duplicates/{id:[0-9]{1,18}}/delete", duplicate_delete)
+    app.router.add_get("/postponed/{id:[0-9]{1,18}}", postponed_detail)
+    app.router.add_post("/postponed/{id:[0-9]{1,18}}/retry", postponed_retry)
+    app.router.add_post("/postponed/{id:[0-9]{1,18}}/delete", postponed_delete)
     app.router.add_get("/queue", queue_get)
-    app.router.add_get("/queue/{id}", queue_detail)
-    app.router.add_post("/queue/{id}/save", queue_save)
-    app.router.add_post("/queue/{id}/publish", queue_publish)
-    app.router.add_post("/queue/{id}/reject", queue_reject)
-    app.router.add_post("/queue/{id}/regen", queue_regen)
-    app.router.add_post("/queue/{id}/schedule", queue_schedule)
-    app.router.add_post("/queue/{id}/unschedule", queue_unschedule)
-    app.router.add_post("/queue/{id}/preview", queue_preview)
+    app.router.add_get("/queue/{id:[0-9]{1,18}}", queue_detail)
+    app.router.add_post("/queue/{id:[0-9]{1,18}}/save", queue_save)
+    app.router.add_post("/queue/{id:[0-9]{1,18}}/publish", queue_publish)
+    app.router.add_post("/queue/{id:[0-9]{1,18}}/reject", queue_reject)
+    app.router.add_post("/queue/{id:[0-9]{1,18}}/regen", queue_regen)
+    app.router.add_post("/queue/{id:[0-9]{1,18}}/schedule", queue_schedule)
+    app.router.add_post("/queue/{id:[0-9]{1,18}}/unschedule", queue_unschedule)
+    app.router.add_post("/queue/{id:[0-9]{1,18}}/preview", queue_preview)
     app.router.add_post("/queue/undo", queue_undo)
     app.router.add_post("/queue/broadcast", queue_broadcast)
     app.router.add_post("/queue/settings", queue_settings)
     app.router.add_post("/queue/dedup-toggle", queue_dedup_toggle)
     app.router.add_post("/queue/dedup-settings", queue_dedup_settings)
-
-    # ======================== JSON API для синхронизации с внешними клиентами ========================
-    # Отдельная авторизация (Bearer-токен = тот же WEB_PANEL_PASSWORD, см.
-    # auth_middleware) — без cookie-сессии и CSRF, рассчитано на машинного
-    # клиента (десктоп-приложение), а не на браузер. Бизнес-логика не
-    # дублируется: те же st.*/pub.* методы, что и у HTML-обработчиков выше,
-    # просто ответ в JSON вместо страницы.
-    async def api_ping(request: web.Request) -> web.Response:
-        pub: Publisher = app["publisher"]
-        return web.json_response({"ok": True, "channel": pub.channel or ""})
-
-    async def api_config(request: web.Request) -> web.Response:
-        st: Storage = app["st"]
-        pub: Publisher = app["publisher"]
-        return web.json_response({
-            "telegram_bot_token": bot.token,
-            "telegram_channel_id": pub.channel or "",
-            "template": st.get("template"),
-            "post_format": st.get("post_format"),
-            "interval_minutes": st.get_int("interval"),
-            "max_per_cycle": st.get_int("max_per_cycle"),
-            "max_age_days": st.get_int("max_age_days"),
-            "llm_base_url": pub.llm.base_url,
-            "llm_api_key": pub.llm.api_key,
-            "llm_model": pub.llm.model,
-        })
-
-    async def api_feeds(request: web.Request) -> web.Response:
-        st: Storage = app["st"]
-        rows = st.feeds()
-        return web.json_response([
-            {
-                "id": r["id"],
-                "url": r["url"],
-                "title": r["title"],
-                "enabled": bool(r["enabled"]),
-                "template": r["template"] or "",
-            }
-            for r in rows
-        ])
-
-    async def api_queue(request: web.Request) -> web.Response:
-        st: Storage = app["st"]
-        rows = st.moderation_list(limit=200)
-        return web.json_response([
-            {
-                "id": r["id"],
-                "feed_id": r["feed_id"],
-                "feed_title": r["feed_title"] or "",
-                "key": r["key"],
-                "title": r["title"],
-                "summary": r["summary"],
-                "link": r["link"],
-                "source": r["source"],
-                "published": r["published"],
-                "image": r["image"],
-                "text": r["text"],
-                "status": r["status"],
-                "queued_at": r["queued_at"],
-                "scheduled_at": r["scheduled_at"],
-            }
-            for r in rows
-        ])
-
-    async def api_queue_save(request: web.Request) -> web.Response:
-        st: Storage = app["st"]
-        item_id = int(request.match_info["id"])
-        row = st.moderation_item(item_id)
-        if row is None:
-            return web.json_response({"ok": False, "error": "not_found"}, status=404)
-        body = await request.json()
-        text = str(body.get("text", "")).strip()
-        if not text:
-            return web.json_response({"ok": False, "error": "empty_text"}, status=400)
-        if tg_len(text) > TG_LIMIT:
-            return web.json_response({"ok": False, "error": "too_long"}, status=400)
-        problem = html_problem(text)
-        if problem:
-            return web.json_response({"ok": False, "error": "bad_markup", "detail": html_mod.unescape(problem)},
-                                     status=400)
-        st.update_moderation_text(item_id, text)
-        return web.json_response({"ok": True})
-
-    async def api_queue_publish(request: web.Request) -> web.Response:
-        st: Storage = app["st"]
-        pub: Publisher = app["publisher"]
-        item_id = int(request.match_info["id"])
-        row = st.moderation_item(item_id)
-        if row is None:
-            return web.json_response({"ok": False, "error": "not_found"}, status=404)
-        error = await pub.publish_moderated(item_id, actor="api")
-        if error:
-            return web.json_response({"ok": False, "error": error}, status=409)
-        return web.json_response({"ok": True})
-
-    async def api_queue_reject(request: web.Request) -> web.Response:
-        st: Storage = app["st"]
-        item_id = int(request.match_info["id"])
-        row = st.moderation_item(item_id)
-        if row is None:
-            return web.json_response({"ok": False, "error": "not_found"}, status=404)
-        guard = _refuse_if_publishing(row)
-        if guard:
-            return web.json_response({"ok": False, "error": "publishing"}, status=409)
-        st.delete_moderation(item_id)
-        return web.json_response({"ok": True})
-
-    async def api_queue_regen(request: web.Request) -> web.Response:
-        st: Storage = app["st"]
-        pub: Publisher = app["publisher"]
-        item_id = int(request.match_info["id"])
-        row = st.moderation_item(item_id)
-        if row is None:
-            return web.json_response({"ok": False, "error": "not_found"}, status=404)
-        guard = _refuse_if_publishing(row)
-        if guard:
-            return web.json_response({"ok": False, "error": "publishing"}, status=409)
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        extra = str(body.get("extra", "")).strip()
-        error = await pub.regen_moderated(item_id, extra)
-        if error:
-            return web.json_response({"ok": False, "error": error}, status=409)
-        fresh = st.moderation_item(item_id)
-        return web.json_response({"ok": True, "text": fresh["text"] if fresh else ""})
-
-    app.router.add_get("/api/ping", api_ping)
-    app.router.add_get("/api/config", api_config)
-    app.router.add_get("/api/feeds", api_feeds)
-    app.router.add_get("/api/queue", api_queue)
-    app.router.add_post("/api/queue/{id}/save", api_queue_save)
-    app.router.add_post("/api/queue/{id}/publish", api_queue_publish)
-    app.router.add_post("/api/queue/{id}/reject", api_queue_reject)
-    app.router.add_post("/api/queue/{id}/regen", api_queue_regen)
 
     return app
 
