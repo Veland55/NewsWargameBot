@@ -499,6 +499,12 @@ CHROME_CONTEXT_HINTS = (
     # <img src=...> без class вообще (см. _body_images) — этот признак их
     # не задевает.
     "object-cover-absolute",
+    # Магазины на Shopify (store.catalystgamelabs.com): под статьёй блога идут
+    # карусель «Our Latest Articles» (class="section-articles", стили
+    # section-latest-articles.css) и слайдер товаров «You May Also Like»
+    # (featured-products-slider / product-card) — фон виджета и карточки
+    # товаров ни к одной новости не относятся.
+    "latest-articles", "section-articles", "featured-products", "product-card",
 )
 # warhammer-community.com переиспользует одну и ту же React-компоненту
 # карточки для РАЗНЫХ виджетов — "shared-articleCard" (похожие статьи),
@@ -514,6 +520,32 @@ _SHARED_CARD_RE = re.compile(r"\bshared-\w*card\b", re.I)
 # WYSIWYG-тела) даже окно в 1000 символов назад не подхватывает ни одного
 # из хинтов CHROME_CONTEXT_HINTS/_SHARED_CARD_RE — ложных срабатываний не даёт.
 _CONTEXT_WINDOW = 1000
+# Контейнер текста самой статьи: rte — Shopify, entry-content/post-content —
+# WordPress и производные. Внутри него картинка-ссылка — это выбор автора
+# (обложка книги со ссылкой на анонс, товар со ссылкой в магазин), а не
+# карточка «читать также»: такие карточки живут вне текста статьи.
+_ARTICLE_BODY_RE = re.compile(
+    r"<(div|section|article)\b[^>]*\bclass\s*=\s*[\"'][^\"']*"
+    r"(?<![\w-])(rte|entry-content|post-content|article-body|article-content|article__content)(?![\w-])",
+    re.I,
+)
+
+
+def _article_body_span(page: str) -> tuple[int, int] | None:
+    """Границы первого контейнера текста статьи (см. _ARTICLE_BODY_RE):
+    от открывающего тега до парного закрывающего, по глубине вложенности
+    тегов того же имени. None — контейнера нет или он не закрыт."""
+    m = _ARTICLE_BODY_RE.search(page)
+    if not m:
+        return None
+    tag = m.group(1).lower()
+    tag_re = re.compile(rf"<(/?){tag}\b", re.I)
+    depth = 0
+    for t in tag_re.finditer(page, m.start()):
+        depth += -1 if t.group(1) else 1
+        if depth == 0:
+            return m.start(), t.start()
+    return None
 
 _TOKEN_RE = re.compile(
     r"<a\b[^>]*?\bhref\s*=\s*[\"']([^\"']*)[\"'][^>]*>"
@@ -582,6 +614,7 @@ def _body_images(page: str, article_url: str, primary_folder: str | None) -> lis
     out: list[str] = []
     anchor_stack: list[str] = []
     landmark_depth = 0
+    body_span = _article_body_span(page)
     for m in _TOKEN_RE.finditer(page):
         if m.group(1) is not None:            # <a href=...>
             anchor_stack.append(m.group(1))
@@ -605,7 +638,14 @@ def _body_images(page: str, article_url: str, primary_folder: str | None) -> lis
             continue
         url = urljoin(article_url, raw)
 
-        if anchor_stack and not anchor_stack[-1].strip().lower().startswith("javascript:"):
+        in_body = body_span is not None and body_span[0] <= m.start() < body_span[1]
+        # SVG — иконки и стрелки интерфейса, иллюстрацией новости не бывают;
+        # Telegram к тому же не принимает SVG как фото.
+        if url.split("?", 1)[0].split("#", 1)[0].lower().endswith(".svg"):
+            continue
+
+        if (anchor_stack and not in_body
+                and not anchor_stack[-1].strip().lower().startswith("javascript:")):
             # javascript: — открывает лайтбокс через обработчик клика, а не
             # переход на другую страницу; urljoin() иначе резолвил бы такой
             # href как отдельную «чужую» страницу и ронял свою же картинку.
