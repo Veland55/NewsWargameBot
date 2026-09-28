@@ -251,3 +251,62 @@ async def test_flood_guard_runs_before_dedup(storage: Storage, monkeypatch):
 
     await pub._process_feed(storage.feed(feed_id))
     assert storage.count_dedup_candidates() <= 1
+
+
+# --- × на миниатюре в карточке согласования (queue_image_delete) -----------
+
+_IMGS = ["https://x/a.jpg", "https://x/bg.png", "https://x/c.jpg"]
+
+
+async def test_queue_card_shows_delete_button_on_each_image(panel, storage: Storage):
+    client, _ = panel
+    await _login(client)
+    item_id = _queued_row(storage, image=_IMGS[0], extra_images="\n".join(_IMGS[1:]), multi=True)
+    html = await (await client.get(f"/queue/{item_id}")).text()
+    assert html.count(f'formaction="/queue/{item_id}/image-delete"') == 3
+
+
+async def test_queue_image_delete_removes_only_that_image(panel, storage: Storage):
+    client, _ = panel
+    csrf = await _login(client)
+    item_id = _queued_row(storage, image=_IMGS[0], extra_images="\n".join(_IMGS[1:]), multi=True)
+    resp = await client.post(f"/queue/{item_id}/image-delete",
+                             data={"csrf": csrf, "url": _IMGS[1], "text": "пост"})
+    assert resp.status == 200
+    row = storage.moderation_item(item_id)
+    assert row["image"] == _IMGS[0]
+    assert row["extra_images"] == _IMGS[2]
+
+
+async def test_queue_image_delete_first_image_promotes_next(panel, storage: Storage):
+    client, _ = panel
+    csrf = await _login(client)
+    item_id = _queued_row(storage, image=_IMGS[0], extra_images=_IMGS[1], multi=True)
+    await client.post(f"/queue/{item_id}/image-delete", data={"csrf": csrf, "url": _IMGS[0]})
+    row = storage.moderation_item(item_id)
+    assert (row["image"], row["extra_images"]) == (_IMGS[1], "")
+    await client.post(f"/queue/{item_id}/image-delete", data={"csrf": csrf, "url": _IMGS[1]})
+    row = storage.moderation_item(item_id)
+    assert (row["image"], row["extra_images"]) == ("", "")
+
+
+async def test_queue_image_delete_keeps_unsaved_text_and_ignores_unknown_url(panel, storage: Storage):
+    client, _ = panel
+    csrf = await _login(client)
+    item_id = _queued_row(storage, image=_IMGS[0])
+    resp = await client.post(f"/queue/{item_id}/image-delete",
+                             data={"csrf": csrf, "url": "https://x/other.jpg", "text": "правка"})
+    html = await resp.text()
+    assert "Этой картинки в посте уже нет" in html
+    assert "правка" in html                       # несохранённый текст не потерян
+    row = storage.moderation_item(item_id)
+    assert row["image"] == _IMGS[0] and row["text"] == "пост"
+
+
+async def test_queue_image_delete_refused_while_publishing(panel, storage: Storage):
+    client, _ = panel
+    csrf = await _login(client)
+    item_id = _queued_row(storage, image=_IMGS[0])
+    assert storage.claim_moderation(item_id, "test", stale_after=600)
+    await client.post(f"/queue/{item_id}/image-delete", data={"csrf": csrf, "url": _IMGS[0]})
+    assert storage.moderation_item(item_id)["image"] == _IMGS[0]

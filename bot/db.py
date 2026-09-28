@@ -895,6 +895,16 @@ class Storage:
             )
             self._conn.commit()
 
+    def set_moderation_images(self, item_id: int, urls: list[str]) -> None:
+        """Картинки карточки после ручной правки в панели (кнопка × на
+        миниатюре): первая — image, остальные — extra_images."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE moderation SET image = ?, extra_images = ?, edited_at = ? WHERE id = ?",
+                (urls[0] if urls else "", "\n".join(urls[1:]), int(time.time()), item_id),
+            )
+            self._conn.commit()
+
     def schedule_moderation(self, item_id: int, when: int) -> None:
         """Откладывает публикацию карточки на конкретное время (веб-панель,
         «Сегодня/Завтра» + время) — карточка остаётся в очереди, публикует

@@ -514,6 +514,18 @@ button:active, .btn:active { transform: scale(.98); }
    освободится) — без этого правила заблокированная кнопка выглядела как
    обычная кликабельная, и было непонятно, почему клик ничего не делает. */
 button:disabled, .btn:disabled { opacity: .45; cursor: not-allowed; }
+/* Миниатюра картинки в карточке согласования с кружком × в углу — убрать
+   картинку из поста до публикации (см. queue_image_delete). */
+.thumb { position: relative; }
+.thumb img { display: block; }
+button.thumb-del {
+  position: absolute; top: 6px; right: 6px; width: 30px; height: 30px; min-height: 30px;
+  padding: 0; border-radius: 50%; font-size: 17px; line-height: 1; font-weight: 700;
+  background: rgba(0, 0, 0, .65); border: 1px solid rgba(255, 255, 255, .35); color: #fff;
+}
+button.thumb-del:hover { background: var(--red); border-color: var(--red); }
+/* Невидимое расширение до 44px — палец попадает, а кружок не закрывает картинку */
+button.thumb-del::after { content: ""; position: absolute; inset: -7px; }
 button.primary { background: var(--blue); border-color: var(--blue); color: var(--on-blue); font-weight: 700; }
 button.primary:hover { background: var(--blue-hover); }
 button.danger { background: var(--red-dim); border-color: var(--red-border); color: var(--red); }
@@ -2910,8 +2922,8 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
         if draft is None and request.query.get("regen") == "1":
             flash, flash_kind = "Черновик обновлён через ИИ.", "ok"
         text = draft if draft is not None else row["text"]
-        draft_note = ('<p class="muted">⚠️ Черновик после перегенерации — ещё не сохранён отдельно, '
-                     'но уже виден ниже; жмите «Опубликовать» или поправьте и сохраните.</p>'
+        draft_note = ('<p class="muted">⚠️ Текст в поле ниже ещё не сохранён — жмите «Опубликовать» '
+                     'или «Сохранить черновик».</p>'
                      if draft is not None else "")
         when = time.strftime("%d.%m %H:%M", time.localtime(row["queued_at"]))
         error_html = (f'<div class="muted" style="color:var(--red); margin-top:6px;">'
@@ -2946,16 +2958,29 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
             if row["scheduled_at"] else "")
 
         urls = [u for u in [row["image"], *row["extra_images"].split("\n")] if u]
+
+        def del_btn(u: str) -> str:
+            # form= — кнопка отправляет форму публикации (она ниже по
+            # странице): вместе с адресом картинки уходит и текущий текст из
+            # поля, и несохранённая правка не теряется при перезагрузке.
+            # formnovalidate — у формы есть required-поле времени плана.
+            return (f'<button type="submit" class="thumb-del" form="queue-publish-form" '
+                    f'formaction="/queue/{row["id"]}/image-delete" formnovalidate '
+                    f'name="url" value="{_e(u)}" title="Убрать картинку из поста" '
+                    f'aria-label="Убрать картинку из поста" {disabled}>×</button>')
+
         gallery = ""
         if len(urls) == 1 and _is_http_url(urls[0]):
-            gallery = (f'<a href="{_safe_href(urls[0])}" target="_blank" rel="noopener">'
+            gallery = (f'<div class="thumb" style="display:inline-block; max-width:100%; margin-top:10px;">'
+                      f'<a href="{_safe_href(urls[0])}" target="_blank" rel="noopener">'
                       f'<img src="{_safe_href(urls[0])}" alt="" loading="lazy" decoding="async" '
-                      f'style="max-width:100%; border-radius:10px; margin-top:10px;"></a>')
+                      f'style="max-width:100%; border-radius:10px;"></a>{del_btn(urls[0])}</div>')
         elif urls:
             thumbs = "".join(
-                f'<a href="{_safe_href(u)}" target="_blank" rel="noopener">'
+                f'<div class="thumb"><a href="{_safe_href(u)}" target="_blank" rel="noopener">'
                 f'<img src="{_safe_href(u)}" alt="" loading="lazy" decoding="async" style="width:100%; border-radius:8px; '
                 f'aspect-ratio:1; object-fit:cover;">{" <span class=\"pill neutral\">1-я, с подписью</span>" if i == 0 else ""}</a>'
+                f'{del_btn(u)}</div>'
                 for i, u in enumerate(urls) if _is_http_url(u)
             )
             gallery = (f'<div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(100px,1fr)); '
@@ -3164,6 +3189,35 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
                                       flash=f"Разметка не годится: {problem}", flash_kind="err")
         st.update_moderation_text(item_id, text)
         return await queue_detail(request, flash="Сохранено.", page=page)
+
+    async def queue_image_delete(request: web.Request) -> web.Response:
+        """Кнопка × на миниатюре: убрать картинку из поста до публикации —
+        технические картинки со страницы (фоны, иконки, витрина магазина)
+        иначе ушли бы в альбом. Картинка задаётся адресом, а не номером:
+        карточка обновляется в фоне, и номер мог бы указать уже на другую."""
+        st: Storage = app["st"]
+        item_id = int(request.match_info["id"])
+        row = st.moderation_item(item_id)
+        if row is None:
+            raise web.HTTPNotFound(text="Запись не найдена — возможно, уже обработана")
+        page = _form_page(request)
+        # Несохранённая правка текста приходит вместе с кнопкой (form= в
+        # разметке) — показываем её снова, а не молча откатываем.
+        text = str(request["form"].get("text", "")).strip()
+        draft = text if text and text != row["text"] else None
+        guard = _refuse_if_publishing(row)
+        if guard:
+            return await queue_detail(request, draft=draft, flash=guard, flash_kind="err", page=page)
+        url = str(request["form"].get("url", ""))
+        urls = [u for u in [row["image"], *row["extra_images"].split("\n")] if u]
+        if url not in urls:
+            return await queue_detail(request, draft=draft, page=page, flash_kind="err",
+                                      flash="Этой картинки в посте уже нет.")
+        urls.remove(url)
+        st.set_moderation_images(item_id, urls)
+        flash = ("Картинка убрана из поста." if urls
+                 else "Картинка убрана — пост уйдёт без картинок.")
+        return await queue_detail(request, draft=draft, flash=flash, page=page)
 
     async def queue_publish(request: web.Request) -> web.Response:
         st: Storage = app["st"]
@@ -3510,6 +3564,7 @@ def create_app(storage: Storage, publisher: Publisher, bot: Bot, password: str,
     app.router.add_get("/queue", queue_get)
     app.router.add_get("/queue/{id:[0-9]{1,18}}", queue_detail)
     app.router.add_post("/queue/{id:[0-9]{1,18}}/save", queue_save)
+    app.router.add_post("/queue/{id:[0-9]{1,18}}/image-delete", queue_image_delete)
     app.router.add_post("/queue/{id:[0-9]{1,18}}/publish", queue_publish)
     app.router.add_post("/queue/{id:[0-9]{1,18}}/reject", queue_reject)
     app.router.add_post("/queue/{id:[0-9]{1,18}}/regen", queue_regen)
